@@ -92,6 +92,56 @@ if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
 
+# ---------------------------------------------------------------------------
+# PR2 — A/B switch for the new ConstantTable + ConstantResolver evaluator.
+#
+# Default ``False`` — preserves the legacy regex+AST mixed evaluator path,
+# byte-for-byte identical to PR1.  When ``True`` (via the ``--use-new-eval``
+# CLI flag or programmatic override), every call site of the legacy
+# ``_eval_int_atom`` / ``_eval_list_len`` / ``_resolve_range_n`` /
+# ``_resolve_iter_len`` is routed through the new ``ConstantResolver`` and
+# both results are recorded into ``_AB_EVAL_DIFFS`` for diffing.
+#
+# The switch is intentionally a *module-level* mutable global so that:
+#   * a CLI run can flip it from ``main()`` before ``build_static_module_tree``
+#     is called,
+#   * a test harness can flip it from a fixture (``analyze_trace.USE_NEW_EVAL
+#     = True``),
+#   * ``build_static_module_tree`` reads it via the closure helper
+#     ``_use_new_eval()`` so callers can safely mutate it any time before the
+#     scan starts.
+# ---------------------------------------------------------------------------
+USE_NEW_EVAL: bool = False
+
+# A/B diff log: filled when ``USE_NEW_EVAL`` is True.  Each entry is a tuple
+# ``(call_site, expr_text, legacy_result, new_result)``.  Cleared at the
+# start of every ``build_static_module_tree`` invocation.
+_AB_EVAL_DIFFS: list = []  # populated lazily; see _ab_record()
+
+
+def _ab_record(call_site: str, expr_text: str, legacy, new):
+    """Append a single A/B diff observation to the global diff log.
+
+    Records *every* (legacy, new) result pair when ``USE_NEW_EVAL`` is True
+    -- both matches and mismatches.  The caller filters by equality at
+    summary time.
+    """
+    _AB_EVAL_DIFFS.append({
+        "site": call_site,
+        "expr": expr_text,
+        "legacy": legacy,
+        "new": new,
+        "match": (legacy == new) or (legacy is None and new is None),
+    })
+
+
+def _ab_summary():
+    """Return ``(matches, mismatches, mismatch_examples)`` for diagnostics."""
+    matches = sum(1 for e in _AB_EVAL_DIFFS if e.get("match"))
+    mismatches = [e for e in _AB_EVAL_DIFFS if not e.get("match")]
+    return matches, len(mismatches), mismatches[:20]
+
+
 def _warn_regex_fallback(module: str, function: str, case: str):
     print(
         f"[WARNING] Regex fallback triggered: {module}/{function}/{case}. AST parsing did not cover this path; treat as bug signal and investigate.",
@@ -6947,7 +6997,8 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
     # the class internally expands containers via `for ... in enumerate(<kw>)`.
     instance_kw_list_lens = defaultdict(dict)
 
-    def _eval_int_atom(expr: str, fname: str):
+    def _eval_int_atom_legacy(expr: str, fname: str):
+        """Legacy regex+AST integer atom evaluator (kept verbatim for A/B)."""
         expr = (expr or '').strip()
         if not expr:
             return None
@@ -6961,6 +7012,29 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
         if vals and len(vals) == 1:
             return next(iter(vals))
         return None
+
+    def _eval_int_atom(expr: str, fname: str):
+        """A/B-aware integer atom evaluator.
+
+        Always computes the legacy answer (preserving call-graph identity).
+        Additionally consults the new resolver when ``USE_NEW_EVAL`` is True
+        and records both into the A/B diff log.  Returns the new result when
+        ``USE_NEW_EVAL`` is True (falling back to legacy on resolver miss),
+        otherwise the legacy result — guaranteeing byte-identical behaviour
+        when the switch is off.
+        """
+        legacy = _eval_int_atom_legacy(expr, fname)
+        if not USE_NEW_EVAL:
+            return legacy
+        # A/B path — note: scope_cls/method are not available at this level
+        # (the legacy entry has no scope context).  We pass ``None`` so the
+        # new resolver only matches file-/global-level constants — the cases
+        # the legacy entry actually handles.  Class-/method-level lookups
+        # happen in ``_resolve_range_n`` / ``_resolve_iter_len`` which carry
+        # full scope.
+        new = _ab_int_via_new_eval(expr, fname)
+        _ab_record("_eval_int_atom", str(expr), legacy, new)
+        return new if new is not None else legacy
 
     def _split_top_level(expr: str):
         """Split `expr` on top-level commas, respecting [], (), {} nesting.
@@ -7005,6 +7079,21 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
         return parts
 
     def _eval_list_len(expr: str, fname: str):
+        """A/B-aware list-length evaluator.
+
+        See ``_eval_list_len_legacy`` for the legacy implementation.  Behaviour
+        is identical to that function unless ``USE_NEW_EVAL`` is True, in
+        which case the new resolver is consulted in parallel and the diff is
+        recorded.
+        """
+        legacy = _eval_list_len_legacy(expr, fname)
+        if not USE_NEW_EVAL:
+            return legacy
+        new = _ab_list_len_via_new_eval(expr, fname)
+        _ab_record("_eval_list_len", str(expr), legacy, new)
+        return new if new is not None else legacy
+
+    def _eval_list_len_legacy(expr: str, fname: str):
         """Try to compute the LENGTH of a list-typed expression statically.
 
         Supported forms (chained via `+` for concat):
@@ -7077,7 +7166,7 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
         if len(plus_parts) > 1:
             total = 0
             for p in plus_parts:
-                n = _eval_list_len(p, fname)
+                n = _eval_list_len_legacy(p, fname)
                 if n is None:
                     return None
                 total += n
@@ -7088,12 +7177,12 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
         if m_mul:
             left = m_mul.group(1).strip()
             right = m_mul.group(2).strip()
-            l_len = _eval_list_len(left, fname)
-            r_int = _eval_int_atom(right, fname)
+            l_len = _eval_list_len_legacy(left, fname)
+            r_int = _eval_int_atom_legacy(right, fname)
             if l_len is not None and r_int is not None:
                 return l_len * r_int
-            r_len = _eval_list_len(right, fname)
-            l_int = _eval_int_atom(left, fname)
+            r_len = _eval_list_len_legacy(right, fname)
+            l_int = _eval_int_atom_legacy(left, fname)
             if r_len is not None and l_int is not None:
                 return r_len * l_int
 
@@ -7143,6 +7232,97 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
     for (fname, cname), info in class_map.items():
         if "forward" in info["methods"]:
             nn_module_classes.add(cname)
+
+    # ------------------------------------------------------------------
+    # PR2 — Build the new ConstantTable + ConstantResolver once per
+    # ``build_static_module_tree`` invocation.  In PR2 they coexist with
+    # the legacy evaluator: when ``USE_NEW_EVAL`` is True the legacy
+    # functions still compute their answer first (so the call graph stays
+    # identical and any side-effects are preserved) and *then* the new
+    # resolver is consulted; when both produce a result they are A/B
+    # diffed via ``_ab_record``.  When ``USE_NEW_EVAL`` is True the new
+    # result is returned to the caller (with legacy as fallback when the
+    # new resolver returns ``None``); when False, the legacy result is
+    # returned unchanged — preserving byte-identical behaviour vs PR1.
+    #
+    # The AST-frontend cache is reused so we don't re-parse files.
+    # ------------------------------------------------------------------
+    _new_eval_table = None
+    _new_eval_resolver = None
+    try:
+        _new_eval_ast_frontends = {}
+        for _fname in source_files.keys():
+            _fe = _get_ast_frontend(_fname)
+            if _fe is not None:
+                _new_eval_ast_frontends[_fname] = _fe
+        _new_eval_table = ConstantTable.build_all(
+            source_files=source_files,
+            ast_frontends=_new_eval_ast_frontends,
+            nn_module_classes=set(nn_module_classes),
+        )
+        _new_eval_resolver = ConstantResolver(_new_eval_table)
+    except Exception as _e:
+        # Defensive: A/B path failure must never break the legacy path.
+        _new_eval_table = None
+        _new_eval_resolver = None
+        _warn_regex_fallback("analyze_trace_ast_refactor", "build_static_module_tree", f"new_eval_build:{type(_e).__name__}")
+
+    # Reset the global A/B diff log at the start of every build so a single
+    # process running multiple test models gets clean per-model accounting.
+    if USE_NEW_EVAL:
+        _AB_EVAL_DIFFS.clear()
+
+    def _ab_int_via_new_eval(expr_text: str, fname: str, scope_cls: str = None,
+                             scope_method: str = None, parent_cls: str = None,
+                             parent_attr: str = None):
+        """Helper: parse *expr_text* as an int expression and ask the new
+        resolver.  Returns ``None`` on parse / scope failure or when the
+        resolver fails.  Used for A/B comparison only — never mutates the
+        legacy fall-through path.
+
+        IMPORTANT: every A/B call uses a *fresh* resolver instance.  The
+        production resolver caches by ``id(node)`` (cheap and correct when
+        the AST is owned by a long-lived ``ASTFrontend``).  In the A/B path
+        we re-parse a string expression on every call, producing transient
+        nodes whose ids get recycled by CPython between calls — which would
+        poison a shared cache.  Per-call resolvers eliminate that risk.
+        """
+        if _new_eval_table is None or not expr_text:
+            return None
+        try:
+            tree = ast.parse(expr_text, mode="eval")
+            node = tree.body
+        except Exception:
+            return None
+        scope = Scope(file=fname, cls=scope_cls, method=scope_method,
+                      parent_cls=parent_cls, parent_attr=parent_attr)
+        try:
+            iv = ConstantResolver(_new_eval_table).eval_int(node, scope)
+        except Exception:
+            return None
+        return iv.value if iv is not None else None
+
+    def _ab_list_len_via_new_eval(expr_text: str, fname: str, scope_cls: str = None,
+                                  scope_method: str = None, parent_cls: str = None,
+                                  parent_attr: str = None):
+        """Helper: parse *expr_text* as a list expression and ask the new
+        resolver for its length.  Returns ``None`` on failure.  Uses a
+        per-call resolver — see ``_ab_int_via_new_eval`` for the rationale.
+        """
+        if _new_eval_table is None or not expr_text:
+            return None
+        try:
+            tree = ast.parse(expr_text, mode="eval")
+            node = tree.body
+        except Exception:
+            return None
+        scope = Scope(file=fname, cls=scope_cls, method=scope_method,
+                      parent_cls=parent_cls, parent_attr=parent_attr)
+        try:
+            return ConstantResolver(_new_eval_table).eval_list_len(node, scope)
+        except Exception:
+            return None
+
 
     # Per-class attr->class mapping. We scan ALL methods (not just __init__) because
     # some codebases lazily build child sub-modules in helper methods (e.g.
@@ -8115,18 +8295,8 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
     # list-length determines the iteration length).
     class_container_kw = defaultdict(dict)
 
-    def _resolve_iter_len(expr: str, fname: str, cname: str, self_to_param: dict, local_vars: dict):
-        """Resolve the iteration-length of an `enumerate(<expr>)` or
-        `for x in <expr>` target.
-
-        Tries (in order):
-          1. local int variables (rare for list iters);
-          2. ctor_kw_list_lens[cname][expr] when expr is a kw param name;
-          3. self.<attr> via self_to_param mapping;
-          4. file-level str-list constants via _eval_list_len.
-        Returns (n, kw_name) where kw_name is the ctor kw if known (else None),
-        or (None, None).
-        """
+    def _resolve_iter_len_legacy(expr: str, fname: str, cname: str, self_to_param: dict, local_vars: dict):
+        """Legacy iteration-length resolver (kept verbatim for A/B)."""
         expr = (expr or '').strip()
         # Direct kw param name.
         if expr in ctor_kw_list_lens.get(cname, {}):
@@ -8144,16 +8314,42 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                 if vals:
                     return max(vals), pn
         # File-level str-list constant.
-        n = _eval_list_len(expr, fname)
+        n = _eval_list_len_legacy(expr, fname)
         if n is not None:
             return n, None
         return None, None
 
-    def _resolve_range_n(expr: str, fname: str, cname: str, self_to_param: dict, local_vars: dict):
+    def _resolve_iter_len(expr: str, fname: str, cname: str, self_to_param: dict, local_vars: dict):
+        """A/B-aware iteration-length resolver.
+
+        Tries (in order):
+          1. local int variables (rare for list iters);
+          2. ctor_kw_list_lens[cname][expr] when expr is a kw param name;
+          3. self.<attr> via self_to_param mapping;
+          4. file-level str-list constants via _eval_list_len.
+        Returns (n, kw_name) where kw_name is the ctor kw if known (else None),
+        or (None, None).
+        """
+        legacy = _resolve_iter_len_legacy(expr, fname, cname, self_to_param, local_vars)
+        if not USE_NEW_EVAL:
+            return legacy
+        # New resolver path — only the integer length is comparable; the kw_name
+        # remains a legacy artifact.  We pass full scope (cls/method) so the
+        # new resolver can reach instance-level overrides.
+        new_n = _ab_list_len_via_new_eval(expr, fname, scope_cls=cname, scope_method="__init__")
+        legacy_n = legacy[0] if legacy else None
+        _ab_record("_resolve_iter_len", str(expr), legacy_n, new_n)
+        if new_n is not None:
+            # Preserve legacy kw_name (the new resolver doesn't track that yet).
+            return new_n, (legacy[1] if legacy else None)
+        return legacy
+
+    def _resolve_range_n_legacy(expr: str, fname: str, cname: str, self_to_param: dict, local_vars: dict):
+        """Legacy range(N) resolver (kept verbatim for A/B)."""
         expr = (expr or '').strip()
         if expr in local_vars and isinstance(local_vars[expr], int):
             return local_vars[expr]
-        v = _eval_int_atom(expr, fname)
+        v = _eval_int_atom_legacy(expr, fname)
         if v is not None:
             return v
         # 参数名（如 layers）
@@ -8170,6 +8366,15 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                 if len(vals) == 1:
                     return vals[0]
         return None
+
+    def _resolve_range_n(expr: str, fname: str, cname: str, self_to_param: dict, local_vars: dict):
+        """A/B-aware range(N) resolver."""
+        legacy = _resolve_range_n_legacy(expr, fname, cname, self_to_param, local_vars)
+        if not USE_NEW_EVAL:
+            return legacy
+        new = _ab_int_via_new_eval(expr, fname, scope_cls=cname, scope_method="__init__")
+        _ab_record("_resolve_range_n", str(expr), legacy, new)
+        return new if new is not None else legacy
 
     for (fname, cname), info in class_map.items():
         if cname not in nn_module_classes:
@@ -9115,7 +9320,17 @@ def main():
     parser.add_argument("--code-path", type=str, default=None, help="模型源码路径（目录或 .tar.gz）")
     parser.add_argument("--screenshot", action="store_true", help="生成 Chrome Tracing 可视化截图")
     parser.add_argument("--html-flowchart", type=str, default=None, help="生成 HTML 模块流程图路径")
+    parser.add_argument("--use-new-eval", action="store_true",
+                        help="启用 PR2 新求值器 (ConstantTable+ConstantResolver) 并记录 A/B diff")
+    parser.add_argument("--ab-eval-report", type=str, default=None,
+                        help="将 A/B diff 摘要写入 JSON 文件 (仅当 --use-new-eval 时生效)")
     args = parser.parse_args()
+
+    # PR2: flip the module-level switch before any analysis runs.
+    if args.use_new_eval:
+        global USE_NEW_EVAL
+        USE_NEW_EVAL = True
+        print("  [PR2] --use-new-eval enabled: ConstantResolver A/B compare active")
 
     # Mode 1: Source-code only flowchart (no trace required)
     if args.html_flowchart and args.code_path and not args.trace_file:
@@ -9126,6 +9341,7 @@ def main():
         result = generate_html_flowchart_dual(source_files, timing_data=None, meta=None, output_path=args.html_flowchart)
         if result:
             print(f"  HTML 流程图已保存到: {args.html_flowchart}")
+        _emit_ab_summary_if_enabled(args)
         return
 
     # Mode 2: Full trace analysis (trace_file required)
@@ -9387,6 +9603,41 @@ def main():
             result = generate_html_flowchart_dual(source_files, timing_data=timing_data, meta=meta, output_path=args.html_flowchart, trace_events=events)
             if result:
                 print(f"  HTML 流程图已保存到: {args.html_flowchart}")
+
+    # PR2: print A/B diff summary at the very end so the user can see it
+    # alongside the regular analysis output.
+    _emit_ab_summary_if_enabled(args)
+
+
+def _emit_ab_summary_if_enabled(args):
+    """PR2: print + optionally persist the A/B diff summary."""
+    if not getattr(args, "use_new_eval", False):
+        return
+    matches, mismatch_count, mismatch_examples = _ab_summary()
+    print()
+    print("  =========================================================")
+    print("  [PR2] A/B Eval Diff Summary")
+    print(f"  total_observations = {len(_AB_EVAL_DIFFS)}")
+    print(f"  matches            = {matches}")
+    print(f"  mismatches         = {mismatch_count}")
+    if mismatch_examples:
+        print("  first up to 20 mismatches:")
+        for e in mismatch_examples:
+            print(f"    [{e['site']}] expr={e['expr']!r} legacy={e['legacy']!r} new={e['new']!r}")
+    print("  =========================================================")
+    report = getattr(args, "ab_eval_report", None)
+    if report:
+        try:
+            with open(report, "w", encoding="utf-8") as f:
+                json.dump({
+                    "total": len(_AB_EVAL_DIFFS),
+                    "matches": matches,
+                    "mismatches": mismatch_count,
+                    "all": _AB_EVAL_DIFFS,
+                }, f, ensure_ascii=False, indent=2)
+            print(f"  A/B diff full log saved to: {report}")
+        except Exception as e:
+            print(f"  ⚠️ failed to write A/B diff report: {e}")
 
 
 def _ast_frontend_smoke_test():
