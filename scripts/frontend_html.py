@@ -1,50 +1,58 @@
 #!/usr/bin/env python3
+"""HTML flowchart rendering for the torch-trace-analyzer DAG.
+
+This module renders the interactive HTML output (``generate_html_flowchart``,
+``generate_html_flowchart_dual``, ``build_timing_data_from_trace`` and
+``_generate_flowchart_html``).  All DAG analysis primitives live in the
+sibling ``analyze_trace`` module which is imported explicitly below — there
+is **no** dynamic ``importlib.util.spec_from_file_location`` re-exec, no
+``globals().update`` and no module-name aliasing here.
+
+Dependency direction is strictly one way:
+
+    analyze_trace  ──provides─▶  ASTFrontend, _build_class_map, ...
+    frontend_html  ──consumes──┘
+
+``analyze_trace`` re-exports the public entry points of this module at the
+end of its own file purely for backward compatibility with callers that
+reach those names through ``analyze_trace`` (for example
+``testset/test_dag_rules.py``).  That re-export is the only "back" reference
+and it runs *after* every name imported below has been bound, so there is
+no real circular dependency.
+"""
 from __future__ import annotations
 
-import importlib.util
+import os
+import sys
 import json as _json
 import re
 from collections import defaultdict
 from pathlib import Path
 
+# When this module is imported by ``analyze_trace.py`` the script directory is
+# already on ``sys.path``.  We add it defensively here so the module also
+# imports cleanly when loaded standalone (e.g. ``python -c "import
+# frontend_html"`` from the scripts/ directory or from a tooling harness).
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
 
-def _load_analyze_trace_symbols():
-    """Load shared helpers from sibling analyze_trace.py without relying on cwd."""
-    script_dir = Path(__file__).resolve().parent
-    analyze_trace_path = script_dir / "analyze_trace.py"
-    spec = importlib.util.spec_from_file_location("torch_trace_analyzer_analyze_trace", analyze_trace_path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Unable to load analyze_trace.py from {analyze_trace_path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    required = [
-        "ASTFrontend",
-        "_build_class_map",
-        "_build_source_dependency_order",
-        "_strip_inline_comment",
-        "_validate_timeline_modules",
-        "aggregate_runtime_instance_phase_times",
-        "aggregate_source_module_phase_times",
-        "build_main_thread_hierarchy",
-        "build_static_module_tree",
-        "extract_step_phase_intervals",
-        "format_duration",
-    ]
-    return {name: getattr(module, name) for name in required}
-
-
-_ANALYZE_TRACE_SYMBOLS = _load_analyze_trace_symbols()
-ASTFrontend = _ANALYZE_TRACE_SYMBOLS["ASTFrontend"]
-_build_class_map = _ANALYZE_TRACE_SYMBOLS["_build_class_map"]
-_build_source_dependency_order = _ANALYZE_TRACE_SYMBOLS["_build_source_dependency_order"]
-_strip_inline_comment = _ANALYZE_TRACE_SYMBOLS["_strip_inline_comment"]
-_validate_timeline_modules = _ANALYZE_TRACE_SYMBOLS["_validate_timeline_modules"]
-aggregate_runtime_instance_phase_times = _ANALYZE_TRACE_SYMBOLS["aggregate_runtime_instance_phase_times"]
-aggregate_source_module_phase_times = _ANALYZE_TRACE_SYMBOLS["aggregate_source_module_phase_times"]
-build_main_thread_hierarchy = _ANALYZE_TRACE_SYMBOLS["build_main_thread_hierarchy"]
-build_static_module_tree = _ANALYZE_TRACE_SYMBOLS["build_static_module_tree"]
-extract_step_phase_intervals = _ANALYZE_TRACE_SYMBOLS["extract_step_phase_intervals"]
-format_duration = _ANALYZE_TRACE_SYMBOLS["format_duration"]
+# Explicit, unambiguous imports of all shared helpers from analyze_trace.
+# Any rename or removal of these names in analyze_trace.py will surface here
+# as an ImportError instead of silently degrading at runtime.
+from analyze_trace import (  # noqa: E402  (sys.path tweak above is intentional)
+    ASTFrontend,
+    _build_class_map,
+    _build_source_dependency_order,
+    _strip_inline_comment,
+    _validate_timeline_modules,
+    aggregate_runtime_instance_phase_times,
+    aggregate_source_module_phase_times,
+    build_main_thread_hierarchy,
+    build_static_module_tree,
+    extract_step_phase_intervals,
+    format_duration,
+)
 
 
 FLOWCHART_HTML_TEMPLATE = r"""<!DOCTYPE html>
