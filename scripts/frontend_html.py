@@ -1341,9 +1341,11 @@ function computeSelfMs(item) {
     return (excPct > 0 && stepUs > 0) ? (excPct * stepUs / 100.0 / 1000.0) : 0;
 }
 
-function fmtTimingMs(value) {
+function fmtTimingMs(value, forceShow) {
     const num = Number(value || 0);
-    return num > 0 ? `${num.toFixed(1)} ms` : '—';
+    if (num > 0) return `${num.toFixed(1)} ms`;
+    if (forceShow) return `0.0 ms`;
+    return '—';
 }
 
 function timingHelpText(kind) {
@@ -1357,7 +1359,7 @@ function timingHelpText(kind) {
 }
 
 function renderTimingRow(label, value, kind) {
-    return `<div class="evidence-meta timing-row"><span class="timing-label"><b>${label}:</b><span class="metric-help" data-help="${escapeHtml(timingHelpText(kind))}">ⓘ</span></span><span class="timing-value">${escapeHtml(fmtTimingMs(value))}</span></div>`;
+    return `<div class="evidence-meta timing-row"><span class="timing-label"><b>${label}:</b><span class="metric-help" data-help="${escapeHtml(timingHelpText(kind))}">ⓘ</span></span><span class="timing-value">${escapeHtml(fmtTimingMs(value, true))}</span></div>`;
 }
 
 function showTooltip(e, n) {
@@ -1365,10 +1367,10 @@ function showTooltip(e, n) {
     let html = `<div class="tt-title">${n.attr_name || n.label || n.class_name} <span style="opacity:0.6">(${n.class_name || n.label || 'Module'})</span></div>`;
     const totalMs = Number(n && n.dur_us || 0) / 1000.0;
     const selfMs = computeSelfMs(n);
-    html += `<div class="tt-row">Total: ${fmtTimingMs(totalMs)}</div>`;
-    html += `<div class="tt-row">Self: ${fmtTimingMs(selfMs)}</div>`;
-    html += `<div class="tt-row">Forward: ${fmtTimingMs(n && n.forward_ms)}</div>`;
-    html += `<div class="tt-row">Backward: ${fmtTimingMs(n && n.backward_ms)}</div>`;
+    html += `<div class="tt-row">Total: ${fmtTimingMs(totalMs, true)}</div>`;
+    html += `<div class="tt-row">Self: ${fmtTimingMs(selfMs, true)}</div>`;
+    html += `<div class="tt-row">Forward: ${fmtTimingMs(n && n.forward_ms, true)}</div>`;
+    html += `<div class="tt-row">Backward: ${fmtTimingMs(n && n.backward_ms, true)}</div>`;
     tt.innerHTML = html;
     tt.style.left = (e.clientX + 12) + 'px';
     tt.style.top = (e.clientY + 12) + 'px';
