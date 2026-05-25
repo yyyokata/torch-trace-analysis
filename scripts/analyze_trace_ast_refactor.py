@@ -33,14 +33,22 @@ class ASTFrontend:
     def __init__(self, source: str = None, path: str = None):
         if source is None and path is None:
             raise ValueError("ASTFrontend requires either source or path")
-        if source is not None and path is not None:
-            raise ValueError("ASTFrontend accepts either source or path, not both")
 
+        # Allow both `source` and `path` to be supplied simultaneously:
+        #   - When `source` is provided, parse from it (in-memory content).
+        #   - `path` is retained as filename metadata for error messages / logs,
+        #     and used to read source from disk only when `source` is None.
+        # Previously this constructor raised ValueError when both were given,
+        # which forced every call site like `ASTFrontend(source=..., path=...)`
+        # into the regex fallback path. That bug is fixed here.
         self.path = path
         if source is None:
             with open(path, "r", encoding="utf-8", errors="replace") as f:
                 source = f.read()
         self.source = source
+        # Lazy-built caches to keep _node_to_text O(1) per call.
+        self._source_bytes = None
+        self._line_starts = None
         self.tree = ast.parse(self.source, filename=path or "<memory>")
         self.class_registry = {}
         self._build_class_registry()
@@ -73,10 +81,31 @@ class ASTFrontend:
             self.class_registry[class_name]["is_nn_module"] = self._resolve_is_nn_module(class_name, set())
 
     def _node_to_text(self, node):
+        # Fast path: ast.get_source_segment internally re-splits self.source on
+        # every call, which is O(n) per node. With thousands of AST nodes that
+        # quickly becomes O(n^2). We bypass it by slicing pre-computed line
+        # offsets instead. Falls back to ast.unparse if positions are missing.
         try:
-            seg = ast.get_source_segment(self.source, node)
-            if seg:
-                return seg.strip()
+            lineno = getattr(node, "lineno", None)
+            end_lineno = getattr(node, "end_lineno", None)
+            col_offset = getattr(node, "col_offset", None)
+            end_col_offset = getattr(node, "end_col_offset", None)
+            if (
+                lineno is not None
+                and end_lineno is not None
+                and col_offset is not None
+                and end_col_offset is not None
+            ):
+                line_starts = self._line_starts
+                if line_starts is None:
+                    line_starts = self._build_line_starts()
+                src = self._source_bytes
+                start = line_starts[lineno - 1] + col_offset
+                end = line_starts[end_lineno - 1] + end_col_offset
+                if 0 <= start <= end <= len(src):
+                    seg = src[start:end].decode("utf-8", errors="replace")
+                    if seg:
+                        return seg.strip()
         except Exception:
             pass
         try:
@@ -96,6 +125,23 @@ class ASTFrontend:
             if isinstance(node, ast.Constant):
                 return repr(node.value)
             return "<unknown>"
+
+    def _build_line_starts(self):
+        # Build byte-offset-of-start-of-each-line so _node_to_text can slice
+        # self.source by (lineno, col_offset, end_lineno, end_col_offset)
+        # without re-splitting the entire source on every call. col_offset is
+        # a *byte* offset into the line (per Python AST contract), so we
+        # operate on the UTF-8 encoded bytes here.
+        src_bytes = self.source.encode("utf-8")
+        self._source_bytes = src_bytes
+        starts = [0]
+        for i, b in enumerate(src_bytes):
+            if b == 0x0A:  # '\n'
+                starts.append(i + 1)
+        # Sentinel for last line end-of-file
+        starts.append(len(src_bytes))
+        self._line_starts = starts
+        return starts
 
     def _resolve_is_nn_module(self, class_name, visiting):
         info = self.class_registry.get(class_name)

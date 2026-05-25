@@ -111,9 +111,14 @@ class ASTFrontend:
     def __init__(self, source: str = None, path: str = None):
         if source is None and path is None:
             raise ValueError("ASTFrontend requires either source or path")
-        if source is not None and path is not None:
-            raise ValueError("ASTFrontend accepts either source or path, not both")
 
+        # Allow both `source` and `path` to be supplied simultaneously:
+        #   - When `source` is provided, parse from it (in-memory content).
+        #   - `path` is retained as filename metadata for error messages / logs,
+        #     and used to read source from disk only when `source` is None.
+        # Previously this constructor raised ValueError when both were given,
+        # which forced every call site like `ASTFrontend(source=..., path=...)`
+        # into the regex fallback path. That bug is fixed here.
         self.path = path
         if source is None:
             with open(path, "r", encoding="utf-8", errors="replace") as f:
