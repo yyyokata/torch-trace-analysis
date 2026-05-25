@@ -6664,11 +6664,13 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                 return _fe._extract_self_attr_name(_target) if _fe else None
 
             def _node_to_text(_node):
-                if _fe:
-                    try:
-                        return _fe._node_to_text(_node)
-                    except Exception:
-                        pass
+                # IMPORTANT: nodes here come from `_parse_local_stmt(line)` which
+                # parses the joined logical line as a *standalone* tiny source
+                # snippet. Their (lineno, col_offset) point into that snippet,
+                # NOT into the file. If we delegated to `_fe._node_to_text` it
+                # would use the file's `_line_starts` and slice wildly wrong
+                # bytes (e.g. returning `'ogging\\nimpo'` for `DenseTower`).
+                # Always use ast.unparse here — it is position-independent.
                 try:
                     return ast.unparse(_node)
                 except Exception:
