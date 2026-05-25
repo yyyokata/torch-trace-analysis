@@ -1206,7 +1206,6 @@ class ConstantTable:
         #    instance binds the parameter — we then read defaults straight
         #    from the dataclass.
         self.class_init_param_anno: Dict[Tuple[str, str], Dict[str, str]] = {}
-
         # ── Auxiliary (referenced in section 4.6) ──────────────────────
         # local_self_dict_literals[(file, cls, method)] ->
         #   {self_attr_name: {key: ast.expr}}
@@ -1607,7 +1606,6 @@ class ConstantTable:
                             for fk, fv in fields.items():
                                 merged.setdefault(fk, fv)
                             slot[param] = merged
-
     # ------------------------------------------------------------------
     # Phase E1.2 helpers
     # ------------------------------------------------------------------
@@ -2023,6 +2021,8 @@ class ConstantResolver:
         if scope.cls is not None:
             kw_set = self.table.ctor_kw_list_args.get(scope.cls, {}).get(node.id)
             if kw_set:
+                # Phase E1.2: when multiple list lengths exist across instances,
+                # pick the maximum as a conservative upper bound (section 4.4).
                 return max(kw_set)
         return None
 
