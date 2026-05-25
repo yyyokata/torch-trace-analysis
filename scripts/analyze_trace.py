@@ -2277,47 +2277,6 @@ def analyze_source_hotspots(events, source_files):
     }
 
 
-def _build_class_map_regex(source_files):
-    class_map = {}
-    for fname, lines in source_files.items():
-        current_class = None
-        current_method = None
-        for i, line in enumerate(lines, 1):
-            stripped = line.lstrip()
-            indent = len(line) - len(stripped)
-            m = re.match(r"^class (\w+)\(", stripped)
-            if m and indent == 0:
-                if current_class:
-                    class_map[(fname, current_class)]["end"] = i - 1
-                    if current_method:
-                        class_map[(fname, current_class)]["methods"][current_method] = (
-                            class_map[(fname, current_class)]["methods"][current_method][0], i - 1)
-                current_class = m.group(1)
-                class_map[(fname, current_class)] = {"start": i, "end": len(lines), "methods": {}}
-                current_method = None
-                continue
-            if current_class and indent == 0 and stripped and not stripped.startswith("#") and not stripped.startswith("@"):
-                if not stripped.startswith("class "):
-                    class_map[(fname, current_class)]["end"] = i - 1
-                    if current_method:
-                        class_map[(fname, current_class)]["methods"][current_method] = (
-                            class_map[(fname, current_class)]["methods"][current_method][0], i - 1)
-                    current_class = None
-                    current_method = None
-            if current_class:
-                m2 = re.match(r"def (\w+)\(", stripped)
-                if m2 and indent > 0:
-                    if current_method:
-                        class_map[(fname, current_class)]["methods"][current_method] = (
-                            class_map[(fname, current_class)]["methods"][current_method][0], i - 1)
-                    current_method = m2.group(1)
-                    class_map[(fname, current_class)]["methods"][current_method] = (i, len(lines))
-        if current_class and current_method:
-            class_map[(fname, current_class)]["methods"][current_method] = (
-                class_map[(fname, current_class)]["methods"][current_method][0],
-                class_map[(fname, current_class)].get("end", len(lines)))
-    return class_map
-
 
 def _build_class_map_ast(source_files):
     class_map = {}
@@ -2360,31 +2319,8 @@ def _build_class_map_ast(source_files):
 
 def _build_class_map(source_files):
     ast_map, failed_files = _build_class_map_ast(source_files)
-    regex_map = _build_class_map_regex(source_files)
     if failed_files:
-        for key, value in regex_map.items():
-            if key[0] in failed_files:
-                ast_map[key] = value
-
-    if set(ast_map.keys()) != set(regex_map.keys()):
-        _warn_regex_fallback("analyze_trace_ast_refactor", "_build_class_map", "class_key_mismatch")
-        return regex_map
-
-    for key in sorted(regex_map.keys()):
-        if key[0] in failed_files:
-            continue
-        a = ast_map.get(key) or {}
-        b = regex_map.get(key) or {}
-        if a.get("start") != b.get("start") or a.get("end") != b.get("end"):
-            _warn_regex_fallback("analyze_trace_ast_refactor", "_build_class_map", f"class_boundary_mismatch:{key[0]}:{key[1]}")
-            return regex_map
-        if set((a.get("methods") or {}).keys()) != set((b.get("methods") or {}).keys()):
-            _warn_regex_fallback("analyze_trace_ast_refactor", "_build_class_map", f"method_key_mismatch:{key[0]}:{key[1]}")
-            return regex_map
-        for mname, bounds in (b.get("methods") or {}).items():
-            if (a.get("methods") or {}).get(mname) != bounds:
-                _warn_regex_fallback("analyze_trace_ast_refactor", "_build_class_map", f"method_boundary_mismatch:{key[0]}:{key[1]}:{mname}")
-                return regex_map
+        print(f"[WARN] AST parse failed for {len(failed_files)} file(s): {sorted(failed_files)}", file=sys.stderr)
     return ast_map
 
 
@@ -6032,33 +5968,6 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
             return next(iter(vals))
         return None
 
-    def _extract_kw_int_args(call_text: str, fname: str):
-        """从 `Foo(a=..., b=...)` 的参数串中尽量提取 kw=int/CONST。
-        不做真正的括号/字符串完整解析，只做足够安全的近似：只匹配最外层的 `kw = ATOM`。
-        Iter11 unroll2: also accept `module.CONST` (e.g. `common.CVR_RAW_REVENUE_K`)
-        — we look up the constant globally by its tail name.
-        """
-        out = {}
-        if not call_text:
-            return out
-        # 先粗暴移除字符串内容，避免在字符串里误命中 kw=
-        scrub = re.sub(r"([\"\']).*?\1", "''", call_text)
-        # 普通形式： kw=NAME / kw=123
-        for m in re.finditer(r'\b(\w+)\s*=\s*([A-Z][A-Z0-9_]*|\d+)\b', scrub):
-            k = m.group(1)
-            v = _eval_int_atom(m.group(2), fname)
-            if v is not None:
-                out[k] = v
-        # 模块属性形式： kw=mod.NAME / kw=pkg.mod.NAME
-        for m in re.finditer(r'\b(\w+)\s*=\s*(?:[a-z_]\w*\.)+([A-Z][A-Z0-9_]*)\b', scrub):
-            k = m.group(1)
-            if k in out:
-                continue
-            v = _eval_int_atom(m.group(2), fname)
-            if v is not None:
-                out[k] = v
-        return out
-
     def _split_top_level(expr: str):
         """Split `expr` on top-level commas, respecting [], (), {} nesting.
         Returns a list of trimmed segments.
@@ -6217,25 +6126,6 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                     items = [it for it in items if it.strip()]
                     return len(items)
         return None
-
-    def _extract_kw_list_lens(call_text: str, fname: str):
-        """Extract kw=<list-expr> mappings whose list length can be statically
-        resolved. Returns {kw: int_length}.
-        """
-        out = {}
-        if not call_text:
-            return out
-        # Walk segments split at top-level commas to robustly extract kw=value.
-        for seg in _split_top_level(call_text):
-            m = re.match(r'^(\w+)\s*=\s*(.+)$', seg)
-            if not m:
-                continue
-            k = m.group(1)
-            v_expr = m.group(2).strip()
-            n = _eval_list_len(v_expr, fname)
-            if n is not None:
-                out[k] = n
-        return out
 
     # Build inheritance info - detect which classes extend nn.Module (or other user classes)
     nn_module_classes = set()
@@ -6441,55 +6331,6 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
         if last:
             parts.append(last)
         return parts
-
-    def _parse_list_ctor_items(list_inner: str):
-        items = []
-        for p in _split_top_level_commas(list_inner):
-            m = re.match(r'^\s*([\w.]+)\s*\(', p)
-            if m:
-                items.append(m.group(1).split('.')[-1])
-        return items
-
-    def _parse_dict_ctor_items(dict_inner: str):
-        items = []
-        # 顶层按逗号切，顶层按第一个冒号切
-        for p in _split_top_level_commas(dict_inner):
-            # split key:value
-            depth = 0
-            in_str = None
-            esc = False
-            split_i = None
-            for i, ch in enumerate(p):
-                if in_str:
-                    if esc:
-                        esc = False
-                    elif ch == '\\':
-                        esc = True
-                    elif ch == in_str:
-                        in_str = None
-                    continue
-                if ch in ("'", '"'):
-                    in_str = ch
-                    continue
-                if ch in '([{':
-                    depth += 1
-                elif ch in ')]}':
-                    depth = max(0, depth - 1)
-                if ch == ':' and depth == 0:
-                    split_i = i
-                    break
-            if split_i is None:
-                continue
-            k_expr = p[:split_i].strip()
-            v_expr = p[split_i + 1:].strip()
-            k = _normalize_str_key(k_expr)
-            if not k:
-                continue
-            m = re.match(r'^\s*([\w.]+)\s*\(', v_expr)
-            if not m:
-                continue
-            items.append((k, m.group(1).split('.')[-1]))
-        return items
 
     # Iter11: parse a literal list of string literals.
     # e.g. "['relation_layer', 'gift_layer', \"stay_layer\"]"
@@ -6950,7 +6791,6 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                 _ast_init_item = _ast_init_assignments_by_line.get(phys_lineno)
 
                 _ast_ctor_assign = _parse_local_ctor_assign(_local_stmt)
-                m_ctor = re.match(r'\s*self\.(\w+)\s*=\s*([\w.]+)\((.*)\)\s*$', line)
                 if _ast_ctor_assign:
                     _ctor_attr = _ast_ctor_assign.get("attr")
                     _cls_full = _ast_ctor_assign.get("class_full") or ""
@@ -6983,38 +6823,15 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                                 _kw_lens[k] = n
                         if _kw_lens and _ctor_attr:
                             instance_kw_list_lens[(cname, _ctor_attr)] = dict(_kw_lens)
-                elif m_ctor:
-                    _warn_regex_fallback("analyze_trace_ast_refactor", "build_static_module_tree", "direct_ctor_kw_parse")
-                    _ctor_attr = m_ctor.group(1)
-                    _cls_full = m_ctor.group(2)
-                    _cls = _cls_full.split('.')[-1]
-                    if _cls:
-                        for k, v in _extract_kw_int_args(m_ctor.group(3), fname).items():
-                            ctor_kw_int_args[_cls][k].add(v)
-                        # Iter17: also collect kw=<list-literal> lengths so that
-                        # ``for i, x in enumerate(<param>):`` inside the ctor of
-                        # ``_cls`` can later be expanded.
-                        _kw_lens = _extract_kw_list_lens(m_ctor.group(3), fname)
-                        for k, v in _kw_lens.items():
-                            ctor_kw_list_lens[_cls][k].add(v)
-                        # Iter17: per-instance binding so different call sites
-                        # of the same class can be expanded to different
-                        # numbers of children.
-                        if _kw_lens:
-                            instance_kw_list_lens[(cname, _ctor_attr)] = dict(_kw_lens)
 
                 # Direct assignment: self.xxx = ClassName(...)
-                m = re.match(r'\s*self\.(\w+)\s*=\s*([\w.]+)\(', line)
-                if _ast_ctor_assign or _ast_init_item or m:
+                if _ast_ctor_assign or _ast_init_item:
                     if _ast_ctor_assign:
                         attr_name = _ast_ctor_assign.get("attr")
                         cls_ref_full = _ast_ctor_assign.get("class_full") or ""
-                    elif _ast_init_item:
+                    else:
                         attr_name = _ast_init_item.get("attr")
                         cls_ref_full = _ast_init_item.get("class") or ""
-                    else:
-                        _warn_regex_fallback("analyze_trace_ast_refactor", "build_static_module_tree", "direct_ctor_assign")
-                        attr_name, cls_ref_full = m.groups()
                     cls_ref = cls_ref_full.split('.')[-1]
                     if cls_ref in nn_module_classes:
                         # Iter13 Step1: track conditional attrs regardless of mode.
@@ -7043,17 +6860,8 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                         # LG.feature_column(...), LG.dense_feature(...),
                         # LG.get_sample_rate(...), LG.get_bias(...)
                         _ast_lg = _parse_local_lg_assign(_local_stmt)
-                        _lg_m = re.match(
-                            r'\s*self\.(\w+)\s*=\s*LG\.(feature_column|dense_feature|get_sample_rate|get_bias)\s*\(',
-                            line)
                         if _ast_lg:
                             attr_name = _ast_lg.get("attr")
-                            attrs[attr_name] = "__LG_InputSource"
-                            attr_def_loc.setdefault((cname, attr_name), (fname, phys_lineno))
-                            input_source_attrs[cname].add(attr_name)
-                        elif _lg_m:
-                            _warn_regex_fallback("analyze_trace_ast_refactor", "build_static_module_tree", "lg_input_source")
-                            attr_name = _lg_m.group(1)
                             attrs[attr_name] = "__LG_InputSource"
                             attr_def_loc.setdefault((cname, attr_name), (fname, phys_lineno))
                             input_source_attrs[cname].add(attr_name)
@@ -7061,24 +6869,14 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                 # Detect fc_dict[...].get_vector(...) assigned to self.xxx
                 # Pattern: self.xxx = fc_dict[slot].get_vector(...) or similar
                 _ast_fc_gv = _parse_local_fc_get_vector_assign(_local_stmt)
-                _fc_gv_m = re.match(
-                    r'\s*self\.(\w+)\s*=\s*\w+(?:_dict|_fc)?\w*\[.*?\]\.get_vector\s*\(', line)
                 if _ast_fc_gv:
                     attr_name = _ast_fc_gv.get("attr")
                     if attr_name not in attrs:
                         attrs[attr_name] = "__LG_InputSource"
                         attr_def_loc.setdefault((cname, attr_name), (fname, phys_lineno))
                         input_source_attrs[cname].add(attr_name)
-                elif _fc_gv_m:
-                    _warn_regex_fallback("analyze_trace_ast_refactor", "build_static_module_tree", "fc_dict_get_vector")
-                    attr_name = _fc_gv_m.group(1)
-                    if attr_name not in attrs:
-                        attrs[attr_name] = "__LG_InputSource"
-                        attr_def_loc.setdefault((cname, attr_name), (fname, phys_lineno))
-                        input_source_attrs[cname].add(attr_name)
 
                 _ast_container_ctor = _parse_local_container_ctor(_local_stmt)
-                m_ml_lit = re.match(r'\s*self\.(\w+)\s*=\s*[\w.]*ModuleList\(\s*\[(.*)\]\s*\)\s*$', line)
                 if _ast_container_ctor and _ast_container_ctor.get("kind") == "ModuleList":
                     cont = _ast_container_ctor.get("attr")
                     _record_container_kind(cname, cont, "ModuleList")
@@ -7104,30 +6902,7 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                                     attrs.setdefault(cont, cls_ref)
                                     attr_def_loc.setdefault((cname, cont), (fname, phys_lineno))
                                     _ensure_elem(cont, cname, _elem_attr_list(cont, i), cls_ref, fname, phys_lineno, attrs)
-                elif m_ml_lit:
-                    _warn_regex_fallback("analyze_trace_ast_refactor", "build_static_module_tree", "modulelist_literal_ctor")
-                    cont = m_ml_lit.group(1)
-                    inner = m_ml_lit.group(2)
-                    _record_container_kind(cname, cont, "ModuleList")
-                    # 推导式： [Cls(...) for _ in range(N)]
-                    m_comp = re.search(r'^\s*([\w.]+)\s*\(.*\)\s*for\s+\w+\s+in\s+range\(\s*([A-Z][A-Z0-9_]*|\d+)\s*\)\s*$', inner)
-                    if m_comp:
-                        cls_ref = m_comp.group(1).split('.')[-1]
-                        n = _eval_int_atom(m_comp.group(2), fname)
-                        if n is not None and cls_ref in nn_module_classes:
-                            # 保留基线行为：container 仍映射到该类
-                            attrs.setdefault(cont, cls_ref)
-                            attr_def_loc.setdefault((cname, cont), (fname, phys_lineno))
-                            for i in range(n):
-                                _ensure_elem(cont, cname, _elem_attr_list(cont, i), cls_ref, fname, phys_lineno, attrs)
-                    else:
-                        for i, cls_ref in enumerate(_parse_list_ctor_items(inner)):
-                            if cls_ref in nn_module_classes:
-                                attrs.setdefault(cont, cls_ref)
-                                attr_def_loc.setdefault((cname, cont), (fname, phys_lineno))
-                                _ensure_elem(cont, cname, _elem_attr_list(cont, i), cls_ref, fname, phys_lineno, attrs)
 
-                m_md_lit = re.match(r'\s*self\.(\w+)\s*=\s*[\w.]*ModuleDict\(\s*\{(.*)\}\s*\)\s*$', line)
                 if _ast_container_ctor and _ast_container_ctor.get("kind") == "ModuleDict":
                     cont = _ast_container_ctor.get("attr")
                     _record_container_kind(cname, cont, "ModuleDict")
@@ -7144,16 +6919,6 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                                 attrs.setdefault(cont, cls_ref)
                                 attr_def_loc.setdefault((cname, cont), (fname, phys_lineno))
                                 _ensure_elem(cont, cname, _elem_attr_dict(cont, k), cls_ref, fname, phys_lineno, attrs)
-                elif m_md_lit:
-                    _warn_regex_fallback("analyze_trace_ast_refactor", "build_static_module_tree", "moduledict_literal_ctor")
-                    cont = m_md_lit.group(1)
-                    inner = m_md_lit.group(2)
-                    _record_container_kind(cname, cont, "ModuleDict")
-                    for k, cls_ref in _parse_dict_ctor_items(inner):
-                        if cls_ref in nn_module_classes:
-                            attrs.setdefault(cont, cls_ref)
-                            attr_def_loc.setdefault((cname, cont), (fname, phys_lineno))
-                            _ensure_elem(cont, cname, _elem_attr_dict(cont, k), cls_ref, fname, phys_lineno, attrs)
                 # ModuleList append: self.xxx.append(ClassName(...))
                 _ast_append_ctor = _parse_local_append_ctor(_local_stmt)
                 m2 = re.search(r'self\.(\w+)\.append\(\s*([\w.]+)\(', line)
