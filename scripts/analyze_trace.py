@@ -819,7 +819,1001 @@ class ASTFrontend:
                     return lit.value
         return None
 
+    # ------------------------------------------------------------------
+    # PR1: ConstantTable lazy accessor
+    # ------------------------------------------------------------------
+    # In PR1 the new evaluator stack (ConstantTable + ConstantResolver) is
+    # added as a *coexistent* skeleton next to the legacy regex+AST
+    # evaluator.  No production code path consumes the new stack yet; this
+    # accessor is the integration seam that future PRs (PR2 A/B comparison,
+    # PR3 regex deletion) will hook into.
+    #
+    # The ``fname`` argument is accepted for API symmetry with the design
+    # document's ``ConstantTable.build_all`` (which is intrinsically
+    # cross-file).  In PR1 we build a *single-file* table per ASTFrontend
+    # and cache it on the frontend instance so repeated calls are O(1).
+    # When PR2 wires a global ``ast_frontends: Dict[fname, ASTFrontend]``
+    # into ``build_static_module_tree`` we will switch to the cross-file
+    # build path; the public method signature stays the same.
+    def get_constant_table(self, fname: str = None):
+        """Return a lazily-built :class:`ConstantTable` for this frontend.
 
+        Parameters
+        ----------
+        fname : str, optional
+            Filename label for entries inserted into the table.  Defaults
+            to ``self.path`` or the literal string ``"<memory>"``.
+
+        Returns
+        -------
+        ConstantTable
+            A populated single-file constant table.  Subsequent calls
+            return the same cached instance unless ``fname`` differs (in
+            which case a new table is built and cached separately).
+        """
+        if not hasattr(self, "_constant_table_cache"):
+            self._constant_table_cache = {}
+        key = fname if fname is not None else (self.path or "<memory>")
+        cached = self._constant_table_cache.get(key)
+        if cached is not None:
+            return cached
+        table = ConstantTable.build_all(
+            source_files={key: self.source.split("\n")},
+            ast_frontends={key: self},
+            nn_module_classes={
+                cname for cname, info in self.class_registry.items()
+                if info.get("is_nn_module")
+            },
+        )
+        self._constant_table_cache[key] = table
+        return table
+
+
+
+
+# ===========================================================================
+# PR1: ConstantTable + ConstantResolver skeleton
+# ===========================================================================
+# Reference: ast_refactor_workdir/output/ast_evaluator_redesign.md (sections
+# 3-4).  These two classes form the "facts table + pure evaluator" pair that
+# will eventually replace the legacy regex+AST mixed evaluator (`_eval_int_atom`
+# / `_eval_list_len` / `_extract_kw_int_args` / `_extract_kw_list_lens` /
+# `_resolve_range_n` / `_resolve_iter_len`) per the 5-stage PR plan.
+#
+# Scope of PR1 (this commit):
+#   * Class skeletons exist and are *callable* (not just `pass` placeholders).
+#   * ConstantTable's 4-pass build path scans real AST nodes for the 14 tables
+#     listed in the design.  Multi-file dataclass field defaults / cross-file
+#     positional binding chains can be built but are intentionally NOT wired
+#     to any production caller.
+#   * ConstantResolver dispatches over the 9 AST node types in section 4.2
+#     (Constant / Name / Attribute / Subscript / BinOp / UnaryOp / Call /
+#     List / Starred) with `_eval_cache` + recursion-guard placeholders.
+#   * Failure path returns ``None`` -- never falls back to regex.
+#
+# Out of scope for PR1 (deferred to PR2+):
+#   * No legacy code path is replaced.  The 6 legacy evaluator functions are
+#     untouched; they continue to be the sole production evaluator.
+#   * Integration into `build_static_module_tree` is limited to the new
+#     ``ASTFrontend.get_constant_table()`` lazy accessor (above).  PR2 adds
+#     the ``--use-new-eval`` A/B switch.
+#   * `local_self_dict_literals` (referenced in section 4.6) is left as a
+#     stub method.  PR5 wires it for the scenario-5 transformer cases.
+#   * `EvalTrace` debug instrumentation is left as a no-op hook.
+# ---------------------------------------------------------------------------
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+
+@dataclass(frozen=True)
+class Scope:
+    """Evaluation context for ``ConstantResolver`` look-ups.
+
+    Every public ``eval_*`` call requires a fully-formed ``Scope``.  When
+    ``cls`` / ``method`` / ``parent_cls`` / ``parent_attr`` are unknown
+    they MUST be passed as ``None`` rather than the empty string -- the
+    table look-ups treat ``None`` as "not in any class/method", whereas
+    an empty string would silently match unrelated entries.
+    """
+
+    file: str
+    cls: Optional[str] = None
+    method: Optional[str] = None
+    parent_cls: Optional[str] = None
+    parent_attr: Optional[str] = None
+
+    @property
+    def class_key(self) -> Tuple[str, Optional[str]]:
+        return (self.file, self.cls)
+
+    @property
+    def method_key(self) -> Tuple[str, Optional[str], Optional[str]]:
+        return (self.file, self.cls, self.method)
+
+    @property
+    def instance_key(self) -> Tuple[Optional[str], Optional[str]]:
+        return (self.parent_cls, self.parent_attr)
+
+
+@dataclass(frozen=True)
+class IntValue:
+    """A resolved integer with provenance metadata for diagnostics."""
+
+    value: int
+    origin: str = "literal"
+
+
+@dataclass(frozen=True)
+class ListValue:
+    """A resolved list-length (with optional original AST element nodes)."""
+
+    length: int
+    items: Optional[Tuple[Any, ...]] = None
+    origin: str = "list_literal"
+
+
+# Sentinel used by ConstantResolver._eval_cache to break recursive cycles
+# (see case22 in the design document).  When a recursive eval re-enters the
+# same (scope, node) key the cache returns this object and the outer call
+# treats it as a soft-fail (None).
+_RECURSING = object()
+
+
+class ConstantTable:
+    """Pre-scanned facts about static integer / list constants in a code base.
+
+    The table is built once via :meth:`build_all` and is read-only thereafter.
+    All 14 tables documented in section 3.1 of ``ast_evaluator_redesign.md``
+    are exposed as plain ``Dict`` attributes; ``ConstantResolver`` consults
+    them through narrow accessor helpers.
+
+    The 14 tables:
+        1.  ``file_int_consts``        — file-level ``NAME = <int>``
+        2.  ``file_str_list_consts``   — file-level ``NAME = [<str>, ...]``
+        3.  ``file_dict_literals``     — file-level ``NAME = {<str>: ...}``
+        4.  ``global_int_consts``      — cross-file unique-int names
+        5.  ``class_init_params``      — ``__init__`` formal parameter lists
+        6.  ``dataclass_defaults``     — ``@dataclass`` field defaults
+        7.  ``ctor_kw_args``           — class-level kwargs (int values)
+        8.  ``ctor_kw_list_args``      — class-level kwargs (list-length)
+        9.  ``instance_kw_int``        — per-instance kwargs (int values)
+        10. ``instance_kw_list_len``   — per-instance kwargs (list-length)
+        11. ``instance_const_chain``   — per-instance dataclass field chains
+        12. ``local_aliases``          — method-level ``var = <expr>`` AST
+        13. ``local_dataclass_inst``   — method-level dataclass instances
+        14. ``self_to_param``          — ``self.attr`` → formal-param map
+    """
+
+    def __init__(self):
+        # ── File-level (table 1-3) ─────────────────────────────────────
+        self.file_int_consts: Dict[str, Dict[str, IntValue]] = {}
+        self.file_str_list_consts: Dict[str, Dict[str, ListValue]] = {}
+        self.file_dict_literals: Dict[str, Dict[str, Dict[str, ast.expr]]] = {}
+
+        # ── Global unique (table 4) ────────────────────────────────────
+        self.global_int_consts: Dict[str, IntValue] = {}
+
+        # ── Class-level (tables 5-8) ───────────────────────────────────
+        # class_init_params[(file, cls)] -> ['self', 'config', ...]
+        self.class_init_params: Dict[Tuple[str, str], List[str]] = {}
+        # dataclass_defaults[(file, cls)] -> {field: IntValue}
+        self.dataclass_defaults: Dict[Tuple[str, str], Dict[str, IntValue]] = {}
+        # ctor_kw_args[ClassName] -> {kw: {IntValue, ...}}
+        self.ctor_kw_args: Dict[str, Dict[str, Set[IntValue]]] = {}
+        # ctor_kw_list_args[ClassName] -> {kw: {list_len, ...}}
+        self.ctor_kw_list_args: Dict[str, Dict[str, Set[int]]] = {}
+
+        # ── Per-instance (tables 9-11) ─────────────────────────────────
+        self.instance_kw_int: Dict[Tuple[str, str], Dict[str, IntValue]] = {}
+        self.instance_kw_list_len: Dict[Tuple[str, str], Dict[str, int]] = {}
+        # instance_const_chain[(parent_cls, parent_attr)] ->
+        #   {param_name: {field: IntValue}}
+        self.instance_const_chain: Dict[
+            Tuple[str, str], Dict[str, Dict[str, IntValue]]
+        ] = {}
+
+        # ── Method-level (tables 12-13) ────────────────────────────────
+        # local_aliases[(file, cls, method)] -> {var_name: ast.expr}
+        self.local_aliases: Dict[Tuple[str, str, str], Dict[str, ast.expr]] = {}
+        # local_dataclass_inst[(file, cls, method)] -> {var: {field: IntValue}}
+        self.local_dataclass_inst: Dict[
+            Tuple[str, str, str], Dict[str, Dict[str, IntValue]]
+        ] = {}
+
+        # ── self.attr → param map (table 14) ───────────────────────────
+        self.self_to_param: Dict[Tuple[str, str], Dict[str, str]] = {}
+
+        # ── Auxiliary (referenced in section 4.6) ──────────────────────
+        # local_self_dict_literals[(file, cls, method)] ->
+        #   {self_attr_name: {key: ast.expr}}
+        # Stays empty in PR1; PR5 will populate it.
+        self.local_self_dict_literals: Dict[
+            Tuple[str, str, str], Dict[str, Dict[str, ast.expr]]
+        ] = {}
+
+        # ── Pass-1-private aggregator: per-file int-name → {value, ...}
+        # Used by Pass 2 to converge to a globally-unique int.  Not part of
+        # the 14 public tables.
+        self._global_int_candidates: Dict[str, Set[int]] = {}
+
+    # ------------------------------------------------------------------
+    # Public build entry point
+    # ------------------------------------------------------------------
+    @classmethod
+    def build_all(cls,
+                  source_files: Dict[str, List[str]],
+                  ast_frontends: Dict[str, "ASTFrontend"],
+                  nn_module_classes: Set[str]) -> "ConstantTable":
+        """Run all 4 passes and return a populated table.
+
+        Parameters
+        ----------
+        source_files : dict[str, list[str]]
+            ``{fname: source_lines}``.  Currently used only for parity with
+            the design doc; PR1 reads exclusively from ``ast_frontends``.
+        ast_frontends : dict[str, ASTFrontend]
+            One entry per ``fname``.  Frontends MUST already be parsed.
+        nn_module_classes : set[str]
+            Names of classes derived (transitively) from ``nn.Module``.
+        """
+        table = cls()
+        # Pass 1 — purely file-level scans.
+        for fname, fe in ast_frontends.items():
+            table._pass1_file_consts(fname, fe)
+        # Pass 2 — cross-file global-int convergence (depends on Pass 1).
+        table._pass2_global_converge()
+        # Pass 3 — class-level chains (depends on Pass 1 + 2).
+        for fname, fe in ast_frontends.items():
+            table._pass3_class_chains(fname, fe, nn_module_classes)
+        # Pass 4 — call-site formal-parameter binding (depends on Pass 3).
+        for fname, fe in ast_frontends.items():
+            table._pass4_callsite_bind(fname, fe, nn_module_classes)
+        return table
+
+    # ------------------------------------------------------------------
+    # Pass 1 — file-level constants, dataclass defaults
+    # ------------------------------------------------------------------
+    def _pass1_file_consts(self, fname: str, fe: "ASTFrontend") -> None:
+        """Scan the top-level ``ast.Module`` body of *fname*.
+
+        Populates:
+          * ``file_int_consts``
+          * ``file_str_list_consts``
+          * ``file_dict_literals``
+          * ``dataclass_defaults`` (for ``@dataclass`` decorated classes)
+          * ``_global_int_candidates`` (consumed by Pass 2)
+        """
+        for node in fe.tree.body:
+            if isinstance(node, ast.Assign) and len(node.targets) == 1:
+                tgt = node.targets[0]
+                if isinstance(tgt, ast.Name):
+                    self._record_file_const(fname, tgt.id, node.value)
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.value is not None:
+                self._record_file_const(fname, node.target.id, node.value)
+            elif isinstance(node, ast.ClassDef):
+                if self._is_dataclass(node):
+                    self._scan_dataclass_defaults(fname, node)
+
+    def _record_file_const(self, fname: str, name: str, value_node: ast.expr) -> None:
+        # int literal
+        if isinstance(value_node, ast.Constant) and isinstance(value_node.value, int) and not isinstance(value_node.value, bool):
+            iv = IntValue(value_node.value, "file_const")
+            self.file_int_consts.setdefault(fname, {})[name] = iv
+            self._global_int_candidates.setdefault(name, set()).add(value_node.value)
+            return
+        # negative int literal (UnaryOp(USub, Constant(int)))
+        if (isinstance(value_node, ast.UnaryOp)
+                and isinstance(value_node.op, ast.USub)
+                and isinstance(value_node.operand, ast.Constant)
+                and isinstance(value_node.operand.value, int)
+                and not isinstance(value_node.operand.value, bool)):
+            v = -value_node.operand.value
+            iv = IntValue(v, "file_const")
+            self.file_int_consts.setdefault(fname, {})[name] = iv
+            self._global_int_candidates.setdefault(name, set()).add(v)
+            return
+        # list of str literals
+        if isinstance(value_node, ast.List) and value_node.elts and all(
+            isinstance(elt, ast.Constant) and isinstance(elt.value, str)
+            for elt in value_node.elts
+        ):
+            self.file_str_list_consts.setdefault(fname, {})[name] = ListValue(
+                length=len(value_node.elts),
+                items=tuple(value_node.elts),
+                origin="file_str_list",
+            )
+            return
+        # dict literal with all-string keys (values stay as AST nodes — the
+        # resolver expands them on demand via ``eval_int`` / ``eval_list_len``)
+        if isinstance(value_node, ast.Dict):
+            d = {}
+            ok = True
+            for k, v in zip(value_node.keys, value_node.values):
+                if not (isinstance(k, ast.Constant) and isinstance(k.value, str)):
+                    ok = False
+                    break
+                d[k.value] = v
+            if ok and d:
+                self.file_dict_literals.setdefault(fname, {})[name] = d
+
+    def _is_dataclass(self, classdef_node: ast.ClassDef) -> bool:
+        for dec in classdef_node.decorator_list:
+            # @dataclass
+            if isinstance(dec, ast.Name) and dec.id == "dataclass":
+                return True
+            # @dataclasses.dataclass
+            if isinstance(dec, ast.Attribute) and dec.attr == "dataclass":
+                return True
+            # @dataclass(...) / @dataclasses.dataclass(...)
+            if isinstance(dec, ast.Call):
+                func = dec.func
+                if isinstance(func, ast.Name) and func.id == "dataclass":
+                    return True
+                if isinstance(func, ast.Attribute) and func.attr == "dataclass":
+                    return True
+        return False
+
+    def _scan_dataclass_defaults(self, fname: str, classdef_node: ast.ClassDef) -> None:
+        """For ``@dataclass class Foo: x: int = 5`` record ``x → IntValue(5)``.
+
+        Only int defaults are captured in PR1 (sections 3.1 + 4.5); PR5
+        extends this to recursive dataclass-instance defaults.
+        """
+        defaults: Dict[str, IntValue] = {}
+        for stmt in classdef_node.body:
+            if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name) and stmt.value is not None:
+                v = stmt.value
+                if isinstance(v, ast.Constant) and isinstance(v.value, int) and not isinstance(v.value, bool):
+                    defaults[stmt.target.id] = IntValue(v.value, "dataclass_field")
+                elif (isinstance(v, ast.UnaryOp) and isinstance(v.op, ast.USub)
+                      and isinstance(v.operand, ast.Constant)
+                      and isinstance(v.operand.value, int)
+                      and not isinstance(v.operand.value, bool)):
+                    defaults[stmt.target.id] = IntValue(-v.operand.value, "dataclass_field")
+        if defaults:
+            self.dataclass_defaults[(fname, classdef_node.name)] = defaults
+
+    # ------------------------------------------------------------------
+    # Pass 2 — cross-file global-int convergence
+    # ------------------------------------------------------------------
+    def _pass2_global_converge(self) -> None:
+        """Promote names whose value is identical across all defining files.
+
+        A name appears in ``global_int_consts`` only when **every** file
+        that defines it gives the *same* int.  This matches the existing
+        ``global_int_const_values`` semantics in the legacy evaluator.
+        """
+        for name, values in self._global_int_candidates.items():
+            if len(values) == 1:
+                v = next(iter(values))
+                self.global_int_consts[name] = IntValue(v, "global_const")
+
+    # ------------------------------------------------------------------
+    # Pass 3 — class-level chains
+    # ------------------------------------------------------------------
+    def _pass3_class_chains(self, fname: str, fe: "ASTFrontend",
+                            nn_module_classes: Set[str]) -> None:
+        """Scan every class in *fname* that participates in DAG construction.
+
+        For each qualifying class records:
+          * ``class_init_params`` (formal parameter names)
+          * ``self_to_param``     (``self.X = X`` aliases)
+          * ``local_aliases``     (``var = <expr>`` inside methods)
+          * ``ctor_kw_args``      (kwargs passed to the class as a ctor)
+          * ``ctor_kw_list_args`` (kwargs whose value is a list literal)
+        """
+        for cname, info in fe.class_registry.items():
+            classdef = info.get("node")
+            if classdef is None:
+                continue
+            qualifies = (cname in nn_module_classes
+                         or (fname, cname) in self.dataclass_defaults)
+            if not qualifies:
+                continue
+            self._scan_class_init_params(fname, cname, classdef)
+            self._scan_self_to_param(fname, cname, fe)
+            self._scan_local_aliases(fname, cname, classdef)
+            self._scan_ctor_call_sites(fname, cname, classdef)
+
+    def _scan_class_init_params(self, fname: str, cname: str,
+                                classdef: ast.ClassDef) -> None:
+        for stmt in classdef.body:
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) and stmt.name == "__init__":
+                params = []
+                # Note: stmt.args.args includes `self`; we keep it for index
+                # symmetry with the positional binding pass.
+                for a in stmt.args.args:
+                    params.append(a.arg)
+                # Skip *args / **kwargs (intentionally — section 8.1 R1).
+                self.class_init_params[(fname, cname)] = params
+                return
+
+    def _scan_self_to_param(self, fname: str, cname: str,
+                            fe: "ASTFrontend") -> None:
+        """Use ASTFrontend's existing ``get_self_param_aliases`` helper."""
+        try:
+            aliases = fe.get_self_param_aliases(cname, "__init__")
+        except Exception:
+            aliases = {}
+        if aliases:
+            self.self_to_param[(fname, cname)] = dict(aliases)
+
+    def _scan_local_aliases(self, fname: str, cname: str,
+                            classdef: ast.ClassDef) -> None:
+        """Record ``var = <expr>`` for every method in the class.
+
+        We keep the **right-hand-side AST node** (not its evaluated value)
+        so the resolver can recurse into it and benefit from memoization.
+        """
+        for stmt in classdef.body:
+            if not isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            mname = stmt.name
+            scope_key = (fname, cname, mname)
+            method_aliases: Dict[str, ast.expr] = {}
+            for sub in ast.walk(stmt):
+                if isinstance(sub, ast.Assign):
+                    for tgt in sub.targets:
+                        if isinstance(tgt, ast.Name):
+                            method_aliases[tgt.id] = sub.value
+                elif isinstance(sub, ast.AnnAssign) and isinstance(sub.target, ast.Name) and sub.value is not None:
+                    method_aliases[sub.target.id] = sub.value
+            if method_aliases:
+                self.local_aliases[scope_key] = method_aliases
+
+    def _scan_ctor_call_sites(self, fname: str, cname: str,
+                              classdef: ast.ClassDef) -> None:
+        """For ``self.x = SubClass(kw=<int>, kw2=[a,b,c])`` aggregate kwargs
+        into the *class-level* ``ctor_kw_args`` / ``ctor_kw_list_args``.
+
+        Per-instance specialisation happens in Pass 4 (``_pass4_callsite_bind``).
+        Both tables retain *all* observed values across instances (Set union)
+        so the resolver can detect non-unique results and conservatively fail.
+        """
+        for stmt in ast.walk(classdef):
+            if not isinstance(stmt, ast.Assign):
+                continue
+            value = stmt.value
+            if not isinstance(value, ast.Call):
+                continue
+            sub_cls = self._call_class_name(value.func)
+            if sub_cls is None:
+                continue
+            for kw in value.keywords:
+                if kw.arg is None:
+                    continue  # **kwargs unpack — skip; PR1 doesn't resolve
+                kw_val = kw.value
+                # int literal
+                if isinstance(kw_val, ast.Constant) and isinstance(kw_val.value, int) and not isinstance(kw_val.value, bool):
+                    iv = IntValue(kw_val.value, "kw_arg")
+                    self.ctor_kw_args.setdefault(sub_cls, {}).setdefault(kw.arg, set()).add(iv)
+                elif (isinstance(kw_val, ast.UnaryOp) and isinstance(kw_val.op, ast.USub)
+                      and isinstance(kw_val.operand, ast.Constant)
+                      and isinstance(kw_val.operand.value, int)
+                      and not isinstance(kw_val.operand.value, bool)):
+                    iv = IntValue(-kw_val.operand.value, "kw_arg")
+                    self.ctor_kw_args.setdefault(sub_cls, {}).setdefault(kw.arg, set()).add(iv)
+                # list literal — record length only
+                elif isinstance(kw_val, ast.List):
+                    self.ctor_kw_list_args.setdefault(sub_cls, {}).setdefault(kw.arg, set()).add(len(kw_val.elts))
+
+    # ------------------------------------------------------------------
+    # Pass 4 — call-site formal-parameter binding
+    # ------------------------------------------------------------------
+    def _pass4_callsite_bind(self, fname: str, fe: "ASTFrontend",
+                             nn_module_classes: Set[str]) -> None:
+        """Cross-call-site positional / keyword argument binding.
+
+        For every ``self.x = SubClass(arg0, arg1, kw=...)`` in *cname*:
+
+          1. Look up ``SubClass.__init__`` formal parameter list.
+          2. ``positional bind`` ``args[i] → params[i]``.
+          3. ``kwargs bind``    ``kw   → param_name``.
+          4. If the bound value resolves to a known dataclass instance
+             (via ``local_dataclass_inst`` populated lazily here), write
+             ``instance_const_chain[(cname, attr)][param] = field_dict``.
+          5. If the bound value is an int literal: write to
+             ``instance_kw_int``.
+          6. If the bound value is a list literal: write list length to
+             ``instance_kw_list_len``.
+
+        PR1 implements the basic int / list-literal arms (steps 5-6) so the
+        skeleton is callable end-to-end.  Steps 1-4 (dataclass propagation
+        across call sites — section 4.6) are stubbed; PR5 wires them.
+        """
+        for class_name, info in fe.class_registry.items():
+            classdef = info.get("node")
+            if classdef is None or class_name not in nn_module_classes:
+                continue
+            for stmt in ast.walk(classdef):
+                if not isinstance(stmt, ast.Assign):
+                    continue
+                target = stmt.targets[0] if len(stmt.targets) == 1 else None
+                attr_name = self._extract_self_attr_name(target) if target is not None else None
+                if attr_name is None:
+                    continue
+                value = stmt.value
+                if not isinstance(value, ast.Call):
+                    continue
+                sub_cls = self._call_class_name(value.func)
+                if sub_cls is None:
+                    continue
+                # --- Step 5/6: literal args via kwargs --------------------
+                for kw in value.keywords:
+                    if kw.arg is None:
+                        continue
+                    kw_val = kw.value
+                    if isinstance(kw_val, ast.Constant) and isinstance(kw_val.value, int) and not isinstance(kw_val.value, bool):
+                        self.instance_kw_int.setdefault((class_name, attr_name), {})[kw.arg] = IntValue(kw_val.value, "kw_arg")
+                    elif (isinstance(kw_val, ast.UnaryOp) and isinstance(kw_val.op, ast.USub)
+                          and isinstance(kw_val.operand, ast.Constant)
+                          and isinstance(kw_val.operand.value, int)
+                          and not isinstance(kw_val.operand.value, bool)):
+                        self.instance_kw_int.setdefault((class_name, attr_name), {})[kw.arg] = IntValue(-kw_val.operand.value, "kw_arg")
+                    elif isinstance(kw_val, ast.List):
+                        self.instance_kw_list_len.setdefault((class_name, attr_name), {})[kw.arg] = len(kw_val.elts)
+                # NOTE: Step 1-4 (positional binding + dataclass propagation)
+                # is intentionally a no-op in PR1.  PR5 will populate
+                # ``instance_const_chain`` here using the dataclass
+                # default tables built in Pass 1.
+
+    # ------------------------------------------------------------------
+    # Helpers (used by Pass 3 & 4)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _call_class_name(func_node: ast.expr) -> Optional[str]:
+        """Best-effort extract of the called class name from ``Call.func``.
+
+        Handles plain ``Cls(...)`` and ``mod.Cls(...)`` / ``a.b.Cls(...)``;
+        returns ``None`` for ``Cls(...).method(...)`` chains and other
+        non-constructor expressions.
+        """
+        if isinstance(func_node, ast.Name):
+            # Heuristic: ``ClassName`` style (PEP 8) — caller decides.
+            return func_node.id
+        if isinstance(func_node, ast.Attribute):
+            return func_node.attr
+        return None
+
+    @staticmethod
+    def _extract_self_attr_name(target: ast.expr) -> Optional[str]:
+        """For ``self.X = ...`` return ``"X"``; otherwise ``None``."""
+        if (isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)
+                and target.value.id == "self"):
+            return target.attr
+        return None
+
+
+class ConstantResolver:
+    """Pure AST-driven constant evaluator.
+
+    The resolver is **read-only**; it consults :class:`ConstantTable` but
+    never mutates it.  Failure semantics: every public ``eval_*`` returns
+    ``None`` when evaluation cannot be completed — *no regex fallback*.
+
+    Dispatch covers the 9 AST node types listed in section 4.2:
+
+        ============  =====================================
+        Node type     ``int`` evaluation path
+        ============  =====================================
+        Constant      literal int, possibly inside a list
+        Name          local alias / file const / global const
+        Attribute     arbitrary-depth ``self.<a>.<b>.<c>...``
+        Subscript     ``LIST[i]`` or ``self.x[i]`` (literal i)
+        BinOp         ``+ - * //`` arithmetic over ints
+        UnaryOp       unary ``-`` over ints
+        Call          ``len(...)`` / ``int(...)`` / dataclass()
+        List          (``list_len`` only) literal list length
+        Starred       (``list_len`` only) inner list length
+        ============  =====================================
+
+    Anything else returns ``None``.
+    """
+
+    # Conservative recursion depth limit (section 4.3).
+    _MAX_ATTR_CHAIN_DEPTH = 8
+
+    def __init__(self, table: ConstantTable):
+        self.table = table
+        # Cache key: (file, cls, method, parent_cls or "", parent_attr or "",
+        # id(node), kind).  Using ``id(node)`` skips the O(n) ``ast.unparse``
+        # cost while remaining stable for the lifetime of the table (section
+        # 3.3, R2).
+        self._eval_cache: Dict[Tuple[Any, ...], Any] = {}
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def resolve(self, node: ast.expr, scope: Scope, kind: str = "int") -> Any:
+        """Generic entry point used by the integration tests in PR1.
+
+        ``kind`` ∈ ``{"int", "list_len", "fields"}``; returns ``None`` on
+        any failure.  Most callers should prefer the typed wrappers below.
+        """
+        if kind == "int":
+            return self.eval_int(node, scope)
+        if kind == "list_len":
+            return self.eval_list_len(node, scope)
+        if kind == "fields":
+            return self.eval_dataclass_fields(node, scope)
+        return None
+
+    def eval_int(self, node: ast.expr, scope: Scope) -> Optional[IntValue]:
+        return self._cached(node, scope, "int", self._eval_int_uncached)
+
+    def eval_list_len(self, node: ast.expr, scope: Scope) -> Optional[int]:
+        return self._cached(node, scope, "list_len", self._eval_list_len_uncached)
+
+    def eval_dataclass_fields(self, node: ast.expr, scope: Scope) -> Optional[Dict[str, IntValue]]:
+        return self._cached(node, scope, "fields", self._eval_fields_uncached)
+
+    # ------------------------------------------------------------------
+    # Cache + recursion guard
+    # ------------------------------------------------------------------
+    def _cached(self, node, scope, kind, fn):
+        key = (
+            scope.file,
+            scope.cls or "",
+            scope.method or "",
+            scope.parent_cls or "",
+            scope.parent_attr or "",
+            id(node),
+            kind,
+        )
+        if key in self._eval_cache:
+            cached = self._eval_cache[key]
+            if cached is _RECURSING:
+                # Cycle detected — fail soft (case22).
+                return None
+            return cached
+        # Insert sentinel so a recursive re-entry on the same node sees it.
+        self._eval_cache[key] = _RECURSING
+        try:
+            result = fn(node, scope)
+        except Exception:
+            result = None
+        # Replace sentinel with actual result.
+        self._eval_cache[key] = result
+        return result
+
+    # ------------------------------------------------------------------
+    # int dispatcher
+    # ------------------------------------------------------------------
+    def _eval_int_uncached(self, node: ast.expr, scope: Scope) -> Optional[IntValue]:
+        if isinstance(node, ast.Constant):
+            return self._visit_Constant_int(node, scope)
+        if isinstance(node, ast.Name):
+            return self._visit_Name_int(node, scope)
+        if isinstance(node, ast.Attribute):
+            return self._visit_Attribute_int(node, scope)
+        if isinstance(node, ast.Subscript):
+            return self._visit_Subscript_int(node, scope)
+        if isinstance(node, ast.BinOp):
+            return self._visit_BinOp_int(node, scope)
+        if isinstance(node, ast.UnaryOp):
+            return self._visit_UnaryOp_int(node, scope)
+        if isinstance(node, ast.Call):
+            return self._visit_Call_int(node, scope)
+        return None
+
+    def _visit_Constant_int(self, node: ast.Constant, scope: Scope) -> Optional[IntValue]:
+        if isinstance(node.value, int) and not isinstance(node.value, bool):
+            return IntValue(node.value, "literal")
+        return None
+
+    def _visit_Name_int(self, node: ast.Name, scope: Scope) -> Optional[IntValue]:
+        # ① Method-local alias chain.
+        method_aliases = self.table.local_aliases.get(scope.method_key)
+        if method_aliases and node.id in method_aliases:
+            rhs = method_aliases[node.id]
+            sub = self.eval_int(rhs, scope)
+            if sub is not None:
+                return IntValue(sub.value, "alias")
+        # ② File-level constant.
+        file_consts = self.table.file_int_consts.get(scope.file, {})
+        if node.id in file_consts:
+            return file_consts[node.id]
+        # ③ Global unique constant.
+        if node.id in self.table.global_int_consts:
+            return self.table.global_int_consts[node.id]
+        # ④ Class formal parameter — try class-level union (only when unique).
+        if scope.cls is not None:
+            params = self.table.class_init_params.get((scope.file, scope.cls), [])
+            if node.id in params:
+                kw_set = self.table.ctor_kw_args.get(scope.cls, {}).get(node.id)
+                if kw_set and len(kw_set) == 1:
+                    return next(iter(kw_set))
+        return None
+
+    def _visit_Attribute_int(self, node: ast.Attribute, scope: Scope) -> Optional[IntValue]:
+        chain = self._flatten_attr_chain(node)
+        if chain is None:
+            return None
+        base, attrs = chain
+        if len(attrs) > self._MAX_ATTR_CHAIN_DEPTH:
+            return None
+        if isinstance(base, ast.Name) and base.id == "self":
+            return self._resolve_self_chain(attrs, scope)
+        return None
+
+    def _visit_Subscript_int(self, node: ast.Subscript, scope: Scope) -> Optional[IntValue]:
+        # Only literal int indices into a known list literal are supported.
+        # Section 4.2 explicitly allows: LIST_NAME[i] / self.x[i] when the
+        # base is ast.List / file_str_list_consts / local_aliases→list.
+        idx_node = node.slice
+        # Python 3.8 wraps subscripts in ast.Index.
+        if hasattr(ast, "Index") and isinstance(idx_node, ast.Index):
+            idx_node = idx_node.value  # type: ignore[attr-defined]
+        if not (isinstance(idx_node, ast.Constant) and isinstance(idx_node.value, int)):
+            return None
+        idx = idx_node.value
+        # Resolve the base to an ast.List literal.
+        base_list = self._resolve_to_list_literal(node.value, scope)
+        if base_list is None:
+            return None
+        if idx < 0:
+            idx += len(base_list.elts)
+        if not (0 <= idx < len(base_list.elts)):
+            return None
+        return self.eval_int(base_list.elts[idx], scope)
+
+    def _visit_BinOp_int(self, node: ast.BinOp, scope: Scope) -> Optional[IntValue]:
+        l = self.eval_int(node.left, scope)
+        r = self.eval_int(node.right, scope)
+        if l is None or r is None:
+            return None
+        try:
+            if isinstance(node.op, ast.Add):
+                return IntValue(l.value + r.value, "binop")
+            if isinstance(node.op, ast.Sub):
+                return IntValue(l.value - r.value, "binop")
+            if isinstance(node.op, ast.Mult):
+                return IntValue(l.value * r.value, "binop")
+            if isinstance(node.op, ast.FloorDiv):
+                if r.value == 0:
+                    return None
+                return IntValue(l.value // r.value, "binop")
+        except Exception:
+            return None
+        return None
+
+    def _visit_UnaryOp_int(self, node: ast.UnaryOp, scope: Scope) -> Optional[IntValue]:
+        if isinstance(node.op, ast.USub):
+            sub = self.eval_int(node.operand, scope)
+            if sub is None:
+                return None
+            return IntValue(-sub.value, "unaryop")
+        if isinstance(node.op, ast.UAdd):
+            return self.eval_int(node.operand, scope)
+        return None
+
+    def _visit_Call_int(self, node: ast.Call, scope: Scope) -> Optional[IntValue]:
+        # ``len([...])`` — degenerates into list_len.
+        if isinstance(node.func, ast.Name) and node.func.id == "len" and len(node.args) == 1:
+            n = self.eval_list_len(node.args[0], scope)
+            if n is not None:
+                return IntValue(n, "len_call")
+            return None
+        # ``int(<int_literal_or_str>)`` — narrow cast.
+        if isinstance(node.func, ast.Name) and node.func.id == "int" and len(node.args) == 1:
+            arg = node.args[0]
+            if isinstance(arg, ast.Constant):
+                if isinstance(arg.value, int) and not isinstance(arg.value, bool):
+                    return IntValue(arg.value, "int_cast")
+                if isinstance(arg.value, str):
+                    try:
+                        return IntValue(int(arg.value), "int_cast")
+                    except ValueError:
+                        return None
+            return self.eval_int(arg, scope)
+        # Dataclass(...) — section 4.2 says return None for int kind (the
+        # caller should use eval_dataclass_fields instead).
+        return None
+
+    # ------------------------------------------------------------------
+    # list_len dispatcher
+    # ------------------------------------------------------------------
+    def _eval_list_len_uncached(self, node: ast.expr, scope: Scope) -> Optional[int]:
+        if isinstance(node, ast.List):
+            return self._visit_List_list_len(node, scope)
+        if isinstance(node, ast.Name):
+            return self._visit_Name_list_len(node, scope)
+        if isinstance(node, ast.Attribute):
+            return self._visit_Attribute_list_len(node, scope)
+        if isinstance(node, ast.BinOp):
+            return self._visit_BinOp_list_len(node, scope)
+        if isinstance(node, ast.Starred):
+            return self._visit_Starred_list_len(node, scope)
+        if isinstance(node, ast.Call):
+            return None  # only int-returning calls are handled
+        return None
+
+    def _visit_List_list_len(self, node: ast.List, scope: Scope) -> Optional[int]:
+        total = 0
+        for elt in node.elts:
+            if isinstance(elt, ast.Starred):
+                n = self.eval_list_len(elt.value, scope)
+                if n is None:
+                    return None
+                total += n
+            else:
+                total += 1
+        return total
+
+    def _visit_Name_list_len(self, node: ast.Name, scope: Scope) -> Optional[int]:
+        # ① local alias → recurse on its RHS
+        method_aliases = self.table.local_aliases.get(scope.method_key)
+        if method_aliases and node.id in method_aliases:
+            return self.eval_list_len(method_aliases[node.id], scope)
+        # ② file-level str-list literal
+        file_lists = self.table.file_str_list_consts.get(scope.file, {})
+        if node.id in file_lists:
+            return file_lists[node.id].length
+        # ③ class-level kwarg union (only when single value)
+        if scope.cls is not None:
+            kw_set = self.table.ctor_kw_list_args.get(scope.cls, {}).get(node.id)
+            if kw_set and len(kw_set) == 1:
+                return next(iter(kw_set))
+        return None
+
+    def _visit_Attribute_list_len(self, node: ast.Attribute, scope: Scope) -> Optional[int]:
+        chain = self._flatten_attr_chain(node)
+        if chain is None:
+            return None
+        base, attrs = chain
+        if not (isinstance(base, ast.Name) and base.id == "self"):
+            return None
+        if len(attrs) != 1:
+            return None  # multi-level list_len not supported in PR1
+        cls_key = (scope.file, scope.cls)
+        param = self.table.self_to_param.get(cls_key, {}).get(attrs[0])
+        if param is None:
+            return None
+        # Per-instance overrides class-level.
+        inst_key = (scope.parent_cls, scope.parent_attr)
+        inst_lens = self.table.instance_kw_list_len.get(inst_key, {})
+        if param in inst_lens:
+            return inst_lens[param]
+        kw_set = self.table.ctor_kw_list_args.get(scope.cls, {}).get(param)
+        if kw_set and len(kw_set) == 1:
+            return next(iter(kw_set))
+        return None
+
+    def _visit_BinOp_list_len(self, node: ast.BinOp, scope: Scope) -> Optional[int]:
+        if isinstance(node.op, ast.Add):
+            l = self.eval_list_len(node.left, scope)
+            r = self.eval_list_len(node.right, scope)
+            if l is None or r is None:
+                return None
+            return l + r
+        if isinstance(node.op, ast.Mult):
+            for a, b in [(node.left, node.right), (node.right, node.left)]:
+                la = self.eval_list_len(a, scope)
+                ib = self.eval_int(b, scope)
+                if la is not None and ib is not None and ib.value >= 0:
+                    return la * ib.value
+        return None
+
+    def _visit_Starred_list_len(self, node: ast.Starred, scope: Scope) -> Optional[int]:
+        return self.eval_list_len(node.value, scope)
+
+    # ------------------------------------------------------------------
+    # dataclass-fields dispatcher
+    # ------------------------------------------------------------------
+    def _eval_fields_uncached(self, node: ast.expr, scope: Scope) -> Optional[Dict[str, IntValue]]:
+        if not isinstance(node, ast.Call):
+            return None
+        cls_name = ConstantTable._call_class_name(node.func)
+        if cls_name is None:
+            return None
+        # Look up dataclass defaults across all files.
+        defaults: Optional[Dict[str, IntValue]] = None
+        field_order: List[str] = []
+        for (fname, cname), d in self.table.dataclass_defaults.items():
+            if cname == cls_name:
+                defaults = dict(d)
+                field_order = list(d.keys())
+                break
+        if defaults is None:
+            return None
+        fields = dict(defaults)
+        # Positional args.
+        for i, arg in enumerate(node.args):
+            if isinstance(arg, ast.Starred) or i >= len(field_order):
+                return None  # conservative
+            v = self.eval_int(arg, scope)
+            if v is not None:
+                fields[field_order[i]] = v
+        # Keyword args.
+        for kw in node.keywords:
+            if kw.arg is None:
+                # **kwargs unpack — PR1 conservative fail.
+                return None
+            v = self.eval_int(kw.value, scope)
+            if v is not None:
+                fields[kw.arg] = v
+        return fields
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    def _flatten_attr_chain(self, node: ast.Attribute) -> Optional[Tuple[ast.expr, List[str]]]:
+        """Convert ``a.b.c.d`` into ``(<Name 'a'>, ['b', 'c', 'd'])``.
+
+        Returns ``None`` if the chain bottoms out at something other than a
+        bare ``ast.Name`` (e.g. a function call result).
+        """
+        attrs: List[str] = []
+        cur: ast.expr = node
+        while isinstance(cur, ast.Attribute):
+            attrs.append(cur.attr)
+            cur = cur.value
+        attrs.reverse()
+        if not isinstance(cur, (ast.Name, ast.Call)):
+            return None
+        return (cur, attrs)
+
+    def _resolve_self_chain(self, attrs: List[str], scope: Scope) -> Optional[IntValue]:
+        if scope.cls is None:
+            return None
+        cls_key = (scope.file, scope.cls)
+        # ── Length-1 chain: self.X ────────────────────────────────────
+        if len(attrs) == 1:
+            param = self.table.self_to_param.get(cls_key, {}).get(attrs[0])
+            if param is None:
+                return None
+            # Per-instance int override beats class-level union.
+            inst_key = (scope.parent_cls, scope.parent_attr)
+            inst_int = self.table.instance_kw_int.get(inst_key, {})
+            if param in inst_int:
+                return inst_int[param]
+            kw_set = self.table.ctor_kw_args.get(scope.cls, {}).get(param)
+            if kw_set and len(kw_set) == 1:
+                return next(iter(kw_set))
+            return None
+        # ── Length-2+ chain: self.X.Y...Z ─────────────────────────────
+        head = attrs[0]
+        param = self.table.self_to_param.get(cls_key, {}).get(head)
+        if param is None:
+            return None
+        inst_key = (scope.parent_cls, scope.parent_attr)
+        chain = self.table.instance_const_chain.get(inst_key, {}).get(param)
+        if chain is None:
+            return None
+        cur: Any = chain
+        for key in attrs[1:]:
+            if isinstance(cur, dict) and key in cur:
+                cur = cur[key]
+            else:
+                return None
+        if isinstance(cur, IntValue):
+            return cur
+        if isinstance(cur, int):
+            return IntValue(cur, "dataclass_field")
+        return None
+
+    def _resolve_to_list_literal(self, node: ast.expr, scope: Scope) -> Optional[ast.List]:
+        """Try to follow *node* down to a concrete ``ast.List`` literal."""
+        if isinstance(node, ast.List):
+            return node
+        if isinstance(node, ast.Name):
+            method_aliases = self.table.local_aliases.get(scope.method_key)
+            if method_aliases and node.id in method_aliases:
+                return self._resolve_to_list_literal(method_aliases[node.id], scope)
+            file_lists = self.table.file_str_list_consts.get(scope.file, {})
+            if node.id in file_lists:
+                items = file_lists[node.id].items
+                if items is not None:
+                    # Re-wrap into an ast.List for uniform handling.
+                    fake = ast.List(elts=list(items), ctx=ast.Load())
+                    return fake
+        return None
+
+
+# ===========================================================================
+# End of PR1 ConstantTable + ConstantResolver skeleton
+# ===========================================================================
 
 
 def _strip_inline_comment(code_line: str) -> str:
