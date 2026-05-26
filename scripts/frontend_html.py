@@ -48,6 +48,7 @@ from analyze_trace import (  # noqa: E402  (sys.path tweak above is intentional)
     _validate_timeline_modules,
     aggregate_runtime_instance_phase_times,
     aggregate_source_module_phase_times,
+    build_instance_timing_pipeline,
     build_main_thread_hierarchy,
     build_static_module_tree,
     extract_step_phase_intervals,
@@ -869,8 +870,8 @@ function render() {
                 tl.setAttribute('x', ox + pos.w/2); tl.setAttribute('y', oy + pos.h/2 + 12);
                 tl.setAttribute('text-anchor', 'middle');
                 tl.setAttribute('class', 'group-timing');
-                const totalUs = (g.pct / 100.0) * ((DATA.meta && DATA.meta.step_dur_us) || 0);
-                tl.textContent = `Total ${g.pct.toFixed(1)}% · ${formatDur(totalUs)}`;
+                // Kernel-only contract: g.dur_us already mirrors kernel_us.
+                tl.textContent = `Kernel ${g.pct.toFixed(1)}% · ${formatDur(g.dur_us)}`;
                 bindGroupHover(tl, gid);
                 svg.appendChild(tl);
             }
@@ -934,8 +935,8 @@ function render() {
             tl.setAttribute('x', ox + pos.w - 10); tl.setAttribute('y', oy + 18);
             tl.setAttribute('text-anchor', 'end');
             tl.setAttribute('class', 'group-timing');
-            const totalUs = (g.pct / 100.0) * ((DATA.meta && DATA.meta.step_dur_us) || 0);
-            tl.textContent = `Total ${g.pct.toFixed(1)}% · ${formatDur(totalUs)}`;
+            // Kernel-only contract: g.dur_us already mirrors kernel_us.
+            tl.textContent = `Kernel ${g.pct.toFixed(1)}% · ${formatDur(g.dur_us)}`;
             bindGroupHover(tl, gid);
             svg.appendChild(tl);
         }
@@ -1326,7 +1327,7 @@ function render() {
             topN.map(x => `<b>${x.label || x.class_name}</b> ${x.pct.toFixed(1)}%`).join(' → ')
         }</p>`;
     } else {
-        summaryDiv.innerHTML = `<h3>🏗️ Architecture Summary</h3><p>Total modules: ${allNodes.length + allGroups.length} | Expandable containers: ${allGroups.length} | Leaf nodes: ${allNodes.length}<br><i>Click ▶ collapsed containers to expand. Provide --trace-file for timing overlay.</i></p>`;
+        summaryDiv.innerHTML = `<h3>🏗️ Architecture Summary</h3><p>Module count: ${allNodes.length + allGroups.length} | Expandable containers: ${allGroups.length} | Leaf nodes: ${allNodes.length}<br><i>Click ▶ collapsed containers to expand. Provide --trace-file for timing overlay.</i></p>`;
     }
 }
 
@@ -1350,10 +1351,10 @@ function fmtTimingMs(value, forceShow) {
 
 function timingHelpText(kind) {
     const help = {
-        total: 'Inclusive time. Time spent in this module including its child modules.',
-        self: 'Exclusive time. Time spent in this module itself, excluding child modules.',
+        kernel: 'Kernel time. The cumulative GPU kernel time attributed to this module instance (forward + backward + other-phase kernels). Excludes optimizer kernels and host walltime.',
         forward: 'Forward time. GPU kernel time classified into the forward phase for this module instance.',
-        backward: 'Backward time. GPU kernel time classified into the backward phase for this module instance.'
+        backward: 'Backward time. GPU kernel time classified into the backward phase for this module instance.',
+        other: 'Other-phase kernel time. GPU kernel time attributed to this module that is neither forward nor backward (e.g. communication or fallback).'
     };
     return help[kind] || '';
 }
@@ -1365,12 +1366,16 @@ function renderTimingRow(label, value, kind) {
 function showTooltip(e, n) {
     const tt = document.getElementById('tooltip');
     let html = `<div class="tt-title">${n.attr_name || n.label || n.class_name} <span style="opacity:0.6">(${n.class_name || n.label || 'Module'})</span></div>`;
-    const totalMs = Number(n && n.dur_us || 0) / 1000.0;
-    const selfMs = computeSelfMs(n);
-    html += `<div class="tt-row">Total: ${fmtTimingMs(totalMs, true)}</div>`;
-    html += `<div class="tt-row">Self: ${fmtTimingMs(selfMs, true)}</div>`;
-    html += `<div class="tt-row">Forward: ${fmtTimingMs(n && n.forward_ms, true)}</div>`;
-    html += `<div class="tt-row">Backward: ${fmtTimingMs(n && n.backward_ms, true)}</div>`;
+    // Kernel-only contract: dur_us mirrors kernel_us; fwd/bwd/other are the
+    // only phase splits we expose. No host walltime / overhead displayed.
+    const kernelMs = Number(n && n.kernel_us != null ? n.kernel_us : (n.dur_us || 0)) / 1000.0;
+    const fwdMs = Number(n && n.fwd_kernel_us || 0) / 1000.0;
+    const bwdMs = Number(n && n.bwd_kernel_us || 0) / 1000.0;
+    const otherMs = Number(n && n.other_kernel_us || 0) / 1000.0;
+    html += `<div class="tt-row">Kernel: ${fmtTimingMs(kernelMs, true)}</div>`;
+    html += `<div class="tt-row">Forward: ${fmtTimingMs(fwdMs, true)}</div>`;
+    html += `<div class="tt-row">Backward: ${fmtTimingMs(bwdMs, true)}</div>`;
+    html += `<div class="tt-row">Other: ${fmtTimingMs(otherMs, true)}</div>`;
     tt.innerHTML = html;
     tt.style.left = (e.clientX + 12) + 'px';
     tt.style.top = (e.clientY + 12) + 'px';
@@ -1470,14 +1475,18 @@ function showSourcePanel(item) {
         : '(class definition not available in supplied sources)';
     document.getElementById('sp-subtitle').textContent = fileLabel;
     let bodyHtml = '';
-    const totalMs = Number(item && item.dur_us || 0) / 1000.0;
-    const selfMs = computeSelfMs(item);
+    // Kernel-only contract: dur_us mirrors kernel_us; fwd/bwd/other are the
+    // only phase splits we expose. No host walltime / overhead displayed.
+    const kernelMs = Number(item && item.kernel_us != null ? item.kernel_us : (item.dur_us || 0)) / 1000.0;
+    const fwdMs = Number(item && item.fwd_kernel_us || 0) / 1000.0;
+    const bwdMs = Number(item && item.bwd_kernel_us || 0) / 1000.0;
+    const otherMs = Number(item && item.other_kernel_us || 0) / 1000.0;
     if (item.has_timing || item.has_phase_timing) {
         bodyHtml += '<div class="side-panel-section"><h4>Timing</h4>' +
-            renderTimingRow('Total', totalMs, 'total') +
-            renderTimingRow('Self', selfMs, 'self') +
-            renderTimingRow('Forward', item && item.forward_ms, 'forward') +
-            renderTimingRow('Backward', item && item.backward_ms, 'backward') +
+            renderTimingRow('Kernel', kernelMs, 'kernel') +
+            renderTimingRow('Forward', fwdMs, 'forward') +
+            renderTimingRow('Backward', bwdMs, 'backward') +
+            renderTimingRow('Other', otherMs, 'other') +
             '</div>';
     }
     if (item.src_snippet) {
@@ -3231,9 +3240,11 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
             _cont_attr_id_map = {_ea: (_k, _id) for (_ea, _k, _id) in _cont_member_ids}
 
             # Aggregate timing for the container header: sum across members.
-            _cont_dur_us = 0.0
-            _cont_fwd_us = 0.0
-            _cont_bwd_us = 0.0
+            # Kernel-only contract: kernel_us = fwd_kernel + bwd_kernel + other_kernel.
+            _cont_kernel_us = 0.0
+            _cont_fwd_kernel_us = 0.0
+            _cont_bwd_kernel_us = 0.0
+            _cont_other_kernel_us = 0.0
             _cont_exc_us = 0.0
             _cont_calls = 0
             _cont_role = "main"
@@ -3241,22 +3252,22 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
                 if _k == "node":
                     for _n in dag_nodes:
                         if _n.get("id") == _id:
-                            _cont_dur_us += _n.get("dur_us", 0) or 0
-                            _cont_fwd_us += _n.get("fwd_us", 0) or 0
-                            _cont_bwd_us += _n.get("bwd_us", 0) or 0
+                            _cont_kernel_us += _n.get("kernel_us", 0) or 0
+                            _cont_fwd_kernel_us += _n.get("fwd_kernel_us", 0) or 0
+                            _cont_bwd_kernel_us += _n.get("bwd_kernel_us", 0) or 0
+                            _cont_other_kernel_us += _n.get("other_kernel_us", 0) or 0
                             _cont_calls += _n.get("calls", 0) or 0
                             break
                 else:
                     for _cg in _cont_children_groups:
                         if _cg.get("id") == _id:
-                            _cont_dur_us += _cg.get("dur_us", 0) or 0
-                            _cont_fwd_us += _cg.get("fwd_us", 0) or 0
-                            _cont_bwd_us += _cg.get("bwd_us", 0) or 0
+                            _cont_kernel_us += _cg.get("kernel_us", 0) or 0
+                            _cont_fwd_kernel_us += _cg.get("fwd_kernel_us", 0) or 0
+                            _cont_bwd_kernel_us += _cg.get("bwd_kernel_us", 0) or 0
+                            _cont_other_kernel_us += _cg.get("other_kernel_us", 0) or 0
                             _cont_calls += _cg.get("calls", 0) or 0
                             break
-            _cont_pct = _cont_dur_us / step_dur_us * 100 if step_dur_us > 0 else 0
-            _cont_fwd_pct = _cont_fwd_us / step_dur_us * 100 if step_dur_us > 0 else 0.0
-            _cont_bwd_pct = _cont_bwd_us / step_dur_us * 100 if step_dur_us > 0 else 0.0
+            _cont_pct = _cont_kernel_us / step_dur_us * 100 if step_dur_us > 0 else 0
 
             _container_group = {
                 "id": _container_gid,
@@ -3271,17 +3282,16 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
                 "attr_id_map": _cont_attr_id_map,
                 "pct": _cont_pct,
                 "exc_pct": 0,
-                "dur_us": _cont_dur_us,
-                "fwd_us": _cont_fwd_us,
-                "bwd_us": _cont_bwd_us,
-                "forward_ms": _cont_fwd_us / 1000.0,
-                "backward_ms": _cont_bwd_us / 1000.0,
-                "fwd_pct": _cont_fwd_pct,
-                "bwd_pct": _cont_bwd_pct,
-                "has_phase_timing": has_timing and (_cont_fwd_us > 0 or _cont_bwd_us > 0),
+                # Kernel-time fields (sum of children); dur_us mirrors kernel_us.
+                "kernel_us": _cont_kernel_us,
+                "fwd_kernel_us": _cont_fwd_kernel_us,
+                "bwd_kernel_us": _cont_bwd_kernel_us,
+                "other_kernel_us": _cont_other_kernel_us,
+                "dur_us": _cont_kernel_us,
+                "has_phase_timing": has_timing and (_cont_fwd_kernel_us > 0 or _cont_bwd_kernel_us > 0 or _cont_other_kernel_us > 0),
                 "calls": _cont_calls,
                 "role": _cont_role,
-                "has_timing": has_timing and _cont_dur_us > 0,
+                "has_timing": has_timing and _cont_kernel_us > 0,
                 # Click-to-source metadata: point at the container's
                 # constructor line (``self.<cont> = nn.ModuleDict(...)``).
                 "src_file": _cont_def_file,
@@ -3312,13 +3322,24 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
             child_groups.append(_container_group)
             dag_groups.append(_container_group)
 
-        # Timing info for group header
+        # Timing info for group header.
+        #
+        # Kernel-only contract:
+        #   * kernel_us       = fwd_kernel_us + bwd_kernel_us + other_kernel_us
+        #   * No walltime / overhead / optimizer time at the per-node level.
+        #
+        # Class-level fallbacks (``class_durations*``) are intentionally
+        # ignored here: per-instance disambiguation is the whole point of
+        # ``runtime_instance_timings_by_class``.  Falling back to class-level
+        # values would make multiple instances of the same class share
+        # identical timings and silently mask attribution bugs.
         inst_timing = _pick_instance_timing(cname, parent_attr_name)
-        dur = inst_timing["total_us"] if inst_timing else class_durations.get(cname, 0)
-        fwd_us = inst_timing["forward_us"] if inst_timing else class_durations_fwd.get(cname, 0.0)
-        bwd_us = inst_timing["backward_us"] if inst_timing else class_durations_bwd.get(cname, 0.0)
+        kernel_us = float(inst_timing["kernel_us"]) if inst_timing else 0.0
+        fwd_kernel_us = float(inst_timing["fwd_kernel_us"]) if inst_timing else 0.0
+        bwd_kernel_us = float(inst_timing["bwd_kernel_us"]) if inst_timing else 0.0
+        other_kernel_us = float(inst_timing["other_kernel_us"]) if inst_timing else 0.0
         exc = class_exclusive.get(cname, 0)
-        pct = dur / step_dur_us * 100 if step_dur_us > 0 else 0
+        pct = kernel_us / step_dur_us * 100 if step_dur_us > 0 else 0
         exc_pct = exc / step_dur_us * 100 if step_dur_us > 0 else 0
         calls_n = class_calls.get(cname, 0)
         role = class_thread_role.get(cname, "main")
@@ -3337,18 +3358,19 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
             "attr_id_map": attr_id_map,
             "pct": pct,
             "exc_pct": exc_pct,
-            "dur_us": dur,
-            # Forward/Backward split (instance-first, class fallback)
-            "fwd_us": fwd_us,
-            "bwd_us": bwd_us,
-            "forward_ms": fwd_us / 1000.0,
-            "backward_ms": bwd_us / 1000.0,
-            "fwd_pct": (fwd_us / step_dur_us * 100) if step_dur_us > 0 else 0.0,
-            "bwd_pct": (bwd_us / step_dur_us * 100) if step_dur_us > 0 else 0.0,
-            "has_phase_timing": has_timing and (fwd_us > 0 or bwd_us > 0),
+            # Kernel-time fields (the only timing fields exposed at the
+            # group level).  ``dur_us`` is kept as an alias for backwards
+            # compatibility with downstream layout code that still reads
+            # the old name; it is always equal to ``kernel_us``.
+            "kernel_us": kernel_us,
+            "fwd_kernel_us": fwd_kernel_us,
+            "bwd_kernel_us": bwd_kernel_us,
+            "other_kernel_us": other_kernel_us,
+            "dur_us": kernel_us,
+            "has_phase_timing": has_timing and (fwd_kernel_us > 0 or bwd_kernel_us > 0 or other_kernel_us > 0),
             "calls": calls_n,
             "role": role,
-            "has_timing": has_timing and dur > 0,
+            "has_timing": has_timing and kernel_us > 0,
             # Click-to-source metadata (same shape as leaf nodes)
             "src_file": gsrc.get("file"),
             "src_start_line": gsrc.get("start_line"),
@@ -3367,15 +3389,17 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
         return group
 
     def _make_dag_node(nid, attr_name, class_name, depth, parent_cname=None):
+        # Kernel-only contract; class-level fallbacks (``class_durations*``)
+        # are intentionally NOT consulted here — see ``_make_dag_group``
+        # comment for rationale.
         inst_timing = _pick_instance_timing(class_name, attr_name)
-        dur = inst_timing["total_us"] if inst_timing else class_durations.get(class_name, 0)
-        fwd = inst_timing["forward_us"] if inst_timing else class_durations_fwd.get(class_name, 0.0)
-        bwd = inst_timing["backward_us"] if inst_timing else class_durations_bwd.get(class_name, 0.0)
+        kernel_us = float(inst_timing["kernel_us"]) if inst_timing else 0.0
+        fwd_kernel_us = float(inst_timing["fwd_kernel_us"]) if inst_timing else 0.0
+        bwd_kernel_us = float(inst_timing["bwd_kernel_us"]) if inst_timing else 0.0
+        other_kernel_us = float(inst_timing["other_kernel_us"]) if inst_timing else 0.0
         exc = class_exclusive.get(class_name, 0)
-        pct = dur / step_dur_us * 100 if step_dur_us > 0 else 0
+        pct = kernel_us / step_dur_us * 100 if step_dur_us > 0 else 0
         exc_pct = exc / step_dur_us * 100 if step_dur_us > 0 else 0
-        fwd_pct = fwd / step_dur_us * 100 if step_dur_us > 0 else 0.0
-        bwd_pct = bwd / step_dur_us * 100 if step_dur_us > 0 else 0.0
         calls_n = class_calls.get(class_name, 0)
         role = class_thread_role.get(class_name, "main")
         src = class_source_info.get(class_name, {})
@@ -3386,18 +3410,18 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
             "depth": depth,
             "pct": pct,
             "exc_pct": exc_pct,
-            "dur_us": dur,
-            # Forward/Backward split (best-effort)
-            "fwd_us": fwd,
-            "bwd_us": bwd,
-            "forward_ms": fwd / 1000.0,
-            "backward_ms": bwd / 1000.0,
-            "fwd_pct": fwd_pct,
-            "bwd_pct": bwd_pct,
-            "has_phase_timing": has_timing and (fwd > 0 or bwd > 0),
+            # Kernel-time fields (the only timing fields exposed at the
+            # leaf-node level).  ``dur_us`` mirrors ``kernel_us`` for
+            # backwards compatibility with layout / hover code.
+            "kernel_us": kernel_us,
+            "fwd_kernel_us": fwd_kernel_us,
+            "bwd_kernel_us": bwd_kernel_us,
+            "other_kernel_us": other_kernel_us,
+            "dur_us": kernel_us,
+            "has_phase_timing": has_timing and (fwd_kernel_us > 0 or bwd_kernel_us > 0 or other_kernel_us > 0),
             "calls": calls_n,
             "role": role,
-            "has_timing": has_timing and dur > 0,
+            "has_timing": has_timing and kernel_us > 0,
             # Click-to-source metadata
             "src_file": src.get("file"),
             "src_start_line": src.get("start_line"),
@@ -5987,60 +6011,67 @@ def build_timing_data_from_trace(events, source_files, mod_info, step_dur_us, pr
     timing_data["phase_interval_steps"] = len(step_infos)
 
     if step_infos and source_files:
-        class_phase_us = aggregate_source_module_phase_times(events, source_files, step_infos)
-        for base, phases in class_phase_us.items():
-            fwd_dur = float(phases.get("forward", 0.0))
-            bwd_dur = float(phases.get("backward", 0.0))
-            total_dur = fwd_dur + bwd_dur
-            timing_data["class_durations_fwd"][base] = fwd_dur
-            timing_data["class_durations_bwd"][base] = bwd_dur
-            if total_dur > 0:
-                timing_data["class_durations"][base] = total_dur
-                if base not in timing_data["class_thread_role"]:
-                    timing_data["class_thread_role"][base] = "main"
+        # ------------------------------------------------------------------
+        # New 4-step instance-level timing pipeline (replaces legacy
+        # aggregate_source_module_phase_times +
+        # aggregate_runtime_instance_phase_times +
+        # _aggregate_kernel_callsite_buckets).
+        #
+        # Design doc: timing_fix_workdir/output/timing_redesign.md
+        # ------------------------------------------------------------------
+        panel = build_instance_timing_pipeline(
+            events, source_files, class_map, step_infos, step_dur_us,
+        )
+        # Class-level totals from instance inclusive (overwrite wrapped-event
+        # estimates; new pipeline is authoritative).
+        for cls, total_us in panel["class_durations"].items():
+            timing_data["class_durations"][cls] = total_us
+            if cls not in timing_data["class_thread_role"]:
+                timing_data["class_thread_role"][cls] = "main"
+        for cls, v in panel["class_durations_fwd"].items():
+            timing_data["class_durations_fwd"][cls] = v
+        for cls, v in panel["class_durations_bwd"].items():
+            timing_data["class_durations_bwd"][cls] = v
 
-        runtime_instance_timings = aggregate_runtime_instance_phase_times(events, step_infos)
-        filtered_runtime = {}
+        # Instance-level: filter to known classes only.
         known_classes = {cname for (_fname, cname) in class_map.keys()}
-        for class_name, items in runtime_instance_timings.items():
+        filtered_runtime = {}
+        for class_name, items in panel["runtime_instance_timings_by_class"].items():
             if class_name not in known_classes:
                 continue
-            target_fwd = float(class_phase_us.get(class_name, {}).get("forward", 0.0))
-            target_bwd = float(class_phase_us.get(class_name, {}).get("backward", 0.0))
-            adjusted_items = [dict(item) for item in items]
-
-            runtime_fwd_sum = sum(float(item.get("forward_us", 0.0)) for item in adjusted_items)
-            if adjusted_items and target_fwd > 0:
-                if runtime_fwd_sum > 0:
-                    scale = target_fwd / runtime_fwd_sum
-                    for item in adjusted_items:
-                        item["forward_us"] = float(item.get("forward_us", 0.0)) * scale
-                else:
-                    even = target_fwd / len(adjusted_items)
-                    for item in adjusted_items:
-                        item["forward_us"] = even
-
-            runtime_bwd_sum = sum(float(item.get("backward_us", 0.0)) for item in adjusted_items)
-            if adjusted_items and target_bwd > 0:
-                if runtime_bwd_sum > 0:
-                    scale = target_bwd / runtime_bwd_sum
-                    for item in adjusted_items:
-                        item["backward_us"] = float(item.get("backward_us", 0.0)) * scale
-                else:
-                    weight_sum = sum(float(item.get("forward_us", 0.0)) for item in adjusted_items)
-                    if weight_sum <= 0:
-                        even = target_bwd / len(adjusted_items)
-                        for item in adjusted_items:
-                            item["backward_us"] = even
-                    else:
-                        for item in adjusted_items:
-                            weight = float(item.get("forward_us", 0.0)) / weight_sum
-                            item["backward_us"] = target_bwd * weight
-
-            for item in adjusted_items:
-                item["total_us"] = float(item.get("forward_us", 0.0) + item.get("backward_us", 0.0) + item.get("optimize_us", 0.0) + item.get("other_us", 0.0))
-            filtered_runtime[class_name] = adjusted_items
+            # Field-name compatibility shim: map new pipeline names
+            # (``total_us`` / ``forward_us`` / ``backward_us`` / ``other_us``)
+            # to the kernel-only contract (``kernel_us`` / ``fwd_kernel_us`` /
+            # ``bwd_kernel_us`` / ``other_kernel_us``) that the existing
+            # frontend (`_make_dag_node` etc.) reads directly. The new
+            # pipeline already produces self (exclusive) values for these
+            # fields, so the rename is a 1:1 alias — no scaling.
+            shimmed = []
+            for item in items:
+                it = dict(item)
+                it.setdefault("kernel_us", float(item.get("total_us", 0.0)))
+                it.setdefault("fwd_kernel_us", float(item.get("forward_us", 0.0)))
+                it.setdefault("bwd_kernel_us", float(item.get("backward_us", 0.0)))
+                it.setdefault("other_kernel_us", float(item.get("other_us", 0.0)))
+                shimmed.append(it)
+            filtered_runtime[class_name] = shimmed
         timing_data["runtime_instance_timings_by_class"] = filtered_runtime
+        timing_data["_timing_pipeline_stats"] = panel.get("_timing_pipeline_stats", {})
+
+        # Debug print (rate-limited).
+        try:
+            ts_stats = panel.get("_timing_pipeline_stats", {})
+            if ts_stats:
+                print(
+                    f"  [timing pipeline] kernels={ts_stats.get('total_kernels',0)} "
+                    f"fwd_attr={ts_stats.get('fwd_attributed',0)} "
+                    f"bwd_attr={ts_stats.get('bwd_attributed',0)} "
+                    f"wrapped_fb={ts_stats.get('wrapped_fallback',0)} "
+                    f"unattr={ts_stats.get('fwd_unattributed',0)+ts_stats.get('bwd_unattributed',0)} "
+                    f"bwd_flow_narrow={ts_stats.get('bwd_via_flow_narrowed',0)}"
+                )
+        except Exception:
+            pass
 
     return timing_data
 
@@ -6276,15 +6307,11 @@ def _generate_flowchart_html(data):
     # ensure_ascii=True is safer for character handling
     data_json = _json.dumps(data, ensure_ascii=True)
     html_template = FLOWCHART_HTML_TEMPLATE
-    # Timing label fix (cherry-picked from iter11_timing_work.py):
-    # group `pct` is inclusive Total%, while group `dur_us` is exclusive Self
-    # duration. When falling back to a template that still uses the old label
-    # formula, rebuild the SVG label from inclusive total time so users see
-    # consistent "Total X% · Y ms" rather than mixed inclusive% / exclusive ms.
-    html_template = html_template.replace(
-        "tl.textContent = `${g.pct.toFixed(1)}% · ${formatDur(g.dur_us)}`;",
-        "const totalUs = (g.pct / 100.0) * ((DATA.meta && DATA.meta.step_dur_us) || 0);\n                tl.textContent = `Total ${g.pct.toFixed(1)}% · ${formatDur(totalUs)}`;"
-    )
+    # NOTE: The legacy "Total X% · Y" → totalUs reflow patch that previously
+    # lived here is gone.  After the kernel-field migration the in-template
+    # SVG label already reads `Kernel ${g.pct.toFixed(1)}% · ${formatDur(g.dur_us)}`
+    # directly (g.dur_us mirrors kernel_us), so no post-hoc replace is
+    # needed.
 
     # ------------------------------------------------------------------
     # Iter14-aggr: front-end hover de-dup for synthetic container boundaries.
