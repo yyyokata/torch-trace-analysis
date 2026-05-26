@@ -10,6 +10,7 @@ import copy
 import tarfile
 import argparse
 import subprocess
+import textwrap
 import tokenize
 from collections import defaultdict
 
@@ -93,60 +94,21 @@ if _SCRIPT_DIR not in sys.path:
 
 
 # ---------------------------------------------------------------------------
-# PR2 — A/B switch for the new ConstantTable + ConstantResolver evaluator.
-#
-# Default ``False`` — preserves the legacy regex+AST mixed evaluator path,
-# byte-for-byte identical to PR1.  When ``True`` (via the ``--use-new-eval``
-# CLI flag or programmatic override), every call site of the legacy
-# ``_eval_int_atom`` / ``_eval_list_len`` / ``_resolve_range_n`` /
-# ``_resolve_iter_len`` is routed through the new ``ConstantResolver`` and
-# both results are recorded into ``_AB_EVAL_DIFFS`` for diffing.
-#
-# The switch is intentionally a *module-level* mutable global so that:
-#   * a CLI run can flip it from ``main()`` before ``build_static_module_tree``
-#     is called,
-#   * a test harness can flip it from a fixture (``analyze_trace.USE_NEW_EVAL
-#     = True``),
-#   * ``build_static_module_tree`` reads it via the closure helper
-#     ``_use_new_eval()`` so callers can safely mutate it any time before the
-#     scan starts.
+# PR3 — ConstantResolver is now the only production evaluator path.
+# Keep the module-level switch for compatibility with older tests / scripts,
+# but default it to ``True`` and no longer maintain a legacy fallback path.
 # ---------------------------------------------------------------------------
-USE_NEW_EVAL: bool = False
+USE_NEW_EVAL: bool = True
 
-# A/B diff log: filled when ``USE_NEW_EVAL`` is True.  Each entry is a tuple
-# ``(call_site, expr_text, legacy_result, new_result)``.  Cleared at the
-# start of every ``build_static_module_tree`` invocation.
-_AB_EVAL_DIFFS: list = []  # populated lazily; see _ab_record()
-
-
-def _ab_record(call_site: str, expr_text: str, legacy, new):
-    """Append a single A/B diff observation to the global diff log.
-
-    Records *every* (legacy, new) result pair when ``USE_NEW_EVAL`` is True
-    -- both matches and mismatches.  The caller filters by equality at
-    summary time.
-    """
-    _AB_EVAL_DIFFS.append({
-        "site": call_site,
-        "expr": expr_text,
-        "legacy": legacy,
-        "new": new,
-        "match": (legacy == new) or (legacy is None and new is None),
-    })
+# Retain the report hook for diagnostics compatibility. PR3 no longer records
+# legacy/new diffs, so the log stays empty unless future instrumentation adds
+# explicit entries.
+_AB_EVAL_DIFFS: list = []
 
 
 def _ab_summary():
-    """Return ``(matches, mismatches, mismatch_examples)`` for diagnostics."""
-    matches = sum(1 for e in _AB_EVAL_DIFFS if e.get("match"))
-    mismatches = [e for e in _AB_EVAL_DIFFS if not e.get("match")]
-    return matches, len(mismatches), mismatches[:20]
-
-
-def _warn_regex_fallback(module: str, function: str, case: str):
-    print(
-        f"[WARNING] Regex fallback triggered: {module}/{function}/{case}. AST parsing did not cover this path; treat as bug signal and investigate.",
-        file=sys.stderr,
-    )
+    """Return an empty A/B summary placeholder kept for CLI compatibility."""
+    return 0, 0, []
 
 
 class ASTFrontend:
@@ -400,39 +362,148 @@ class ASTFrontend:
         ))
         return calls
 
+    def _joinedstr_affixes(self, node):
+        if not isinstance(node, ast.JoinedStr):
+            return None
+        parts = []
+        for value in node.values:
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                parts.append(value.value)
+            else:
+                parts.append(None)
+        prefix_parts = []
+        for part in parts:
+            if part is None:
+                break
+            prefix_parts.append(part)
+        suffix_parts = []
+        for part in reversed(parts):
+            if part is None:
+                break
+            suffix_parts.append(part)
+        return "".join(prefix_parts), "".join(reversed(suffix_parts))
+
+    def _dynamic_attr_expr_matches(self, expr, target_attr):
+        if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
+            return expr.value == target_attr
+        affixes = self._joinedstr_affixes(expr)
+        if affixes is None:
+            return False
+        prefix, suffix = affixes
+        if prefix and not target_attr.startswith(prefix):
+            return False
+        if suffix and not target_attr.endswith(suffix):
+            return False
+        return bool(prefix or suffix)
+
+    def _is_self_getattr_call(self, node):
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "getattr"
+            and len(node.args) >= 2
+            and isinstance(node.args[0], ast.Name)
+            and node.args[0].id == "self"
+        )
+
     def get_first_call_loc(self, class_name, attr_name):
         method_names = ["forward"]
         if self.get_method_lines(class_name, "forward") is None:
             return None
         method_names.extend(sorted(self.get_reachable_helpers(class_name, "forward")))
+        target_attr = attr_name.split("[", 1)[0] if "[" in attr_name else attr_name
         best = None
         for method_name in method_names:
             for call in self.get_module_calls(class_name, method_name):
                 called_attr = call.get("attr")
-                if called_attr == attr_name or ("[" in attr_name and called_attr == attr_name.split("[", 1)[0]):
+                if called_attr == attr_name or called_attr == target_attr:
                     line = call.get("line")
                     if line is None:
                         continue
                     cand = (self.path or "", line)
                     if best is None or line < best[1]:
                         best = cand
+            method_node = self._get_method_node(class_name, method_name)
+            if method_node is None:
+                continue
+            alias_bindings = defaultdict(list)
+            nodes = sorted(
+                ast.walk(method_node),
+                key=lambda node: (
+                    getattr(node, "lineno", 10 ** 9),
+                    getattr(node, "col_offset", 10 ** 9),
+                ),
+            )
+            for node in nodes:
+                if isinstance(node, ast.Assign) and self._is_self_getattr_call(node.value):
+                    if self._dynamic_attr_expr_matches(node.value.args[1], target_attr):
+                        assign_line = getattr(node, "lineno", None)
+                        for target in node.targets:
+                            if isinstance(target, ast.Name) and assign_line is not None:
+                                alias_bindings[target.id].append(assign_line)
+                    continue
+                if isinstance(node, ast.Call) and self._is_self_getattr_call(node.func):
+                    if self._dynamic_attr_expr_matches(node.func.args[1], target_attr):
+                        line = getattr(node, "lineno", None)
+                        if line is None:
+                            continue
+                        cand = (self.path or "", line)
+                        if best is None or line < best[1]:
+                            best = cand
+                        continue
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                    alias_lines = alias_bindings.get(node.func.id) or []
+                    line = getattr(node, "lineno", None)
+                    if line is None:
+                        continue
+                    if any(alias_line <= line for alias_line in alias_lines):
+                        cand = (self.path or "", line)
+                        if best is None or line < best[1]:
+                            best = cand
         return best
+
+    def _lookup_var_env_entry(self, env, var_name, phys_lineno=None):
+        chain = env.get(var_name) or []
+        if not isinstance(chain, list):
+            chain = [chain]
+        matched = None
+        for item in chain:
+            if not item:
+                continue
+            line = item[1] if len(item) > 1 else None
+            if phys_lineno is None:
+                matched = item
+                continue
+            if line is not None and line <= phys_lineno:
+                matched = item
+        return matched
 
     def build_var_env(self, class_name, method_name):
         method_node = self._get_method_node(class_name, method_name)
         if method_node is None:
             return {}
         env = {}
+        alias_env = {}
         stmt_infos = self._get_stmt_infos(class_name, method_name)
         for info in stmt_infos:
+            line = info.get("line")
+            rhs_vars = info.get("rhs_vars") or []
+            targets = [target for target in (info.get("targets") or []) if target and target != "_"]
             producer_attr = info.get("producer_attr")
             if not producer_attr:
-                continue
-            line = info.get("line")
-            excerpt = self._line_excerpt(line)
-            for target in info.get("targets", []):
-                if target and target != "_":
-                    env[target] = (producer_attr, line, excerpt)
+                for rhs_var in rhs_vars:
+                    root = alias_env.get(rhs_var, rhs_var)
+                    entry = self._lookup_var_env_entry(env, root, line)
+                    if entry:
+                        producer_attr = entry[0]
+                        break
+            if producer_attr:
+                for target in targets:
+                    env.setdefault(target, []).append((producer_attr, line))
+            if info.get("kind") == "assign" and len(rhs_vars) == 1:
+                root = alias_env.get(rhs_vars[0], rhs_vars[0])
+                for target in targets:
+                    alias_env[target] = root
         return env
 
     def build_alias_env(self, class_name, method_name):
@@ -472,8 +543,9 @@ class ASTFrontend:
             if not producer_attr:
                 for rhs_var in info.get("rhs_vars") or []:
                     root = alias_env.get(rhs_var, rhs_var)
-                    if root in var_env:
-                        producer_attr = var_env[root][0]
+                    entry = self._lookup_var_env_entry(var_env, root, line)
+                    if entry:
+                        producer_attr = entry[0]
                         break
             if producer_attr:
                 slot_env[(dict_var, dict_key)] = (producer_attr, line)
@@ -533,8 +605,13 @@ class ASTFrontend:
                 idx_node = node.slice.value if isinstance(node.slice, ast.Index) else node.slice
                 if isinstance(idx_node, ast.Constant) and isinstance(idx_node.value, int):
                     continue
-                idx_text = self._node_to_text(idx_node).strip()
-                if re.fullmatch(r'-?\d+', idx_text):
+                # Also treat ``-N`` as a literal integer index (UnaryOp(USub, Constant(int))).
+                if (
+                    isinstance(idx_node, ast.UnaryOp)
+                    and isinstance(idx_node.op, ast.USub)
+                    and isinstance(idx_node.operand, ast.Constant)
+                    and isinstance(idx_node.operand.value, int)
+                ):
                     continue
                 out.add(owner.attr)
         return out
@@ -680,6 +757,7 @@ class ASTFrontend:
             "line": getattr(node, "lineno", None),
             "rhs_text": rhs_text,
             "rhs_vars": rhs_vars,
+            "rhs_node": node.value,
             "targets": [],
             "producer_attr": self._extract_called_self_attr(node.value.func) if isinstance(node.value, ast.Call) else None,
         }
@@ -751,12 +829,27 @@ class ASTFrontend:
     def _literal_key(self, node):
         if isinstance(node, ast.Constant):
             return node.value
+        # AST-only fallback: parse the textual representation as an
+        # expression and inspect the resulting node.  No regex is used.
         text = self._node_to_text(node).strip()
-        m = re.match(r'^(?:["\'])(.*)(?:["\'])$', text)
-        if m:
-            return m.group(1)
-        if re.fullmatch(r'\d+', text):
-            return int(text)
+        try:
+            tree = ast.parse(text, mode='eval')
+        except SyntaxError:
+            return '*'
+        body = tree.body
+        if isinstance(body, ast.Constant):
+            if isinstance(body.value, str):
+                return body.value
+            if isinstance(body.value, int):
+                return body.value
+        # Negative integer literal e.g. ``-1`` parses as UnaryOp(USub, Constant(int)).
+        if (
+            isinstance(body, ast.UnaryOp)
+            and isinstance(body.op, ast.USub)
+            and isinstance(body.operand, ast.Constant)
+            and isinstance(body.operand.value, int)
+        ):
+            return -body.operand.value
         return '*'
 
     def _line_excerpt(self, lineno):
@@ -778,12 +871,18 @@ class ASTFrontend:
                 return str(node.value)
             if isinstance(node.value, str):
                 return "'" + node.value.replace("'", "\\'") + "'"
+        # AST-only fallback: parse textual representation and inspect the node.
         text = self._node_to_text(node).strip()
-        if re.fullmatch(r'\d+', text):
-            return str(int(text))
-        m = re.match(r'^(["\'])(.*)\1$', text)
-        if m:
-            return "'" + m.group(2).replace("'", "\\'") + "'"
+        try:
+            tree = ast.parse(text, mode='eval')
+        except SyntaxError:
+            return None
+        body = tree.body
+        if isinstance(body, ast.Constant):
+            if isinstance(body.value, int):
+                return str(body.value)
+            if isinstance(body.value, str):
+                return "'" + body.value.replace("'", "\\'") + "'"
         return None
 
     def _extract_self_method_name(self, func_node):
@@ -3329,7 +3428,6 @@ def _build_class_map_ast(source_files):
         try:
             fe = ASTFrontend(source='\n'.join(lines), path=fname)
         except Exception:
-            _warn_regex_fallback("analyze_trace_ast_refactor", "_build_class_map_ast", f"parse_failed:{fname}")
             failed_files.add(fname)
             continue
         file_failed = False
@@ -3338,7 +3436,6 @@ def _build_class_map_ast(source_files):
             start = getattr(cls_node, "lineno", None)
             end = getattr(cls_node, "end_lineno", None)
             if start is None or end is None:
-                _warn_regex_fallback("analyze_trace_ast_refactor", "_build_class_map_ast", f"missing_class_bounds:{fname}:{cname}")
                 file_failed = True
                 break
             methods = {}
@@ -3347,7 +3444,6 @@ def _build_class_map_ast(source_files):
                 mend = method.get("end_lineno")
                 mname = method.get("name")
                 if not mname or mstart is None or mend is None:
-                    _warn_regex_fallback("analyze_trace_ast_refactor", "_build_class_map_ast", f"missing_method_bounds:{fname}:{cname}:{mname or 'unknown'}")
                     file_failed = True
                     break
                 methods[mname] = (mstart, mend)
@@ -3382,17 +3478,25 @@ def _build_source_dependency_order(source_files, class_map):
             try:
                 ast_frontends[fname] = ASTFrontend(source='\n'.join(source_files.get(fname, [])), path=fname)
             except Exception:
-                _warn_regex_fallback("analyze_trace_ast_refactor", "_build_source_dependency_order", f"ASTFrontend_init:{fname}")
                 ast_frontends[fname] = None
         return ast_frontends[fname]
 
     def _norm_index(idx_expr: str):
         idx_expr = (idx_expr or '').strip()
-        if re.fullmatch(r'\d+', idx_expr):
-            return str(int(idx_expr))
-        m = re.match(r"^([\"\'])(.*)\1$", idx_expr)
-        if m:
-            return "'" + m.group(2).replace("'", "\\'") + "'"
+        if not idx_expr:
+            return None
+        # AST-only path: parse the textual index as a Python expression and
+        # only accept integer or string Constant nodes.
+        try:
+            tree = ast.parse(idx_expr, mode='eval')
+        except SyntaxError:
+            return None
+        body = tree.body
+        if isinstance(body, ast.Constant):
+            if isinstance(body.value, int):
+                return str(body.value)
+            if isinstance(body.value, str):
+                return "'" + body.value.replace("'", "\\'") + "'"
         return None
 
     for fname, lines in source_files.items():
@@ -3407,15 +3511,6 @@ def _build_source_dependency_order(source_files, class_map):
                     cls_ref = (item.get("class") or "").split('.')[-1]
                     if attr_name and cls_ref:
                         attr_to_class[(fname, attr_name)] = cls_ref
-            else:
-                init_range = info["methods"].get("__init__")
-                if init_range:
-                    for i in range(init_range[0] - 1, min(init_range[1], len(lines))):
-                        line = lines[i]
-                        m = re.match(r'\s+self\.(\w+)\s*=\s*(\w+)\(', line)
-                        if m:
-                            attr_name, cls_ref = m.groups()
-                            attr_to_class[(fname, attr_name)] = cls_ref
 
             # Parse forward() reachable helpers to find self.xxx(...) and self.xxx[idx](...) call order
             call_order = []
@@ -3425,33 +3520,6 @@ def _build_source_dependency_order(source_files, class_map):
                     for call in fe.get_module_calls(cname, method_name):
                         attr_name = call.get("attr")
                         if attr_name and attr_name not in call_order and attr_name != "forward":
-                            call_order.append(attr_name)
-            if not call_order:
-                fwd_range = info["methods"].get("forward")
-                if not fwd_range:
-                    continue
-                for i in range(fwd_range[0] - 1, min(fwd_range[1], len(lines))):
-                    line = lines[i]
-                    # Match indexed: self.attr[IDX](...) ; 若 IDX 为字面量则归一到 attr[IDX]
-                    for m in re.finditer(r'self\.(\w+)\[\s*([^\]]+?)\s*\]\s*\(', line):
-                        base = m.group(1)
-                        idx = _norm_index(m.group(2))
-                        attr_name = f"{base}[{idx}]" if idx is not None else base
-                        if attr_name not in call_order and attr_name != 'forward':
-                            call_order.append(attr_name)
-
-                    # Match direct: self.attr(...)
-                    for m in re.finditer(r'self\.(\w+)\s*\(', line):
-                        attr_name = m.group(1)
-                        if attr_name not in call_order and attr_name != "forward":
-                            call_order.append(attr_name)
-
-                    # Also match getattr(self, name)(...) where name is a literal string.
-                    # Dynamic-name getattr cannot be resolved here (will be handled in data-dep edges
-                    # and via remaining attrs fallback), but literal getattr helps ordering.
-                    for m in re.finditer(r'getattr\(\s*self\s*,\s*([\"\'])([^\"\']+)\1\s*\)\s*\(', line):
-                        attr_name = m.group(2)
-                        if attr_name not in call_order and attr_name != "forward":
                             call_order.append(attr_name)
             module_call_order[cname] = call_order
 
@@ -3501,14 +3569,20 @@ def _build_data_dependency_edges(source_files, class_map, module_attrs, class_st
     # 全局（跨 class）共享 dict 槽位：{(fname, dict_name): {key: (producers, from_line, var_evidence)}}
     shared_dict_slots = defaultdict(dict)
 
-    _STR_LIT_RE = re.compile(r"^([\"\'])(.*)\1$")
-
     def _as_str_lit(s: str):
-        s = s.strip()
-        m = _STR_LIT_RE.match(s)
-        if not m:
+        """AST-only string-literal extraction.  Returns the literal value
+        for ``"abc"`` / ``'abc'``, otherwise ``None``."""
+        s = (s or '').strip()
+        if not s:
             return None
-        return m.group(2)
+        try:
+            tree = ast.parse(s, mode='eval')
+        except SyntaxError:
+            return None
+        body = tree.body
+        if isinstance(body, ast.Constant) and isinstance(body.value, str):
+            return body.value
+        return None
 
     def _dict_union_slots(dslots: dict):
         """将 dict 的所有槽位 producers 合并（key 非字面量时使用）。"""
@@ -3526,74 +3600,135 @@ def _build_data_dependency_edges(source_files, class_map, module_attrs, class_st
     def _collect_dict_reads(expr: str, dict_slots: dict, fname: str):
         """从表达式中收集 dict 读取产生的 producers。
 
+        AST-only walk.  Recognises:
+          * ``d['k']`` / ``d[var]``  → ast.Subscript with ast.Name owner
+          * ``d.get('k', ...)``      → ast.Call with ast.Attribute func of '.get'
+
         返回：
           producers_set, evidence_map(producer_attr -> (var_evidence, from_line))
         """
         prod = set()
         ev_map = {}
+        if not expr:
+            return prod, ev_map
+        # Parse as expression; tolerate top-level commas via tuple wrap.
+        try:
+            tree = ast.parse(expr, mode='eval')
+        except SyntaxError:
+            try:
+                tree = ast.parse("(" + expr + ")", mode='eval')
+            except SyntaxError:
+                return prod, ev_map
 
-        # d['k']
-        for m in re.finditer(r"\b(\w+)\s*\[\s*([^\]]+?)\s*\]", expr):
-            dname = m.group(1)
-            key_expr = m.group(2).strip()
-            dslots = dict_slots.get(dname) or shared_dict_slots.get((fname, dname))
-            if not dslots:
-                continue
-            key_lit = _as_str_lit(key_expr)
-            if key_lit is not None and key_lit in dslots:
-                ps, pl, pv = dslots[key_lit]
-                prod.update(ps)
-                for p in ps:
-                    prev = ev_map.get(p)
-                    if prev is None or (pl is not None and pl > prev[1]):
-                        ev_map[p] = (f"{dname}['{key_lit}']", pl)
-            else:
-                ps, pl, pv = _dict_union_slots(dslots)
-                prod.update(ps)
-                for p in ps:
-                    prev = ev_map.get(p)
-                    if prev is None or (pl is not None and pl > prev[1]):
-                        ev_map[p] = (f"{dname}[{key_expr}]", pl)
+        def _idx_text(idx_node):
+            if isinstance(idx_node, ast.Index):  # py<3.9
+                idx_node = idx_node.value
+            try:
+                return ast.unparse(idx_node).strip()
+            except Exception:
+                return ""
 
-        # d.get('k', ...)
-        for m in re.finditer(r"\b(\w+)\.get\(\s*([^,\)]+)", expr):
-            dname = m.group(1)
-            key_expr = m.group(2).strip()
-            dslots = dict_slots.get(dname) or shared_dict_slots.get((fname, dname))
-            if not dslots:
-                continue
-            key_lit = _as_str_lit(key_expr)
-            if key_lit is not None and key_lit in dslots:
-                ps, pl, pv = dslots[key_lit]
-                prod.update(ps)
-                for p in ps:
-                    prev = ev_map.get(p)
-                    if prev is None or (pl is not None and pl > prev[1]):
-                        ev_map[p] = (f"{dname}.get('{key_lit}')", pl)
-            else:
-                ps, pl, pv = _dict_union_slots(dslots)
-                prod.update(ps)
-                for p in ps:
-                    prev = ev_map.get(p)
-                    if prev is None or (pl is not None and pl > prev[1]):
-                        ev_map[p] = (f"{dname}.get({key_expr})", pl)
+        for sub in ast.walk(tree):
+            # d[k] / d['k']
+            if isinstance(sub, ast.Subscript) and isinstance(sub.value, ast.Name):
+                dname = sub.value.id
+                idx_node = sub.slice
+                if isinstance(idx_node, ast.Index):
+                    idx_node = idx_node.value
+                key_expr = _idx_text(idx_node)
+                dslots = dict_slots.get(dname) or shared_dict_slots.get((fname, dname))
+                if not dslots:
+                    continue
+                if isinstance(idx_node, ast.Constant) and isinstance(idx_node.value, str):
+                    key_lit = idx_node.value
+                else:
+                    key_lit = _as_str_lit(key_expr)
+                if key_lit is not None and key_lit in dslots:
+                    ps, pl, pv = dslots[key_lit]
+                    prod.update(ps)
+                    for p in ps:
+                        prev = ev_map.get(p)
+                        if prev is None or (pl is not None and pl > prev[1]):
+                            ev_map[p] = (f"{dname}['{key_lit}']", pl)
+                else:
+                    ps, pl, pv = _dict_union_slots(dslots)
+                    prod.update(ps)
+                    for p in ps:
+                        prev = ev_map.get(p)
+                        if prev is None or (pl is not None and pl > prev[1]):
+                            ev_map[p] = (f"{dname}[{key_expr}]", pl)
+            # d.get('k', ...)
+            elif (
+                isinstance(sub, ast.Call)
+                and isinstance(sub.func, ast.Attribute)
+                and sub.func.attr == "get"
+                and isinstance(sub.func.value, ast.Name)
+                and sub.args
+            ):
+                dname = sub.func.value.id
+                key_node = sub.args[0]
+                key_expr = _idx_text(key_node)
+                dslots = dict_slots.get(dname) or shared_dict_slots.get((fname, dname))
+                if not dslots:
+                    continue
+                if isinstance(key_node, ast.Constant) and isinstance(key_node.value, str):
+                    key_lit = key_node.value
+                else:
+                    key_lit = _as_str_lit(key_expr)
+                if key_lit is not None and key_lit in dslots:
+                    ps, pl, pv = dslots[key_lit]
+                    prod.update(ps)
+                    for p in ps:
+                        prev = ev_map.get(p)
+                        if prev is None or (pl is not None and pl > prev[1]):
+                            ev_map[p] = (f"{dname}.get('{key_lit}')", pl)
+                else:
+                    ps, pl, pv = _dict_union_slots(dslots)
+                    prod.update(ps)
+                    for p in ps:
+                        prev = ev_map.get(p)
+                        if prev is None or (pl is not None and pl > prev[1]):
+                            ev_map[p] = (f"{dname}.get({key_expr})", pl)
 
         return prod, ev_map
 
     def _collect_expr_producers(expr: str, var_producers: dict, dict_slots: dict, fname: str):
-        """统一收集一个表达式的 producers（普通变量 + dict reads）。"""
+        """统一收集一个表达式的 producers（普通变量 + dict reads）。
+
+        AST-only walk over ``ast.Name`` nodes for variable references,
+        plus delegation to ``_collect_dict_reads`` for dict-based flow.
+        """
         producers = set()
         best_line = None
         best_var = None
 
-        # 普通变量引用
-        for var, (ps, ploc) in var_producers.items():
-            if re.search(r"\b" + re.escape(var) + r"\b", expr):
-                if ps:
-                    producers.update(ps)
-                    if ploc is not None and (best_line is None or ploc > best_line):
-                        best_line = ploc
-                        best_var = var
+        # 普通变量引用：parse expression and walk Name nodes.
+        if expr and var_producers:
+            tree = None
+            try:
+                tree = ast.parse(expr, mode='eval')
+            except SyntaxError:
+                try:
+                    tree = ast.parse("(" + expr + ")", mode='eval')
+                except SyntaxError:
+                    tree = None
+            if tree is not None:
+                seen_vars = set()
+                for sub in ast.walk(tree):
+                    if isinstance(sub, ast.Name):
+                        var = sub.id
+                        if var in seen_vars:
+                            continue
+                        seen_vars.add(var)
+                        info = var_producers.get(var)
+                        if not info:
+                            continue
+                        ps, ploc = info
+                        if ps:
+                            producers.update(ps)
+                            if ploc is not None and (best_line is None or ploc > best_line):
+                                best_line = ploc
+                                best_var = var
 
         # dict 读取
         dps, dev = _collect_dict_reads(expr, dict_slots, fname)
@@ -3744,8 +3879,8 @@ def _build_data_dependency_edges(source_files, class_map, module_attrs, class_st
 
             def _vars_in(expr_text):
                 """Return tracked var names that textually appear in expr_text
-                (word-boundary match), preserving expression order so the most
-                relevant carrier (last) is at the end."""
+                (AST walk, ``ast.Name`` only), preserving expression order so
+                the most relevant carrier (last) is at the end."""
                 if not expr_text:
                     return []
                 hits = []
@@ -3754,10 +3889,24 @@ def _build_data_dependency_edges(source_files, class_map, module_attrs, class_st
                 # (module-rooted tracking) so we don't miss variables that have
                 # producers but no recorded lineage step yet.
                 _candidates = set(var_lineage.keys()) | set(var_producers.keys())
-                for v in _candidates:
-                    if not v or v == '_':
-                        continue
-                    if re.search(r'\b' + re.escape(v) + r'\b', expr_text):
+                if not _candidates:
+                    return []
+                # AST-only path: parse the expression and walk Name nodes in
+                # source order.  ``ast.parse`` requires a complete expression;
+                # wrap as ``(expr,)`` to tolerate top-level comma-separated
+                # arg-strings without changing Name semantics.
+                try:
+                    tree = ast.parse(expr_text, mode='eval')
+                except SyntaxError:
+                    try:
+                        tree = ast.parse("(" + expr_text + ")", mode='eval')
+                    except SyntaxError:
+                        return []
+                for sub in ast.walk(tree):
+                    if isinstance(sub, ast.Name):
+                        v = sub.id
+                        if not v or v == '_' or v not in _candidates:
+                            continue
                         if v not in seen:
                             seen.add(v)
                             hits.append(v)
@@ -3882,21 +4031,38 @@ def _build_data_dependency_edges(source_files, class_map, module_attrs, class_st
             # container -> [elem_attr,...] (ModuleList/ModuleDict 展开后的子节点)
             # 约定：elem_attr 形如 "layers[0]" / "loss_fns['ctr0']" / "blocks[*]"
             container_to_elems = defaultdict(list)
-            _elem_re = re.compile(r'^(\w+)\[(.+)\]$')
+
+            def _split_indexed_attr(attr_name):
+                """Pure-string split of ``container[idx]`` style attr names.
+                Returns (container_name, idx_text) or ``None`` when the attr
+                does not look like an indexed reference.  No regex is used —
+                only matching brackets at the very end of the string and an
+                identifier head for the container."""
+                if not attr_name or not attr_name.endswith(']'):
+                    return None
+                lb = attr_name.find('[')
+                if lb <= 0 or lb >= len(attr_name) - 1:
+                    return None
+                head = attr_name[:lb]
+                if not (head.isidentifier()):
+                    return None
+                inner = attr_name[lb + 1:-1]
+                return head, inner
+
             for a in known_attrs:
-                m = _elem_re.match(a)
-                if not m:
+                split = _split_indexed_attr(a)
+                if not split:
                     continue
-                container_to_elems[m.group(1)].append(a)
+                container_to_elems[split[0]].append(a)
             # 稳定排序：优先按 [数字] 排序，否则按字典序
             for cont in list(container_to_elems.keys()):
                 elems = container_to_elems[cont]
                 num_elems = []
                 other = []
                 for ea in elems:
-                    mm = re.match(r'^' + re.escape(cont) + r'\[(\d+)\]$', ea)
-                    if mm:
-                        num_elems.append((int(mm.group(1)), ea))
+                    sp = _split_indexed_attr(ea)
+                    if sp and sp[0] == cont and sp[1].isdigit():
+                        num_elems.append((int(sp[1]), ea))
                     else:
                         other.append(ea)
                 if num_elems and not other:
@@ -3906,11 +4072,19 @@ def _build_data_dependency_edges(source_files, class_map, module_attrs, class_st
 
             def _norm_index_expr(idx_expr: str):
                 idx_expr = (idx_expr or '').strip()
-                if re.fullmatch(r'\d+', idx_expr):
-                    return str(int(idx_expr))
-                m = re.match(r"^([\"\'])(.*)\1$", idx_expr)
-                if m:
-                    return "'" + m.group(2).replace("'", "\\'") + "'"
+                if not idx_expr:
+                    return None
+                # AST-only path: only int / str Constant nodes are accepted.
+                try:
+                    tree = ast.parse(idx_expr, mode='eval')
+                except SyntaxError:
+                    return None
+                body = tree.body
+                if isinstance(body, ast.Constant):
+                    if isinstance(body.value, int):
+                        return str(body.value)
+                    if isinstance(body.value, str):
+                        return "'" + body.value.replace("'", "\\'") + "'"
                 return None
 
             def _resolve_indexed_attr(container: str, idx_expr: str):
@@ -3949,10 +4123,83 @@ def _build_data_dependency_edges(source_files, class_map, module_attrs, class_st
                 _method_text_cache[_mname] = "\n".join(
                     lines[_mrange[0] - 1: min(_mrange[1], len(lines))])
 
+            # AST cache for helper-method discovery: parse each method body once
+            # and reuse for both attr-call detection and self-method-call lookup.
+            _method_ast_cache = {}
+
+            def _parse_method_ast(_text: str):
+                """Parse method body text via ast.parse; returns the function-body
+                AST list or None on failure.  Uses leading-whitespace stripping
+                so that a top-level ``def`` parses correctly."""
+                if not _text:
+                    return None
+                if _text in _method_ast_cache:
+                    return _method_ast_cache[_text]
+                stripped = textwrap.dedent(_text)
+                try:
+                    tree = ast.parse(stripped)
+                except SyntaxError:
+                    _method_ast_cache[_text] = None
+                    return None
+                # Find the FunctionDef body
+                body = None
+                for n in tree.body:
+                    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        body = n.body
+                        break
+                if body is None:
+                    body = tree.body
+                _method_ast_cache[_text] = body
+                return body
+
             def _method_has_attr_call(_mtext: str) -> bool:
-                for _attr in attrs:
-                    if re.search(r'self\.' + re.escape(_attr) + r'(?:\[|\s*\()', _mtext):
-                        return True
+                """AST-only: does this method body contain a ``self.<attr>(...)`` or
+                ``self.<attr>[...]`` reference for any known attr?  Walks both
+                ``ast.Call`` (with self-attr func) and ``ast.Subscript`` whose
+                owner is ``self.<attr>``."""
+                body = _parse_method_ast(_mtext)
+                if body is None:
+                    return False
+                for top in body:
+                    for sub in ast.walk(top):
+                        # self.<attr>(...)  : Call → Attribute(value=Name('self'))
+                        if isinstance(sub, ast.Call):
+                            f = sub.func
+                            if (
+                                isinstance(f, ast.Attribute)
+                                and isinstance(f.value, ast.Name)
+                                and f.value.id == "self"
+                                and f.attr in attrs
+                            ):
+                                return True
+                        # self.<attr>[...]  : Subscript whose value is Attribute(self, attr)
+                        if isinstance(sub, ast.Subscript):
+                            owner = sub.value
+                            if (
+                                isinstance(owner, ast.Attribute)
+                                and isinstance(owner.value, ast.Name)
+                                and owner.value.id == "self"
+                                and owner.attr in attrs
+                            ):
+                                return True
+                return False
+
+            def _method_calls_self_method(_text: str, _target_name: str) -> bool:
+                """AST-only: does this method body contain a ``self.<_target_name>(...)`` call?"""
+                body = _parse_method_ast(_text)
+                if body is None:
+                    return False
+                for top in body:
+                    for sub in ast.walk(top):
+                        if isinstance(sub, ast.Call):
+                            f = sub.func
+                            if (
+                                isinstance(f, ast.Attribute)
+                                and isinstance(f.value, ast.Name)
+                                and f.value.id == "self"
+                                and f.attr == _target_name
+                            ):
+                                return True
                 return False
 
             _reachable_helpers: "set[str]" = set()
@@ -3967,7 +4214,7 @@ def _build_data_dependency_edges(source_files, class_map, module_attrs, class_st
                     for _mname in _all_methods:
                         if _mname in _seen_methods or _mname in ("__init__",):
                             continue
-                        if not re.search(r'self\.' + re.escape(_mname) + r'\s*\(', _src_text):
+                        if not _method_calls_self_method(_src_text, _mname):
                             continue
                         _seen_methods.add(_mname)
                         _next.append(_mname)
@@ -4017,7 +4264,11 @@ def _build_data_dependency_edges(source_files, class_map, module_attrs, class_st
                         if _ln is None:
                             continue
                         _ast_calls_by_line.setdefault(_ln, []).append(_call_info)
-                    _ast_var_env.update(_ast_fe_dd.build_var_env(cname, _mn))
+                    _mn_var_env = _ast_fe_dd.build_var_env(cname, _mn)
+                    for _var_name, _chain in (_mn_var_env or {}).items():
+                        if not _chain:
+                            continue
+                        _ast_var_env.setdefault(_var_name, []).extend(list(_chain))
                     _ast_alias_env.update(_ast_fe_dd.build_alias_env(cname, _mn))
                     _ast_dict_slot_env.update(_ast_fe_dd.build_dict_slot_env(cname, _mn))
                 for _ln, _calls in _ast_calls_by_line.items():
@@ -4039,73 +4290,88 @@ def _build_data_dependency_edges(source_files, class_map, module_attrs, class_st
             _attr_max_calls_in_single_method = defaultdict(int)
             for _mr_start, _mr_end in _method_ranges_for_counting:
                 _method_lines = lines[_mr_start - 1: min(_mr_end, len(lines))]
-                _method_logical = _join_logical_lines(_method_lines, _mr_start)
+                _method_text = "\n".join(_method_lines)
                 _method_call_count = defaultdict(int)
-                _method_loop_vars = set()
-                for _pl, _ln in _method_logical:
-                    _ln_s = _strip_inline_comment(_ln).strip()
-                    if not _ln_s or _ln_s.startswith('#'):
-                        continue
-                    # Detect loop vars
-                    _lm = re.match(r'\s*for\s+(?:\w+,\s*)?(\w+)\s+in\s+(?:enumerate\(\s*)?self\.(\w+)\s*\)?\s*:', _ln_s)
-                    if _lm and _lm.group(2) in known_attrs:
-                        _method_loop_vars.add(_lm.group(1))
-                        continue
-                    _lm2 = re.match(r'\s*for\s+\w+\s*,\s*(\w+)\s+in\s+self\.(\w+)\.items\(\)\s*:', _ln_s)
-                    if _lm2 and _lm2.group(2) in known_attrs:
-                        _method_loop_vars.add(_lm2.group(1))
-                        continue
-                    _lm3 = re.match(r'\s*for\s+(\w+)\s+in\s+self\.(\w+)\.values\(\)\s*:', _ln_s)
-                    if _lm3 and _lm3.group(2) in known_attrs:
-                        _method_loop_vars.add(_lm3.group(1))
-                        continue
-                    # Count direct self.attr(...) calls
-                    for _cm in re.finditer(r'self\.(\w+)\s*\(', _ln_s):
-                        _ca = _cm.group(1)
-                        if _ca in known_attrs:
-                            _method_call_count[_ca] += 1
-                    # Count getattr(self, 'attr')(...) calls
-                    for _cm in re.finditer(r'getattr\(\s*self\s*,\s*[\"\']([^\"\']+)[\"\']\s*\)\s*\(', _ln_s):
-                        _ca = _cm.group(1)
-                        if _ca in known_attrs:
-                            _method_call_count[_ca] += 1
-                    # Iter11 Rule3 fix: count indexed container calls
-                    #   self.recycle_layers_[f"..."](...)
-                    #   self.ln_layers_[key](...)
-                    # Whether the index resolves to a real elem or to a wildcard
-                    # (`container[*]`), each such call is a distinct invocation
-                    # of *something inside the container*. When the same
-                    # container is invoked multiple times across different
-                    # forward steps with intervening calls to other containers,
-                    # an unsplit wildcard node will produce a self-cycle. We
-                    # therefore treat the resolved attr (real elem or
-                    # `container[*]`) as a multi-call candidate.
-                    for _cm in re.finditer(r'self\.(\w+)\s*\[\s*([^\]]+?)\s*\]\s*\(', _ln_s):
-                        _cont = _cm.group(1)
-                        _idx_expr = _cm.group(2)
-                        if _cont not in known_attrs:
-                            continue
-                        # Resolve identically to the runtime call: literal -> real elem,
-                        # dynamic -> all expanded elems (or container itself fallback).
-                        _norm = _norm_index_expr(_idx_expr)
-                        if _norm is not None:
-                            _cand = f"{_cont}[{_norm}]"
-                            if _cand in known_attrs:
-                                _method_call_count[_cand] += 1
-                            else:
-                                _wild = f"{_cont}[*]"
-                                if _wild in known_attrs:
-                                    _method_call_count[_wild] += 1
+
+                # AST-only: walk every Call/Subscript/For node in the method body.
+                _body = _parse_method_ast(_method_text)
+                if not _body:
+                    # If method body fails to parse, skip; do NOT fall back to regex.
+                    for _ca, _cnt in _method_call_count.items():
+                        if _cnt > _attr_max_calls_in_single_method[_ca]:
+                            _attr_max_calls_in_single_method[_ca] = _cnt
+                    continue
+
+                def _is_self_attr(node, attr_name=None):
+                    if not (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "self"):
+                        return False
+                    return attr_name is None or node.attr == attr_name
+
+                # ``for`` loops over self.<attr> introduce a loop variable that
+                # binds to a Module-instance taken from self.<attr>.  We track
+                # only existence of these loop vars (the call-counting prepass
+                # below does not need to know loop var names because it counts
+                # syntactic call sites, not run-time invocations).
+                for top in _body:
+                    for sub in ast.walk(top):
+                        if isinstance(sub, ast.Call):
+                            _func = sub.func
+                            # 1) self.<attr>(...)
+                            if _is_self_attr(_func) and _func.attr in known_attrs:
+                                _method_call_count[_func.attr] += 1
+                                continue
+                            # 2) getattr(self, '<lit>')(...)
+                            if (
+                                isinstance(_func, ast.Call)
+                                and isinstance(_func.func, ast.Name)
+                                and _func.func.id == "getattr"
+                                and len(_func.args) >= 2
+                                and isinstance(_func.args[0], ast.Name)
+                                and _func.args[0].id == "self"
+                                and isinstance(_func.args[1], ast.Constant)
+                                and isinstance(_func.args[1].value, str)
+                                and _func.args[1].value in known_attrs
+                            ):
+                                _method_call_count[_func.args[1].value] += 1
+                                continue
+                            # 3) self.<container>[<idx>](...)
+                            if (
+                                isinstance(_func, ast.Subscript)
+                                and isinstance(_func.value, ast.Attribute)
+                                and isinstance(_func.value.value, ast.Name)
+                                and _func.value.value.id == "self"
+                            ):
+                                _cont = _func.value.attr
+                                if _cont not in known_attrs:
+                                    continue
+                                idx_node = _func.slice
+                                if isinstance(idx_node, ast.Index):  # py<3.9
+                                    idx_node = idx_node.value
+                                # Literal index?
+                                _norm = None
+                                if isinstance(idx_node, ast.Constant):
+                                    if isinstance(idx_node.value, int):
+                                        _norm = str(idx_node.value)
+                                    elif isinstance(idx_node.value, str):
+                                        _norm = "'" + idx_node.value.replace("'", "\\'") + "'"
+                                if _norm is not None:
+                                    _cand = f"{_cont}[{_norm}]"
+                                    if _cand in known_attrs:
+                                        _method_call_count[_cand] += 1
+                                    else:
+                                        _wild = f"{_cont}[*]"
+                                        if _wild in known_attrs:
+                                            _method_call_count[_wild] += 1
+                                        else:
+                                            _method_call_count[_cont] += 1
                                 else:
-                                    _method_call_count[_cont] += 1
-                        else:
-                            _wild = f"{_cont}[*]"
-                            if _wild in known_attrs:
-                                _method_call_count[_wild] += 1
-                            elif _cont in container_to_elems and container_to_elems[_cont]:
-                                _method_call_count[_cont + "[*]"] += 1
-                            else:
-                                _method_call_count[_cont] += 1
+                                    _wild = f"{_cont}[*]"
+                                    if _wild in known_attrs:
+                                        _method_call_count[_wild] += 1
+                                    elif _cont in container_to_elems and container_to_elems[_cont]:
+                                        _method_call_count[_cont + "[*]"] += 1
+                                    else:
+                                        _method_call_count[_cont] += 1
                 # Track the max across all methods
                 for _ca, _cnt in _method_call_count.items():
                     if _cnt > _attr_max_calls_in_single_method[_ca]:
@@ -4185,86 +4451,83 @@ def _build_data_dependency_edges(source_files, class_map, module_attrs, class_st
                                 return _tail or _ast_attrs[-1]
                             return _ast_attrs[-1]
 
-                    rhs_called = []
-                    for mm in re.finditer(r'self\.(\w+)\[[^\]]*\]\s*\(', expr):
-                        aa = mm.group(1)
-                        if aa in known_attrs:
-                            rhs_called.append(aa)
-                    for mm in re.finditer(r'self\.(\w+)\s*\(', expr):
-                        aa = mm.group(1)
-                        if aa in known_attrs:
-                            # 避免和 indexed call 重复
-                            if not rhs_called or rhs_called[-1] != aa:
-                                rhs_called.append(aa)
-                    # loop_var(...)
-                    for vv, (pp, _ploc) in list(var_producers.items()):
-                        mm = re.search(r'\b' + re.escape(vv) + r'\s*\(', expr)
-                        if not mm:
-                            continue
-                        for pa in pp:
-                            if pa in known_attrs:
-                                rhs_called.append(pa)
-
-                    # 普通 dict/变量里存的 nn.Module：d['k'](...)
-                    for mm in re.finditer(r"\b(\w+)\s*\[\s*([^\]]+?)\s*\]\s*\(", expr):
-                        dname = mm.group(1)
-                        key_expr = mm.group(2).strip()
-                        dslots = dict_slots.get(dname) or shared_dict_slots.get((fname, dname))
-                        if not dslots:
-                            continue
-                        key_lit = _as_str_lit(key_expr)
-                        if key_lit is not None and key_lit in dslots:
-                            ps, _pl, _pv = dslots[key_lit]
-                        else:
-                            ps, _pl, _pv = _dict_union_slots(dslots)
-                        for pa in ps:
-                            if pa in known_attrs:
-                                rhs_called.append(pa)
-
-                    # d.get('k')(...)
-                    for mm in re.finditer(r"\b(\w+)\.get\(\s*([^,\)]+)[^\)]*\)\s*\(", expr):
-                        dname = mm.group(1)
-                        key_expr = mm.group(2).strip()
-                        dslots = dict_slots.get(dname) or shared_dict_slots.get((fname, dname))
-                        if not dslots:
-                            continue
-                        key_lit = _as_str_lit(key_expr)
-                        if key_lit is not None and key_lit in dslots:
-                            ps, _pl, _pv = dslots[key_lit]
-                        else:
-                            ps, _pl, _pv = _dict_union_slots(dslots)
-                        for pa in ps:
-                            if pa in known_attrs:
-                                rhs_called.append(pa)
-                    return rhs_called[-1] if rhs_called else None
+                    # AST is the authoritative path for ``_rhs_last_called_attr``.
+                    # If the expression failed to parse or the AST root is not a
+                    # Call, we cannot reliably identify the producer; return None
+                    # rather than fall back to regex (per AST-only directive).
+                    return None
 
                 # ------------------------------
-                # dict 数据流：初始化 / 字面量 / 槽位写入
+                # dict 数据流：初始化 / 字面量 / 槽位写入  (AST-only)
                 # ------------------------------
-                m_init = re.match(r'^\s*(\w+)\s*=\s*(\{\s*\}|dict\(\s*\))\s*$', line)
-                if m_init:
-                    dname = m_init.group(1)
-                    dict_slots[dname] = {}
-                    shared_dict_slots[(fname, dname)] = dict_slots[dname]
-                    continue
+                # Parse the joined logical line as a standalone Python module.
+                # Failure → skip the dict-flow scan for this line (the regex
+                # path used to gracefully no-op too).
+                _line_mod = None
+                try:
+                    _line_mod = ast.parse(line)
+                except SyntaxError:
+                    _line_mod = None
+                _line_stmt = (_line_mod.body[0]
+                              if _line_mod and len(_line_mod.body) == 1
+                              else None)
 
-                m_lit = re.match(r'^\s*(\w+)\s*=\s*\{(.*)\}\s*$', line)
-                if m_lit:
-                    dname = m_lit.group(1)
-                    inner = m_lit.group(2)
-                    for k_expr, v_expr in _parse_dict_literal_items(inner):
-                        k_lit = _as_str_lit(k_expr)
-                        if k_lit is None:
+                # Pattern: ``var = {}`` or ``var = dict()``  →  initialise empty dict slot.
+                if (
+                    isinstance(_line_stmt, ast.Assign)
+                    and len(_line_stmt.targets) == 1
+                    and isinstance(_line_stmt.targets[0], ast.Name)
+                ):
+                    _val = _line_stmt.value
+                    _is_empty_dict = (
+                        (isinstance(_val, ast.Dict) and not _val.keys and not _val.values)
+                        or (
+                            isinstance(_val, ast.Call)
+                            and isinstance(_val.func, ast.Name)
+                            and _val.func.id == "dict"
+                            and not _val.args
+                            and not _val.keywords
+                        )
+                    )
+                    if _is_empty_dict:
+                        dname = _line_stmt.targets[0].id
+                        dict_slots[dname] = {}
+                        shared_dict_slots[(fname, dname)] = dict_slots[dname]
+                        continue
+
+                # Pattern: ``var = { 'k': expr, ... }``  →  literal dict assignment.
+                if (
+                    isinstance(_line_stmt, ast.Assign)
+                    and len(_line_stmt.targets) == 1
+                    and isinstance(_line_stmt.targets[0], ast.Name)
+                    and isinstance(_line_stmt.value, ast.Dict)
+                    and _line_stmt.value.keys
+                ):
+                    dname = _line_stmt.targets[0].id
+                    for _k_node, _v_node in zip(_line_stmt.value.keys, _line_stmt.value.values):
+                        if _k_node is None or _v_node is None:
                             continue
-                        last_attr = _rhs_last_called_attr(v_expr)
+                        # key must be a literal string
+                        if not (isinstance(_k_node, ast.Constant) and isinstance(_k_node.value, str)):
+                            continue
+                        k_lit = _k_node.value
+                        try:
+                            v_expr = ast.unparse(_v_node)
+                        except Exception:
+                            v_expr = ""
+                        last_attr = _rhs_last_called_attr(v_expr, expr_node=_v_node)
                         if last_attr is not None:
-                            dict_slots[dname][k_lit] = ({last_attr}, phys_lineno, f"self.{last_attr}(...)" )
+                            dict_slots[dname][k_lit] = ({last_attr}, phys_lineno, f"self.{last_attr}(...)")
                             shared_dict_slots[(fname, dname)] = dict_slots[dname]
                             continue
                         # module ref: {'k': self.xxx}
-                        m_modref = re.match(r'^\s*self\.(\w+)\s*$', v_expr)
-                        if m_modref and m_modref.group(1) in known_attrs:
-                            a = m_modref.group(1)
+                        if (
+                            isinstance(_v_node, ast.Attribute)
+                            and isinstance(_v_node.value, ast.Name)
+                            and _v_node.value.id == "self"
+                            and _v_node.attr in known_attrs
+                        ):
+                            a = _v_node.attr
                             dict_slots[dname][k_lit] = ({a}, phys_lineno, f"self.{a}")
                             shared_dict_slots[(fname, dname)] = dict_slots[dname]
                             continue
@@ -4275,22 +4538,39 @@ def _build_data_dependency_edges(source_files, class_map, module_attrs, class_st
                     # value 里可能包含 self.xxx()，这里不 continue
 
                 _ast_dict_write = _ast_stmt if _ast_stmt and _ast_stmt.get("kind") == "dict_write" else None
-                m_set = None
+                _ast_subscript_assign = None
                 if _ast_dict_write:
                     dname = (_ast_dict_write.get("dict_var") or "").strip()
                     slot_key = _ast_dict_write.get("dict_key")
                     slot_key = slot_key if slot_key is not None else '*'
                     rhs = (_ast_dict_write.get("rhs_text") or "").strip()
                     key_expr = repr(slot_key) if slot_key != '*' else '*'
+                    _v_rhs_node = _ast_dict_write.get("rhs_node")
                 else:
-                    m_set = re.match(r'^\s*(\w+)\s*\[\s*(.+?)\s*\]\s*=\s*(.+)$', line)
-                    if m_set:
-                        dname = m_set.group(1)
-                        key_expr = m_set.group(2)
-                        rhs = m_set.group(3)
-                        k_lit = _as_str_lit(key_expr)
-                        slot_key = k_lit if k_lit is not None else '*'
-                if _ast_dict_write or m_set:
+                    # AST-only fallback: ``dname[key_expr] = rhs`` form.
+                    if (
+                        isinstance(_line_stmt, ast.Assign)
+                        and len(_line_stmt.targets) == 1
+                        and isinstance(_line_stmt.targets[0], ast.Subscript)
+                        and isinstance(_line_stmt.targets[0].value, ast.Name)
+                    ):
+                        _ast_subscript_assign = _line_stmt
+                        dname = _line_stmt.targets[0].value.id
+                        _slice = _line_stmt.targets[0].slice
+                        try:
+                            key_expr = ast.unparse(_slice)
+                        except Exception:
+                            key_expr = ""
+                        try:
+                            rhs = ast.unparse(_line_stmt.value)
+                        except Exception:
+                            rhs = ""
+                        if isinstance(_slice, ast.Constant) and isinstance(_slice.value, str):
+                            slot_key = _slice.value
+                        else:
+                            slot_key = '*'
+                        _v_rhs_node = _line_stmt.value
+                if _ast_dict_write or _ast_subscript_assign is not None:
                     _ast_slot = _ast_dict_slot_env.get((dname, slot_key))
                     if _ast_slot:
                         _prod_attr, _prod_line = _ast_slot
@@ -4298,15 +4578,19 @@ def _build_data_dependency_edges(source_files, class_map, module_attrs, class_st
                             dict_slots[dname][slot_key] = ({_prod_attr}, _prod_line if _prod_line is not None else phys_lineno, f"self.{_prod_attr}(...)" )
                             shared_dict_slots[(fname, dname)] = dict_slots[dname]
                     else:
-                        last_attr = _rhs_last_called_attr(rhs)
+                        last_attr = _rhs_last_called_attr(rhs, expr_node=_v_rhs_node)
                         if last_attr is not None:
                             dict_slots[dname][slot_key] = ({last_attr}, phys_lineno, f"self.{last_attr}(...)" )
                             shared_dict_slots[(fname, dname)] = dict_slots[dname]
                         else:
-                            # module ref: d['k'] = self.xxx
-                            m_modref = re.match(r'^\s*self\.(\w+)\s*$', rhs)
-                            if m_modref and m_modref.group(1) in known_attrs:
-                                a = m_modref.group(1)
+                            # module ref: d['k'] = self.xxx  (AST check)
+                            if (
+                                isinstance(_v_rhs_node, ast.Attribute)
+                                and isinstance(_v_rhs_node.value, ast.Name)
+                                and _v_rhs_node.value.id == "self"
+                                and _v_rhs_node.attr in known_attrs
+                            ):
+                                a = _v_rhs_node.attr
                                 dict_slots[dname][slot_key] = ({a}, phys_lineno, f"self.{a}")
                                 shared_dict_slots[(fname, dname)] = dict_slots[dname]
                             else:
@@ -4321,21 +4605,77 @@ def _build_data_dependency_edges(source_files, class_map, module_attrs, class_st
                 #   for _, x in enumerate(self.attr):
                 #   for k, v in self.dict.items():
                 #   for v in self.dict.values():
+                # AST-only: the joined logical line by itself is not a complete
+                # statement (no body), so we wrap it as ``<for-line>\n    pass``
+                # before parsing.
                 loop_var = None
                 loop_attr = None
                 loop_items = None
-                m_list = re.match(r'\s*for\s+(?:\w+,\s*)?(\w+)\s+in\s+(?:enumerate\(\s*)?self\.(\w+)\s*\)?\s*:', line)
-                if m_list:
-                    loop_var = m_list.group(1)
-                    loop_attr = m_list.group(2)
-                m_items = re.match(r'\s*for\s+\w+\s*,\s*(\w+)\s+in\s+self\.(\w+)\.items\(\)\s*:', line)
-                if m_items:
-                    loop_var = m_items.group(1)
-                    loop_attr = m_items.group(2)
-                m_vals = re.match(r'\s*for\s+(\w+)\s+in\s+self\.(\w+)\.values\(\)\s*:', line)
-                if m_vals:
-                    loop_var = m_vals.group(1)
-                    loop_attr = m_vals.group(2)
+                _for_stmt = None
+                _stripped_line = line.lstrip()
+                if _stripped_line.startswith("for ") or _stripped_line.startswith("for\t"):
+                    try:
+                        _for_mod = ast.parse(_stripped_line.rstrip() + "\n    pass\n")
+                        if (
+                            _for_mod.body
+                            and isinstance(_for_mod.body[0], ast.For)
+                        ):
+                            _for_stmt = _for_mod.body[0]
+                    except SyntaxError:
+                        _for_stmt = None
+                if _for_stmt is not None:
+                    _it = _for_stmt.iter
+                    _tgt = _for_stmt.target
+                    # Determine the loop variable name (Name or Tuple).
+                    _loop_var_candidate = None
+                    if isinstance(_tgt, ast.Name):
+                        _loop_var_candidate = _tgt.id
+                    elif isinstance(_tgt, ast.Tuple) and _tgt.elts:
+                        # for k, v in ...  -> the SECOND element (when 2-tuple)
+                        # for i, x in enumerate(...) -> SECOND element
+                        # The original regex picked group(1)=last var of any
+                        # leading "<x>," prefix, then last positional name.
+                        _last = _tgt.elts[-1]
+                        if isinstance(_last, ast.Name):
+                            _loop_var_candidate = _last.id
+                    if _loop_var_candidate is not None:
+                        # Variant 1: ``for x in self.<attr>:`` (also matches
+                        # ``for _, x in enumerate(self.<attr>):``)
+                        _attr_node = None
+                        if (
+                            isinstance(_it, ast.Attribute)
+                            and isinstance(_it.value, ast.Name)
+                            and _it.value.id == "self"
+                        ):
+                            _attr_node = _it
+                        elif (
+                            isinstance(_it, ast.Call)
+                            and isinstance(_it.func, ast.Name)
+                            and _it.func.id == "enumerate"
+                            and _it.args
+                            and isinstance(_it.args[0], ast.Attribute)
+                            and isinstance(_it.args[0].value, ast.Name)
+                            and _it.args[0].value.id == "self"
+                        ):
+                            _attr_node = _it.args[0]
+                        if _attr_node is not None:
+                            loop_var = _loop_var_candidate
+                            loop_attr = _attr_node.attr
+                        # Variant 2: ``for k, v in self.<attr>.items():`` /
+                        #            ``for v in self.<attr>.values():``
+                        if (
+                            loop_attr is None
+                            and isinstance(_it, ast.Call)
+                            and isinstance(_it.func, ast.Attribute)
+                            and _it.func.attr in ("items", "values")
+                            and isinstance(_it.func.value, ast.Attribute)
+                            and isinstance(_it.func.value.value, ast.Name)
+                            and _it.func.value.value.id == "self"
+                            and not _it.args
+                            and not _it.keywords
+                        ):
+                            loop_var = _loop_var_candidate
+                            loop_attr = _it.func.value.attr
                 if loop_var and loop_attr and loop_attr in known_attrs:
                     # 若该容器已展开，则 loop_var 视为可能调用任一 elem；并补一条 elem 顺序链
                     if loop_attr in container_to_elems and container_to_elems[loop_attr]:
@@ -4388,11 +4728,29 @@ def _build_data_dependency_edges(source_files, class_map, module_attrs, class_st
                 # `relation_layer_out`, `gift_layer_out`, ... → producer set
                 # of `group_tower_out` (which is the union of GroupTower attrs).
                 # ------------------------------------------------------------
-                m_setattr_tensor = re.match(
-                    r'\s*setattr\(\s*self\s*,\s*(.+?)\s*,\s*(\w+)\s*\)\s*$', line)
+                m_setattr_tensor = None
+                _setattr_call = None
+                _setattr_name_node = None
+                _setattr_src_var = None
+                # AST-only: detect ``setattr(self, <name_expr>, <Name>)``
+                # statements where the value is a bare local Name.
+                if (
+                    _line_stmt is not None
+                    and isinstance(_line_stmt, ast.Expr)
+                    and isinstance(_line_stmt.value, ast.Call)
+                    and isinstance(_line_stmt.value.func, ast.Name)
+                    and _line_stmt.value.func.id == "setattr"
+                    and len(_line_stmt.value.args) == 3
+                    and isinstance(_line_stmt.value.args[0], ast.Name)
+                    and _line_stmt.value.args[0].id == "self"
+                    and isinstance(_line_stmt.value.args[2], ast.Name)
+                ):
+                    _setattr_call = _line_stmt.value
+                    _setattr_name_node = _setattr_call.args[1]
+                    _setattr_src_var = _setattr_call.args[2].id
+                    m_setattr_tensor = True
                 if m_setattr_tensor:
-                    name_expr_raw = m_setattr_tensor.group(1).strip()
-                    src_var = m_setattr_tensor.group(2).strip()
+                    src_var = _setattr_src_var
                     # Only proceed if the value isn't a constructor call
                     # (already handled by the Module setattr scanner).
                     if src_var in var_producers:
@@ -4406,48 +4764,73 @@ def _build_data_dependency_edges(source_files, class_map, module_attrs, class_st
                         # attrs allow per-iteration refinement (each alias maps
                         # to ONLY the corresponding Module).
                         alias_name_to_producers = {}
-                        m_lit = re.match(r"^[\"\']([^\"\']+)[\"\']$", name_expr_raw)
-                        if m_lit:
-                            alias_name_to_producers[m_lit.group(1)] = set(src_producers)
-                        else:
-                            m_fstr = re.match(r"^[fF][\"\']([^\"\']*)[\"\']$", name_expr_raw)
-                            if m_fstr:
-                                template = m_fstr.group(1)
-                                ref_vars = re.findall(r'\{([^{}]*)\}', template)
-                                ref_names = set()
-                                for rv in ref_vars:
-                                    base = rv.split(':', 1)[0].split('!', 1)[0].strip()
-                                    if base:
-                                        ref_names.add(base)
-                                resolvable = (
-                                    len(ref_names) == 1 and
-                                    next(iter(ref_names)) in _loop_var_to_str_items_local
+                        if (
+                            isinstance(_setattr_name_node, ast.Constant)
+                            and isinstance(_setattr_name_node.value, str)
+                        ):
+                            alias_name_to_producers[_setattr_name_node.value] = set(src_producers)
+                        elif isinstance(_setattr_name_node, ast.JoinedStr):
+                            # f-string template: extract referenced variable
+                            # names from the FormattedValue parts and the
+                            # literal-only template (with each FormattedValue
+                            # collapsed to a single placeholder for sub).
+                            ref_names = set()
+                            for _part in _setattr_name_node.values:
+                                if isinstance(_part, ast.FormattedValue):
+                                    _vname = None
+                                    if isinstance(_part.value, ast.Name):
+                                        _vname = _part.value.id
+                                    if _vname:
+                                        ref_names.add(_vname)
+                            resolvable = (
+                                len(ref_names) == 1
+                                and next(iter(ref_names)) in _loop_var_to_str_items_local
+                            )
+                            if resolvable:
+                                lv = next(iter(ref_names))
+                                items = _loop_var_to_str_items_local[lv]
+                                # Per-iteration refinement: if every item
+                                # is itself a known Module attr AND the
+                                # source variable's producers are exactly
+                                # the union of those items, bind each
+                                # alias to the single corresponding item.
+                                items_set = set(items)
+                                can_refine = (
+                                    all(it in known_attrs for it in items)
+                                    and items_set & set(src_producers) == items_set & set(known_attrs)
                                 )
-                                if resolvable:
-                                    lv = next(iter(ref_names))
-                                    items = _loop_var_to_str_items_local[lv]
-                                    # Per-iteration refinement: if every item
-                                    # is itself a known Module attr AND the
-                                    # source variable's producers are exactly
-                                    # the union of those items, bind each
-                                    # alias to the single corresponding item.
-                                    items_set = set(items)
-                                    can_refine = (
-                                        all(it in known_attrs for it in items)
-                                        and items_set & set(src_producers) == items_set & set(known_attrs)
-                                    )
-                                    for it in items:
-                                        expanded = re.sub(
-                                            r'\{[^{}]*\}', str(it), template)
-                                        if not expanded:
-                                            continue
-                                        if can_refine and it in src_producers:
-                                            alias_name_to_producers[expanded] = {it}
+                                for it in items:
+                                    # Expand the JoinedStr node by substituting
+                                    # the loop variable's value for every
+                                    # FormattedValue and concatenating the
+                                    # literal parts.
+                                    _expanded_parts = []
+                                    for _part in _setattr_name_node.values:
+                                        if isinstance(_part, ast.Constant) and isinstance(_part.value, str):
+                                            _expanded_parts.append(_part.value)
+                                        elif isinstance(_part, ast.FormattedValue):
+                                            # Refining only handles the simple
+                                            # ``{loop_var}`` case (with optional
+                                            # !s/!r/!a or :spec).  Skip format
+                                            # specs and conversions and just
+                                            # str() the value.
+                                            _expanded_parts.append(str(it))
                                         else:
-                                            alias_name_to_producers[expanded] = set(src_producers)
-                            else:
-                                if name_expr_raw in _loop_var_to_str_items_local:
-                                    for it in _loop_var_to_str_items_local[name_expr_raw]:
+                                            _expanded_parts.append("")
+                                    expanded = "".join(_expanded_parts)
+                                    if not expanded:
+                                        continue
+                                    if can_refine and it in src_producers:
+                                        alias_name_to_producers[expanded] = {it}
+                                    else:
+                                        alias_name_to_producers[expanded] = set(src_producers)
+                        else:
+                            # Bare Name expression: try to resolve via
+                            # _loop_var_to_str_items_local.
+                            if isinstance(_setattr_name_node, ast.Name):
+                                _name_arg = _setattr_name_node.id
+                                if _name_arg in _loop_var_to_str_items_local:
+                                    for it in _loop_var_to_str_items_local[_name_arg]:
                                         alias_name_to_producers[it] = set(src_producers)
                         # Register the aliases (union with any existing).
                         # Use the source variable's production line as the
@@ -4515,10 +4898,25 @@ def _build_data_dependency_edges(source_files, class_map, module_attrs, class_st
                                         called_attrs.append((_attr, _start, _end, _call.get("node")))
                         elif _kind == "getattr_dynamic":
                             _name_arg = (_call.get("name_expr") or "").strip()
+                            _expr_node = None
+                            _call_node = _call.get("node")
+                            if (
+                                _ast_fe_dd
+                                and isinstance(_call_node, ast.Call)
+                                and _ast_fe_dd._is_self_getattr_call(_call_node.func)
+                            ):
+                                _expr_node = _call_node.func.args[1]
                             if _name_arg in _loop_var_to_real_attrs:
                                 for _attr in _loop_var_to_real_attrs[_name_arg]:
                                     if _attr in known_attrs:
                                         called_attrs.append((_attr, _start, _end, _call.get("node")))
+                            elif _expr_node is not None:
+                                _matched_attrs = [
+                                    _attr for _attr in known_attrs
+                                    if _ast_fe_dd._dynamic_attr_expr_matches(_expr_node, _attr)
+                                ]
+                                for _attr in sorted(_matched_attrs):
+                                    called_attrs.append((_attr, _start, _end, _call.get("node")))
                             elif dynamic_setattr_attrs:
                                 for _attr in dynamic_setattr_attrs:
                                     called_attrs.append((_attr, _start, _end, _call.get("node")))
@@ -4531,96 +4929,16 @@ def _build_data_dependency_edges(source_files, class_map, module_attrs, class_st
                                         called_attrs.append((_attr, _start, _end, _call.get("node")))
 
                 if not called_attrs:
-                    # Regex fallback during AST migration
-                    # Pattern: d['k'](...) where dict slot stores an nn.Module
-                    for m in re.finditer(r"\b(\w+)\s*\[\s*([^\]]+?)\s*\]\s*\(", line):
-                        dname = m.group(1)
-                        key_expr = m.group(2).strip()
-                        dslots = dict_slots.get(dname) or shared_dict_slots.get((fname, dname))
-                        if not dslots:
-                            continue
-                        key_lit = _as_str_lit(key_expr)
-                        if key_lit is not None and key_lit in dslots:
-                            ps, _pl, _pv = dslots[key_lit]
-                        else:
-                            ps, _pl, _pv = _dict_union_slots(dslots)
-                        for a in ps:
-                            if a in known_attrs:
-                                called_attrs.append((a, m.start(), m.end(), None))
-
-                    # Pattern: d.get('k')(...) where dict slot stores an nn.Module
-                    for m in re.finditer(r"\b(\w+)\.get\(\s*([^,\)]+)[^\)]*\)\s*\(", line):
-                        dname = m.group(1)
-                        key_expr = m.group(2).strip()
-                        dslots = dict_slots.get(dname) or shared_dict_slots.get((fname, dname))
-                        if not dslots:
-                            continue
-                        key_lit = _as_str_lit(key_expr)
-                        if key_lit is not None and key_lit in dslots:
-                            ps, _pl, _pv = dslots[key_lit]
-                        else:
-                            ps, _pl, _pv = _dict_union_slots(dslots)
-                        for a in ps:
-                            if a in known_attrs:
-                                called_attrs.append((a, m.start(), m.end(), None))
-
-                    # Pattern: self.attr[idx](...)  - indexed ModuleList/ModuleDict call
-                    for m in re.finditer(r'self\.(\w+)\[\s*([^\]]+?)\s*\]\s*\(', line):
-                        cont = m.group(1)
-                        idx_expr = m.group(2)
-                        if cont in known_attrs:
-                            for a in _resolve_indexed_attr(cont, idx_expr):
-                                if a in known_attrs:
-                                    called_attrs.append((a, m.start(), m.end(), None))
-                    # Pattern: self.attr(...) - direct module call
-                    for m in re.finditer(r'self\.(\w+)\s*\(', line):
-                        a = m.group(1)
-                        if a in known_attrs:
-                            # Avoid duplicating if already matched as indexed
-                            already = False
-                            for (ea, es, ee, _enode) in called_attrs:
-                                if ea == a and abs(es - m.start()) < 3:
-                                    already = True
-                                    break
-                            if not already:
-                                called_attrs.append((a, m.start(), m.end(), None))
-
-                    # Pattern: getattr(self, 'attr')(...) - literal getattr call
-                    for m in re.finditer(r'getattr\(\s*self\s*,\s*([\"\'])([^\"\']+)\1\s*\)\s*\(', line):
-                        a = m.group(2)
-                        if a in known_attrs:
-                            called_attrs.append((a, m.start(), m.end(), None))
-
-                    # Pattern: getattr(self, name_expr)(...) - dynamic getattr call
-                    # Iter11: if name_expr is a loop variable bound to a literal string list,
-                    # we have an exact resolution to the real per-element attrs (precise,
-                    # not wildcard). Otherwise we fall back to the conservative wildcard
-                    # connection to all dynamically-registered attrs (`dynamic_setattr_attrs`).
-                    for m in re.finditer(r'getattr\(\s*self\s*,\s*([^\)]+)\)\s*\(', line):
-                        snippet = line[m.start():m.end()]
-                        if re.search(r'getattr\(\s*self\s*,\s*[\"\']', snippet):
-                            continue
-                        name_arg = m.group(1).strip()
-                        if name_arg in _loop_var_to_real_attrs:
-                            for a in _loop_var_to_real_attrs[name_arg]:
-                                if a in known_attrs:
-                                    called_attrs.append((a, m.start(), m.end(), None))
-                        elif dynamic_setattr_attrs:
-                            for a in dynamic_setattr_attrs:
-                                called_attrs.append((a, m.start(), m.end(), None))
-                    # Pattern: loop_var(...) where loop_var was set from a module list
-                    for var, (producers, _ploc) in list(var_producers.items()):
-                        lv_m = re.search(r'\b' + re.escape(var) + r'\s*\(', line)
-                        if lv_m and var not in known_attrs:
-                            # This is calling a loop variable that iterates over a module list
-                            for prod_attr in producers:
-                                if prod_attr in known_attrs:
-                                    called_attrs.append((prod_attr, lv_m.start(), lv_m.end(), None))
+                    # AST path is authoritative for module-call detection.
+                    # No regex fallback — if the AST scan didn't find any calls
+                    # we treat this as a non-call line.  The downstream
+                    # ``if not called_attrs:`` block below still handles
+                    # variable-flow tracking through non-module ops.
+                    pass
 
                 if not called_attrs:
                     # No module calls - track variable flow through non-module ops
                     _ast_stmt = _ast_stmt_info_by_line.get(phys_lineno)
-                    assign_m = None
                     _ast_lhs = None
                     _ast_rhs = None
                     if _ast_stmt and _ast_stmt.get("kind") in ("assign", "augassign"):
@@ -4631,22 +4949,43 @@ def _build_data_dependency_edges(source_files, class_map, module_attrs, class_st
                     if _ast_lhs is not None:
                         lhs = _ast_lhs
                         rhs = _ast_rhs
+                    elif (
+                        isinstance(_line_stmt, ast.Assign)
+                        and len(_line_stmt.targets) == 1
+                        and isinstance(_line_stmt.targets[0], ast.Name)
+                    ):
+                        # AST-only fallback for ``var = expr`` parsed from the
+                        # joined logical line (used when _ast_stmt did not
+                        # provide an upstream record).
+                        lhs = _line_stmt.targets[0].id
+                        try:
+                            rhs = ast.unparse(_line_stmt.value)
+                        except Exception:
+                            rhs = ""
                     else:
-                        assign_m = re.match(r'\s*(\w+)\s*=\s*(.+)', line)
-                        if assign_m:
-                            lhs = assign_m.group(1)
-                            rhs = assign_m.group(2)
-                        else:
-                            lhs = None
-                            rhs = None
+                        lhs = None
+                        rhs = None
+                    # Resolve the rhs AST node for downstream attribute checks.
+                    _rhs_ast = None
+                    if _ast_stmt:
+                        _rhs_ast = _ast_stmt.get("rhs_node")
+                    if _rhs_ast is None and isinstance(_line_stmt, (ast.Assign, ast.AugAssign)):
+                        _rhs_ast = _line_stmt.value
                     if lhs is not None and rhs is not None:
 
                         # Special case: ModuleDict/ModuleList module reference
                         #   x = self.container[key]
-                        m_modref_idx = re.match(r'\s*self\.(\w+)\s*\[\s*([^\]]+?)\s*\]\s*$', rhs)
-                        if m_modref_idx:
-                            cont = m_modref_idx.group(1)
-                            idx_expr = m_modref_idx.group(2)
+                        if (
+                            isinstance(_rhs_ast, ast.Subscript)
+                            and isinstance(_rhs_ast.value, ast.Attribute)
+                            and isinstance(_rhs_ast.value.value, ast.Name)
+                            and _rhs_ast.value.value.id == "self"
+                        ):
+                            cont = _rhs_ast.value.attr
+                            try:
+                                idx_expr = ast.unparse(_rhs_ast.slice)
+                            except Exception:
+                                idx_expr = ""
                             if cont in known_attrs:
                                 resolved = _resolve_indexed_attr(cont, idx_expr)
                                 # 这里 resolved 可能是多个 elem（动态 key/index），保守合并
@@ -4660,9 +4999,17 @@ def _build_data_dependency_edges(source_files, class_map, module_attrs, class_st
                         # This is common with setattr-registered modules:
                         #   group_tower = getattr(self, group_name)
                         #   group_tower_out = group_tower(tensor)
-                        m_modref_lit = re.match(r'\s*getattr\(\s*self\s*,\s*([\"\'])([^\"\']+)\1\s*\)\s*$', rhs)
-                        if m_modref_lit:
-                            a = m_modref_lit.group(2)
+                        if (
+                            isinstance(_rhs_ast, ast.Call)
+                            and isinstance(_rhs_ast.func, ast.Name)
+                            and _rhs_ast.func.id == "getattr"
+                            and len(_rhs_ast.args) >= 2
+                            and isinstance(_rhs_ast.args[0], ast.Name)
+                            and _rhs_ast.args[0].id == "self"
+                            and isinstance(_rhs_ast.args[1], ast.Constant)
+                            and isinstance(_rhs_ast.args[1].value, str)
+                        ):
+                            a = _rhs_ast.args[1].value
                             if a in known_attrs:
                                 var_producers[lhs] = ({a}, phys_lineno)
                                 _record_lineage(lhs, _vars_in(rhs), phys_lineno)
@@ -4679,12 +5026,39 @@ def _build_data_dependency_edges(source_files, class_map, module_attrs, class_st
                                     var_producers[lhs] = (set(_alias_prods), _alias_pl)
                                     _record_lineage(lhs, _vars_in(rhs), phys_lineno)
                                     continue
-                        m_modref_dyn = re.match(r'\s*getattr\(\s*self\s*,\s*([^\)]+)\)\s*$', rhs)
-                        if m_modref_dyn:
-                            _name_arg = m_modref_dyn.group(1).strip()
+                        if (
+                            isinstance(_rhs_ast, ast.Call)
+                            and isinstance(_rhs_ast.func, ast.Name)
+                            and _rhs_ast.func.id == "getattr"
+                            and len(_rhs_ast.args) >= 2
+                            and isinstance(_rhs_ast.args[0], ast.Name)
+                            and _rhs_ast.args[0].id == "self"
+                            and not (
+                                isinstance(_rhs_ast.args[1], ast.Constant)
+                                and isinstance(_rhs_ast.args[1].value, str)
+                            )
+                        ):
+                            try:
+                                _name_arg = ast.unparse(_rhs_ast.args[1]).strip()
+                            except Exception:
+                                _name_arg = ""
+                            _ast_rhs_node = _rhs_ast
                             # Iter11: prefer precise loop-var resolution to literal str list
                             if _name_arg in _loop_var_to_real_attrs:
                                 _resolved = [a for a in _loop_var_to_real_attrs[_name_arg] if a in known_attrs]
+                                if _resolved:
+                                    var_producers[lhs] = (set(_resolved), phys_lineno)
+                                    _record_lineage(lhs, _vars_in(rhs), phys_lineno)
+                                    continue
+                            if (
+                                _ast_fe_dd
+                                and isinstance(_ast_rhs_node, ast.Call)
+                                and _ast_fe_dd._is_self_getattr_call(_ast_rhs_node)
+                            ):
+                                _resolved = [
+                                    a for a in known_attrs
+                                    if _ast_fe_dd._dynamic_attr_expr_matches(_ast_rhs_node.args[1], a)
+                                ]
                                 if _resolved:
                                     var_producers[lhs] = (set(_resolved), phys_lineno)
                                     _record_lineage(lhs, _vars_in(rhs), phys_lineno)
@@ -4738,18 +5112,38 @@ def _build_data_dependency_edges(source_files, class_map, module_attrs, class_st
                             if tensor_alias_producers:
                                 _name_lit_prefix = ""
                                 _name_lit_suffix = ""
-                                _m_fstr_d = re.match(
-                                    r'^[fF][\"\']([^\"\']*)[\"\']$',
-                                    _name_arg)
-                                if _m_fstr_d:
-                                    _tpl = _m_fstr_d.group(1)
-                                    _first = _tpl.find('{')
-                                    _last = _tpl.rfind('}')
-                                    if _first >= 0 and _last >= 0:
-                                        _name_lit_prefix = _tpl[:_first]
-                                        _name_lit_suffix = _tpl[_last + 1:]
+                                # AST-only: derive prefix/suffix from the
+                                # JoinedStr (f-string) AST node when the
+                                # name expression is an f-string.  For pure
+                                # ``f"literal"`` (a JoinedStr containing only a
+                                # single Constant) we treat the entire literal
+                                # as the prefix.  For an unparseable or non-
+                                # f-string node, prefix/suffix stay empty.
+                                _name_node_for_fstr = (
+                                    _rhs_ast.args[1] if _rhs_ast is not None and len(_rhs_ast.args) >= 2 else None
+                                )
+                                if isinstance(_name_node_for_fstr, ast.JoinedStr):
+                                    _values = _name_node_for_fstr.values
+                                    if all(
+                                        isinstance(_p, ast.Constant) and isinstance(_p.value, str)
+                                        for _p in _values
+                                    ):
+                                        _name_lit_prefix = "".join(_p.value for _p in _values)
                                     else:
-                                        _name_lit_prefix = _tpl
+                                        _prefix_parts = []
+                                        for _p in _values:
+                                            if isinstance(_p, ast.Constant) and isinstance(_p.value, str):
+                                                _prefix_parts.append(_p.value)
+                                            else:
+                                                break
+                                        _suffix_parts = []
+                                        for _p in reversed(_values):
+                                            if isinstance(_p, ast.Constant) and isinstance(_p.value, str):
+                                                _suffix_parts.append(_p.value)
+                                            else:
+                                                break
+                                        _name_lit_prefix = "".join(_prefix_parts)
+                                        _name_lit_suffix = "".join(reversed(_suffix_parts))
                                 _compat_aliases = []
                                 for _alias_name in tensor_alias_producers:
                                     if _name_lit_prefix and not _alias_name.startswith(_name_lit_prefix):
@@ -4783,12 +5177,30 @@ def _build_data_dependency_edges(source_files, class_map, module_attrs, class_st
                             # call site rather than the intermediate line.
                             # Only use the upstream line if there's no direct
                             # ``self.<attr>(...)`` call on this rhs.
-                            _has_self_call = bool(
-                                re.search(r'self\.\w+\s*[\[\(]', rhs)
-                                or re.search(
-                                    r'getattr\(\s*self\s*,\s*[^\)]+\)\s*\(',
-                                    rhs)
-                            )
+                            _has_self_call = False
+                            if isinstance(_rhs_ast, ast.AST):
+                                # AST-only check for ``self.<attr>(...)`` /
+                                # ``self.<attr>[...]`` access or
+                                # ``getattr(self, <expr>)(...)`` calls
+                                # anywhere within the rhs.
+                                for _sub in ast.walk(_rhs_ast):
+                                    if (
+                                        isinstance(_sub, ast.Attribute)
+                                        and isinstance(_sub.value, ast.Name)
+                                        and _sub.value.id == "self"
+                                    ):
+                                        _has_self_call = True
+                                        break
+                                    if (
+                                        isinstance(_sub, ast.Call)
+                                        and isinstance(_sub.func, ast.Name)
+                                        and _sub.func.id == "getattr"
+                                        and len(_sub.args) >= 2
+                                        and isinstance(_sub.args[0], ast.Name)
+                                        and _sub.args[0].id == "self"
+                                    ):
+                                        _has_self_call = True
+                                        break
                             _line_for_lhs = phys_lineno
                             if (not _has_self_call) and _pl is not None:
                                 _line_for_lhs = _pl
@@ -4804,18 +5216,26 @@ def _build_data_dependency_edges(source_files, class_map, module_attrs, class_st
                             if _parents:
                                 _record_lineage(lhs, _parents, phys_lineno)
                     _ast_append = _ast_stmt if _ast_stmt and _ast_stmt.get("kind") == "append" else None
-                    append_m = None
                     if _ast_append:
                         list_var = (_ast_append.get("target_var") or "").strip()
                         rhs = (_ast_append.get("rhs_text") or "").strip()
+                    elif (
+                        isinstance(_line_stmt, ast.Expr)
+                        and isinstance(_line_stmt.value, ast.Call)
+                        and isinstance(_line_stmt.value.func, ast.Attribute)
+                        and _line_stmt.value.func.attr == "append"
+                        and isinstance(_line_stmt.value.func.value, ast.Name)
+                        and len(_line_stmt.value.args) == 1
+                    ):
+                        # AST-only fallback: ``var.append(rhs)``
+                        list_var = _line_stmt.value.func.value.id
+                        try:
+                            rhs = ast.unparse(_line_stmt.value.args[0])
+                        except Exception:
+                            rhs = ""
                     else:
-                        append_m = re.match(r'\s*(\w+)\.append\((.+)\)', line)
-                        if append_m:
-                            list_var = append_m.group(1)
-                            rhs = append_m.group(2)
-                        else:
-                            list_var = None
-                            rhs = None
+                        list_var = None
+                        rhs = None
                     if list_var and rhs is not None:
                         rhs_producers, _pl, _pv = _collect_expr_producers(rhs, var_producers, dict_slots, fname)
                         if rhs_producers:
@@ -4823,19 +5243,24 @@ def _build_data_dependency_edges(source_files, class_map, module_attrs, class_st
                             var_producers[list_var] = (existing | rhs_producers, phys_lineno)
                             _record_lineage(list_var, _vars_in(rhs), phys_lineno)
                     _ast_aug = _ast_stmt if _ast_stmt and _ast_stmt.get("kind") == "augassign" else None
-                    aug_m = None
                     if _ast_aug:
                         _aug_targets = [t for t in (_ast_aug.get("targets") or []) if t and t != '_']
                         list_var = _aug_targets[0] if len(_aug_targets) == 1 else None
                         rhs = (_ast_aug.get("rhs_text") or "").strip()
+                    elif (
+                        isinstance(_line_stmt, ast.AugAssign)
+                        and isinstance(_line_stmt.op, ast.Add)
+                        and isinstance(_line_stmt.target, ast.Name)
+                    ):
+                        # AST-only fallback: ``var += rhs``
+                        list_var = _line_stmt.target.id
+                        try:
+                            rhs = ast.unparse(_line_stmt.value)
+                        except Exception:
+                            rhs = ""
                     else:
-                        aug_m = re.match(r'\s*(\w+)\s*\+=\s*(.+)', line)
-                        if aug_m:
-                            list_var = aug_m.group(1)
-                            rhs = aug_m.group(2)
-                        else:
-                            list_var = None
-                            rhs = None
+                        list_var = None
+                        rhs = None
                     if list_var and rhs is not None:
                         rhs_producers, _pl, _pv = _collect_expr_producers(rhs, var_producers, dict_slots, fname)
                         if rhs_producers:
@@ -4848,21 +5273,68 @@ def _build_data_dependency_edges(source_files, class_map, module_attrs, class_st
                         _targets = [v for v in (_ast_stmt.get("targets") or []) if v and v != '_']
                         if len(_targets) > 1:
                             _ast_tuple_targets = list(_targets)
-                    tuple_m = re.match(r'\s*\(?(\w+(?:\s*,\s*\w+)+)\)?\s*=\s*(.+)', line)
-                    if _ast_tuple_targets or tuple_m:
-                        lhs_vars = _ast_tuple_targets or [v.strip() for v in re.split(r'\s*,\s*', tuple_m.group(1)) if v.strip()]
-                        rhs = (_ast_stmt.get("rhs_text") if _ast_tuple_targets else tuple_m.group(2))
+                    # AST-only fallback: detect ``(a, b) = expr`` / ``a, b = expr``
+                    _line_tuple_targets = []
+                    _line_tuple_rhs = None
+                    if (
+                        not _ast_tuple_targets
+                        and isinstance(_line_stmt, ast.Assign)
+                        and len(_line_stmt.targets) == 1
+                        and isinstance(_line_stmt.targets[0], ast.Tuple)
+                    ):
+                        _line_tuple_targets = [
+                            elt.id for elt in _line_stmt.targets[0].elts
+                            if isinstance(elt, ast.Name)
+                        ]
+                        if len(_line_tuple_targets) >= 2:
+                            try:
+                                _line_tuple_rhs = ast.unparse(_line_stmt.value)
+                            except Exception:
+                                _line_tuple_rhs = ""
+                        else:
+                            _line_tuple_targets = []
+                    if _ast_tuple_targets or _line_tuple_targets:
+                        lhs_vars = _ast_tuple_targets or _line_tuple_targets
+                        if _ast_tuple_targets:
+                            rhs = (_ast_stmt.get("rhs_text") or "")
+                        else:
+                            rhs = _line_tuple_rhs or ""
                         rhs_producers, _pl, _pv = _collect_expr_producers(rhs, var_producers, dict_slots, fname)
                         if rhs_producers:
                             for v in lhs_vars:
                                 v = v.strip()
                                 if v and v != '_':
                                     _line_for_v = phys_lineno
-                                    if _ast_var_env.get(v) and _ast_var_env[v][1] is not None:
-                                        _line_for_v = _ast_var_env[v][1]
+                                    _ast_var_entry = None
+                                    if _ast_fe_dd is not None:
+                                        _ast_var_entry = _ast_fe_dd._lookup_var_env_entry(_ast_var_env, v, phys_lineno)
+                                    elif _ast_var_env.get(v):
+                                        _chain = _ast_var_env.get(v) or []
+                                        if not isinstance(_chain, list):
+                                            _chain = [_chain]
+                                        for _item in _chain:
+                                            if _item and len(_item) > 1 and _item[1] is not None and _item[1] <= phys_lineno:
+                                                _ast_var_entry = _item
+                                    if _ast_var_entry is not None and len(_ast_var_entry) > 1 and _ast_var_entry[1] is not None:
+                                        _line_for_v = _ast_var_entry[1]
                                     var_producers[v] = (rhs_producers, _line_for_v)
                                     _record_lineage(v, _vars_in(rhs), phys_lineno)
                     continue
+
+                if called_attrs:
+                    _ast_append = _ast_stmt if _ast_stmt and _ast_stmt.get("kind") == "append" else None
+                    if _ast_append:
+                        _list_var = (_ast_append.get("target_var") or "").strip()
+                        _rhs_text = (_ast_append.get("rhs_text") or "").strip()
+                        if _list_var:
+                            _existing = var_producers.get(_list_var, (set(), phys_lineno))[0]
+                            _call_producers = {
+                                _attr for _attr, _call_start, _call_end, _call_node in called_attrs
+                                if _attr in known_attrs
+                            }
+                            if _call_producers:
+                                var_producers[_list_var] = (_existing | _call_producers, phys_lineno)
+                                _record_lineage(_list_var, _vars_in(_rhs_text), phys_lineno)
 
                 # For each module call, determine consumed variables
                 for attr, call_start, call_end, call_node in called_attrs:
@@ -4880,67 +5352,10 @@ def _build_data_dependency_edges(source_files, class_map, module_attrs, class_st
                                 prev = consumed_var_for_producer.get(p)
                                 if prev is None or (meta[1] is not None and (prev[1] is None or meta[1] > prev[1])):
                                     consumed_var_for_producer[p] = meta
-                    else:
-                        # Find the args region for this call
-                        try:
-                            paren_start = line.index('(', call_end - 1)
-                        except ValueError:
-                            # Try to find from call_start
-                            try:
-                                paren_start = line.index('(', call_start)
-                            except ValueError:
-                                continue
-                        depth = 0
-                        paren_end = paren_start
-                        for ci in range(paren_start, len(line)):
-                            if line[ci] == '(':
-                                depth += 1
-                            elif line[ci] == ')':
-                                depth -= 1
-                                if depth == 0:
-                                    paren_end = ci
-                                    break
-                        args_str = line[paren_start+1:paren_end]
-
-                        for var, (producers, ploc) in var_producers.items():
-                            if re.search(r'\b' + re.escape(var) + r'\b', args_str):
-                                consumed_producers.update(producers)
-                                for p in producers:
-                                    # Prefer the most recent variable carrying this producer
-                                    prev = consumed_var_for_producer.get(p)
-                                    if prev is None or ploc > prev[1]:
-                                        consumed_var_for_producer[p] = (var, ploc)
-
-                        # dict 读取（d['k'] / d.get('k')）
-                        dps, dev_map = _collect_dict_reads(args_str, dict_slots, fname)
-                        if dps:
-                            consumed_producers.update(dps)
-                            for p, (vname, pl) in dev_map.items():
-                                prev = consumed_var_for_producer.get(p)
-                                if prev is None or (pl is not None and pl > prev[1]):
-                                    consumed_var_for_producer[p] = (vname, pl if pl is not None else phys_lineno)
-                        # Nested self.yyy() or self.yyy[...]() in args
-                        for m2 in re.finditer(r'self\.(\w+)(?:\[[^\]]*\])?\s*\(', args_str):
-                            nested_attr = m2.group(1)
-                            if nested_attr in known_attrs and nested_attr != attr:
-                                consumed_producers.add(nested_attr)
-                                consumed_var_for_producer.setdefault(nested_attr, ("(nested call)", phys_lineno))
-
-                        # Nested getattr(self, ...)(...) in args
-                        for m2 in re.finditer(r'getattr\(\s*self\s*,\s*([\"\'])([^\"\']+)\1\s*\)\s*\(', args_str):
-                            nested_attr = m2.group(2)
-                            if nested_attr in known_attrs and nested_attr != attr:
-                                consumed_producers.add(nested_attr)
-                                consumed_var_for_producer.setdefault(nested_attr, ("(nested getattr call)", phys_lineno))
-                        if dynamic_setattr_attrs:
-                            for m2 in re.finditer(r'getattr\(\s*self\s*,\s*[^\)]+\)\s*\(', args_str):
-                                snippet = args_str[m2.start():m2.end()]
-                                if re.search(r'getattr\(\s*self\s*,\s*[\"\']', snippet):
-                                    continue
-                                for nested_attr in dynamic_setattr_attrs:
-                                    if nested_attr != attr:
-                                        consumed_producers.add(nested_attr)
-                                        consumed_var_for_producer.setdefault(nested_attr, ("(nested getattr call)", phys_lineno))
+                    # Note: a regex-based fallback path used to handle
+                    # ``call_node is None`` here; that branch has been retired
+                    # because every call now originates from the AST scan and
+                    # always carries a real ``ast.Call`` node.
 
                     for producer in consumed_producers:
                         if producer != attr:
@@ -5014,86 +5429,119 @@ def _build_data_dependency_edges(source_files, class_map, module_attrs, class_st
                         _record_lineage(v_clean, _vars_in(line), phys_lineno)
                     _handled_lhs = True
                 if not _handled_lhs:
-                    # Match patterns like: var = self.attr(...) or var = self.attr[idx](...)
-                    # or (v1, v2) = self.attr(...)
-                    lhs_match_getattr = re.match(r'\s*([^=]+?)\s*=\s*getattr\(\s*self\s*,\s*([\"\'])([^\"\']+)\2\s*\)\s*\(', line)
-                    if lhs_match_getattr:
-                        lhs_str = lhs_match_getattr.group(1).strip()
-                        producing_attr = lhs_match_getattr.group(3)
+                    # AST-only LHS handling.
+                    # Three target shapes are recognised:
+                    #   1) ``var = getattr(self, 'attr')(...)``
+                    #   2) ``var = self.attr(...)`` / ``var = self.attr[idx](...)``
+                    #   3) ``var = <expr>`` / ``a, b = <expr>`` (general)
+                    # In each case, the LHS targets and (for shapes 1/2) the
+                    # producer attr come straight from the AST stmt.
+                    _ast_assign_stmt = None
+                    if isinstance(_line_stmt, ast.Assign):
+                        _ast_assign_stmt = _line_stmt
+                    _lhs_targets = []
+                    _lhs_is_tuple = False
+                    if _ast_assign_stmt and len(_ast_assign_stmt.targets) == 1:
+                        _t0 = _ast_assign_stmt.targets[0]
+                        if isinstance(_t0, ast.Name):
+                            _lhs_targets = [_t0.id]
+                        elif isinstance(_t0, ast.Tuple):
+                            _lhs_targets = [
+                                e.id for e in _t0.elts
+                                if isinstance(e, ast.Name) and e.id != "_"
+                            ]
+                            _lhs_is_tuple = True
+
+                    # Shape 1: ``... = getattr(self, 'attr')(...)``
+                    _shape_handled = False
+                    if (
+                        _ast_assign_stmt is not None
+                        and isinstance(_ast_assign_stmt.value, ast.Call)
+                        and isinstance(_ast_assign_stmt.value.func, ast.Call)
+                        and isinstance(_ast_assign_stmt.value.func.func, ast.Name)
+                        and _ast_assign_stmt.value.func.func.id == "getattr"
+                        and len(_ast_assign_stmt.value.func.args) >= 2
+                        and isinstance(_ast_assign_stmt.value.func.args[0], ast.Name)
+                        and _ast_assign_stmt.value.func.args[0].id == "self"
+                        and isinstance(_ast_assign_stmt.value.func.args[1], ast.Constant)
+                        and isinstance(_ast_assign_stmt.value.func.args[1].value, str)
+                    ):
+                        producing_attr = _ast_assign_stmt.value.func.args[1].value
                         if producing_attr in known_attrs:
-                            lhs_str_clean = lhs_str.strip('()')
-                            lhs_vars = [v.strip() for v in lhs_str_clean.split(',') if v.strip()]
-                            for v in lhs_vars:
-                                v_clean = v.strip()
-                                if re.match(r'^[\w]+$', v_clean) and v_clean != '_':
+                            for v_clean in _lhs_targets:
+                                if v_clean and v_clean != "_" and v_clean.isidentifier():
                                     var_producers[v_clean] = ({producing_attr}, phys_lineno)
                                     _record_lineage(v_clean, _vars_in(line), phys_lineno)
+                        _shape_handled = True
                         continue
 
-                    lhs_match = re.match(r'\s*([^=]+?)\s*=\s*self\.(\w+)(?:\[\s*([^\]]+?)\s*\])?\s*\(', line)
-                    if lhs_match:
-                        lhs_str = lhs_match.group(1).strip()
-                        producing_attr = lhs_match.group(2)
-                        idx_expr = lhs_match.group(3)
-                        producing_attrs = []
-                        if idx_expr is not None:
-                            producing_attrs = _resolve_indexed_attr(producing_attr, idx_expr)
-                        else:
-                            producing_attrs = [producing_attr]
-                        producing_attrs = [a for a in producing_attrs if a in known_attrs]
-                        if producing_attrs:
-                            lhs_str_clean = lhs_str.strip('()')
-                            lhs_vars = [v.strip() for v in lhs_str_clean.split(',') if v.strip()]
-                            for v in lhs_vars:
-                                v_clean = v.strip()
-                                if re.match(r'^[\w]+$', v_clean) and v_clean != '_':
-                                    var_producers[v_clean] = (set(producing_attrs), phys_lineno)
-                                    _record_lineage(v_clean, _vars_in(line), phys_lineno)
-                    else:
-                        # e.g. "shorthead_kv = self.FAFE_shorthead_kv(shorthead_kv, ...)"
-                        assign_m = re.match(r'\s*(\w+)\s*=\s*(.+)', line)
-                        if assign_m and called_attrs:
-                            lhs = assign_m.group(1)
-                            # Use the last called attr as producer (rightmost = final output)
-                            last_s, last_e = called_attrs[-1][1], called_attrs[-1][2]
-                            last_calls = {a for (a, s, e, _node) in called_attrs if s == last_s and e == last_e}
-                            last_calls = last_calls or {called_attrs[-1][0]}
-                            # 若 last_calls 是 container 的元素集合（例如 loop_var），取“链尾”作为更贴近真实的 producer
-                            if len(last_calls) > 1:
-                                # 尝试按 container_to_elems 顺序选最后一个
-                                tail = None
-                                for cont, elems in container_to_elems.items():
-                                    for ea in reversed(elems):
-                                        if ea in last_calls:
-                                            tail = ea
-                                            break
-                                    if tail:
+                    # Shape 2: ``... = self.attr(...)`` or
+                    #         ``... = self.attr[idx](...)``
+                    if (
+                        _ast_assign_stmt is not None
+                        and isinstance(_ast_assign_stmt.value, ast.Call)
+                    ):
+                        _call_func = _ast_assign_stmt.value.func
+                        _producing_attr_name = None
+                        _producing_idx_expr = None
+                        if (
+                            isinstance(_call_func, ast.Attribute)
+                            and isinstance(_call_func.value, ast.Name)
+                            and _call_func.value.id == "self"
+                        ):
+                            _producing_attr_name = _call_func.attr
+                        elif (
+                            isinstance(_call_func, ast.Subscript)
+                            and isinstance(_call_func.value, ast.Attribute)
+                            and isinstance(_call_func.value.value, ast.Name)
+                            and _call_func.value.value.id == "self"
+                        ):
+                            _producing_attr_name = _call_func.value.attr
+                            try:
+                                _producing_idx_expr = ast.unparse(_call_func.slice)
+                            except Exception:
+                                _producing_idx_expr = ""
+                        if _producing_attr_name is not None:
+                            if _producing_idx_expr is not None:
+                                producing_attrs = _resolve_indexed_attr(
+                                    _producing_attr_name, _producing_idx_expr)
+                            else:
+                                producing_attrs = [_producing_attr_name]
+                            producing_attrs = [a for a in producing_attrs if a in known_attrs]
+                            if producing_attrs:
+                                for v_clean in _lhs_targets:
+                                    if v_clean and v_clean != "_" and v_clean.isidentifier():
+                                        var_producers[v_clean] = (set(producing_attrs), phys_lineno)
+                                        _record_lineage(v_clean, _vars_in(line), phys_lineno)
+                            _shape_handled = True
+
+                    # Shape 3: general ``var = ...`` / ``a, b = ...``
+                    # (only when shape 2 didn't match).  When ``called_attrs``
+                    # is non-empty, the producer is the last-call attr.
+                    if not _shape_handled and called_attrs:
+                        last_s, last_e = called_attrs[-1][1], called_attrs[-1][2]
+                        last_calls = {a for (a, s, e, _node) in called_attrs if s == last_s and e == last_e}
+                        last_calls = last_calls or {called_attrs[-1][0]}
+                        # 若 last_calls 是 container 的元素集合（例如 loop_var），取"链尾"作为更贴近真实的 producer
+                        if len(last_calls) > 1:
+                            tail = None
+                            for cont, elems in container_to_elems.items():
+                                for ea in reversed(elems):
+                                    if ea in last_calls:
+                                        tail = ea
                                         break
                                 if tail:
-                                    last_calls = {tail}
-                            var_producers[lhs] = (set(last_calls), phys_lineno)
-                            _record_lineage(lhs, _vars_in(line), phys_lineno)
-                        # Handle tuple unpacking from module calls
-                        tuple_lhs_m = re.match(r'\s*\(?(\w+(?:\s*,\s*\w+)+)\)?\s*=\s*', line)
-                        if tuple_lhs_m and called_attrs:
-                            lhs_vars_str = tuple_lhs_m.group(1)
-                            last_s, last_e = called_attrs[-1][1], called_attrs[-1][2]
-                            last_calls = {a for (a, s, e, _node) in called_attrs if s == last_s and e == last_e}
-                            last_calls = last_calls or {called_attrs[-1][0]}
-                            if len(last_calls) > 1:
-                                tail = None
-                                for cont, elems in container_to_elems.items():
-                                    for ea in reversed(elems):
-                                        if ea in last_calls:
-                                            tail = ea
-                                            break
-                                    if tail:
-                                        break
-                                if tail:
-                                    last_calls = {tail}
-                            for v in re.split(r'\s*,\s*', lhs_vars_str):
-                                v = v.strip()
-                                if v and v != '_' and re.match(r'^[\w]+$', v):
+                                    break
+                            if tail:
+                                last_calls = {tail}
+                        if not _lhs_is_tuple and len(_lhs_targets) == 1:
+                            lhs = _lhs_targets[0]
+                            if lhs and lhs != "_" and lhs.isidentifier():
+                                var_producers[lhs] = (set(last_calls), phys_lineno)
+                                _record_lineage(lhs, _vars_in(line), phys_lineno)
+                        elif _lhs_is_tuple and _lhs_targets:
+                            for v in _lhs_targets:
+                                if v and v != "_" and v.isidentifier():
                                     var_producers[v] = (set(last_calls), phys_lineno)
                                     _record_lineage(v, _vars_in(line), phys_lineno)
 
@@ -6918,7 +7366,6 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                     path=fname,
                 )
             except Exception:
-                _warn_regex_fallback("analyze_trace_ast_refactor", "build_static_module_tree", f"ASTFrontend_init:{fname}")
                 _ast_frontend_cache[fname] = None
         return _ast_frontend_cache[fname]
 
@@ -6931,29 +7378,53 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
     # elements / dynamic setattrs that downstream consumers can consult when
     # the existing regex pass is uncertain.  The data is stashed on each
     # tree[cname] entry as ``_ast_*`` keys near the end of this function.
-    # We deliberately keep the existing logic as the primary driver so the
-    # 7-model + 2-synthetic regression baseline stays at zero deltas — the
-    # AST view is purely additive metadata.
-    try:
-        _ast_extractor = _AST_ModuleTreeExtractor(source_files)
-    except Exception:
-        # Defensive: never let the AST pass break analysis.
-        _warn_regex_fallback("analyze_trace_ast_refactor", "build_static_module_tree", "_AST_ModuleTreeExtractor")
-        _ast_extractor = None
+    _ast_extractor = _AST_ModuleTreeExtractor(source_files)
 
     # ------------------------------------------------------------------
     # 轻量常量表：用于 ModuleList/ModuleDict 展开时解析 range(N) / layers=CONST
     # 仅解析“文件级”形如 `NAME = 6` 的 int 常量。
+    # AST-only:  parse each source file once and inspect top-level
+    # ``ast.Assign`` statements where the target is an UPPER_SNAKE Name
+    # and the value is a non-negative integer Constant.
     # ------------------------------------------------------------------
     file_int_consts = {}
-    _INT_CONST_RE = re.compile(r'^\s*([A-Z][A-Z0-9_]*)\s*=\s*(\d+)\s*(?:#.*)?$')
+    file_str_list_globals_raw = {}  # {fname: {VARNAME: raw_inner_string}}
+
+    def _is_upper_snake_name(_s: str) -> bool:
+        return bool(_s) and _s[0:1].isupper() and all(
+            c.isupper() or c.isdigit() or c == "_" for c in _s
+        )
+
     for _fname, _lines in source_files.items():
-        consts = {}
-        for _line in _lines:
-            m = _INT_CONST_RE.match(_line)
-            if m:
-                consts[m.group(1)] = int(m.group(2))
-        file_int_consts[_fname] = consts
+        int_consts = {}
+        str_list_consts_raw = {}
+        try:
+            _file_tree = ast.parse("".join(_lines))
+        except SyntaxError:
+            _file_tree = None
+        if _file_tree is not None:
+            for _node in _file_tree.body:
+                if not isinstance(_node, ast.Assign) or len(_node.targets) != 1:
+                    continue
+                _t = _node.targets[0]
+                if not (isinstance(_t, ast.Name) and _is_upper_snake_name(_t.id)):
+                    continue
+                _v = _node.value
+                # int constant: ``NAME = 42``
+                if isinstance(_v, ast.Constant) and isinstance(_v.value, int) and not isinstance(_v.value, bool):
+                    if _v.value >= 0:
+                        int_consts[_t.id] = _v.value
+                # list literal: ``NAME = ['a', 'b']`` — store the unparse of
+                # the inner element list so the existing
+                # ``_parse_str_literal_list`` helper can consume it later.
+                elif isinstance(_v, ast.List):
+                    try:
+                        _inner_text = ", ".join(ast.unparse(_e) for _e in _v.elts)
+                    except Exception:
+                        _inner_text = ""
+                    str_list_consts_raw[_t.id] = _inner_text
+        file_int_consts[_fname] = int_consts
+        file_str_list_globals_raw[_fname] = str_list_consts_raw
 
     # 全局常量：同名常量在多个文件出现时，若值唯一则可跨文件解析
     global_int_const_values = defaultdict(set)
@@ -6964,18 +7435,7 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
     # Iter13 Step2: file-level string-literal list globals, e.g.
     #   COMMON_KEYS = ['a', 'b']
     # Used to resolve ModuleDict keys driven by such constants.
-    # NOTE: this lookup table is built lazily (lambda) because
-    # ``_parse_str_literal_list`` is not yet defined here — we just collect
-    # raw bracket contents and parse them on demand once the helper is in scope.
-    file_str_list_globals_raw = {}  # {fname: {VARNAME: raw_inner_string}}
-    _STR_LIST_RE = re.compile(r'^\s*([A-Z][A-Z0-9_]*)\s*=\s*\[(.*)\]\s*$')
-    for _fname, _lines in source_files.items():
-        slots = {}
-        for _line in _lines:
-            m = _STR_LIST_RE.match(_line)
-            if m:
-                slots[m.group(1)] = m.group(2)
-        file_str_list_globals_raw[_fname] = slots
+    # NOTE: ``file_str_list_globals_raw`` was populated above (AST-driven).
     # Realised lookup: parsed lists, populated below once
     # ``_parse_str_literal_list`` is available.  We keep it as a placeholder dict
     # and fill it lazily in the per-class scanning loop.
@@ -6997,218 +7457,44 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
     # the class internally expands containers via `for ... in enumerate(<kw>)`.
     instance_kw_list_lens = defaultdict(dict)
 
-    def _eval_int_atom_legacy(expr: str, fname: str):
-        """Legacy regex+AST integer atom evaluator (kept verbatim for A/B)."""
-        expr = (expr or '').strip()
-        if not expr:
+    def _eval_expr_node(expr_text: str):
+        expr_text = (expr_text or '').strip()
+        if not expr_text:
             return None
-        if re.fullmatch(r'\d+', expr):
-            return int(expr)
-        consts = file_int_consts.get(fname, {})
-        if expr in consts:
-            return consts[expr]
-        # 跨文件唯一常量
-        vals = global_int_const_values.get(expr)
-        if vals and len(vals) == 1:
-            return next(iter(vals))
-        return None
-
-    def _eval_int_atom(expr: str, fname: str):
-        """A/B-aware integer atom evaluator.
-
-        Always computes the legacy answer (preserving call-graph identity).
-        Additionally consults the new resolver when ``USE_NEW_EVAL`` is True
-        and records both into the A/B diff log.  Returns the new result when
-        ``USE_NEW_EVAL`` is True (falling back to legacy on resolver miss),
-        otherwise the legacy result — guaranteeing byte-identical behaviour
-        when the switch is off.
-        """
-        legacy = _eval_int_atom_legacy(expr, fname)
-        if not USE_NEW_EVAL:
-            return legacy
-        # A/B path — note: scope_cls/method are not available at this level
-        # (the legacy entry has no scope context).  We pass ``None`` so the
-        # new resolver only matches file-/global-level constants — the cases
-        # the legacy entry actually handles.  Class-/method-level lookups
-        # happen in ``_resolve_range_n`` / ``_resolve_iter_len`` which carry
-        # full scope.
-        new = _ab_int_via_new_eval(expr, fname)
-        _ab_record("_eval_int_atom", str(expr), legacy, new)
-        return new if new is not None else legacy
-
-    def _split_top_level(expr: str):
-        """Split `expr` on top-level commas, respecting [], (), {} nesting.
-        Returns a list of trimmed segments.
-        """
-        parts = []
-        depth = 0
-        cur = []
-        in_str = False
-        qc = None
-        esc = False
-        for ch in expr:
-            if in_str:
-                cur.append(ch)
-                if esc:
-                    esc = False
-                elif ch == '\\':
-                    esc = True
-                elif ch == qc:
-                    in_str = False
-                continue
-            if ch in '"\'':
-                in_str = True
-                qc = ch
-                cur.append(ch)
-                continue
-            if ch in '([{':
-                depth += 1
-                cur.append(ch)
-            elif ch in ')]}':
-                depth -= 1
-                cur.append(ch)
-            elif ch == ',' and depth == 0:
-                parts.append(''.join(cur).strip())
-                cur = []
-            else:
-                cur.append(ch)
-        if cur:
-            tail = ''.join(cur).strip()
-            if tail:
-                parts.append(tail)
-        return parts
-
-    def _eval_list_len(expr: str, fname: str):
-        """A/B-aware list-length evaluator.
-
-        See ``_eval_list_len_legacy`` for the legacy implementation.  Behaviour
-        is identical to that function unless ``USE_NEW_EVAL`` is True, in
-        which case the new resolver is consulted in parallel and the diff is
-        recorded.
-        """
-        legacy = _eval_list_len_legacy(expr, fname)
-        if not USE_NEW_EVAL:
-            return legacy
-        new = _ab_list_len_via_new_eval(expr, fname)
-        _ab_record("_eval_list_len", str(expr), legacy, new)
-        return new if new is not None else legacy
-
-    def _eval_list_len_legacy(expr: str, fname: str):
-        """Try to compute the LENGTH of a list-typed expression statically.
-
-        Supported forms (chained via `+` for concat):
-          - `[a, b, c]` -> 3
-          - `NAME` where file/global str-list constant exists -> len of that list
-          - `NAME` where module class has class_str_list_attrs (later)
-          - `[a, b] + [c, d]` -> 4
-          - `[x] * N` / `N * [x]` where N is int atom -> N (item count)
-
-        Returns int or None.
-        """
-        if expr is None:
+        try:
+            return ast.parse(expr_text, mode="eval").body
+        except Exception:
             return None
-        expr = expr.strip()
-        if not expr:
+
+    def _resolver_scope(fname: str, cname: str = None, mname: str = None,
+                        parent_cls: str = None, parent_attr: str = None):
+        return Scope(file=fname, cls=cname, method=mname,
+                     parent_cls=parent_cls, parent_attr=parent_attr)
+
+    def _eval_int_node(expr_node, fname: str, cname: str = None, mname: str = None,
+                       parent_cls: str = None, parent_attr: str = None):
+        if expr_node is None or _new_eval_resolver is None:
             return None
-        # Strip outer parens.
-        while expr.startswith('(') and expr.endswith(')'):
-            inner = expr[1:-1].strip()
-            depth = 0
-            balanced = True
-            for ch in inner:
-                if ch == '(':
-                    depth += 1
-                elif ch == ')':
-                    depth -= 1
-                    if depth < 0:
-                        balanced = False
-                        break
-            if not balanced or depth != 0:
-                break
-            expr = inner
+        try:
+            iv = _new_eval_resolver.eval_int(
+                expr_node,
+                _resolver_scope(fname, cname, mname, parent_cls, parent_attr),
+            )
+        except Exception:
+            return None
+        return iv.value if iv is not None else None
 
-        # Concat with `+`: split on top-level + and sum each side's length.
-        # We only split when both sides look list-like to avoid arithmetic.
-        plus_parts = []
-        depth = 0
-        cur = []
-        in_str = False
-        qc = None
-        esc = False
-        for ch in expr:
-            if in_str:
-                cur.append(ch)
-                if esc:
-                    esc = False
-                elif ch == '\\':
-                    esc = True
-                elif ch == qc:
-                    in_str = False
-                continue
-            if ch in '"\'':
-                in_str = True
-                qc = ch
-                cur.append(ch)
-                continue
-            if ch in '([{':
-                depth += 1
-                cur.append(ch)
-            elif ch in ')]}':
-                depth -= 1
-                cur.append(ch)
-            elif ch == '+' and depth == 0:
-                plus_parts.append(''.join(cur).strip())
-                cur = []
-            else:
-                cur.append(ch)
-        if cur:
-            plus_parts.append(''.join(cur).strip())
-        if len(plus_parts) > 1:
-            total = 0
-            for p in plus_parts:
-                n = _eval_list_len_legacy(p, fname)
-                if n is None:
-                    return None
-                total += n
-            return total
-
-        # `[a, b] * N` or `N * [a, b]`
-        m_mul = re.match(r'^(.+?)\s*\*\s*(.+)$', expr)
-        if m_mul:
-            left = m_mul.group(1).strip()
-            right = m_mul.group(2).strip()
-            l_len = _eval_list_len_legacy(left, fname)
-            r_int = _eval_int_atom_legacy(right, fname)
-            if l_len is not None and r_int is not None:
-                return l_len * r_int
-            r_len = _eval_list_len_legacy(right, fname)
-            l_int = _eval_int_atom_legacy(left, fname)
-            if r_len is not None and l_int is not None:
-                return r_len * l_int
-
-        # Bare list literal: [a, b, c]
-        if expr.startswith('[') and expr.endswith(']'):
-            inner = expr[1:-1].strip()
-            if not inner:
-                return 0
-            items = _split_top_level(inner)
-            return len(items)
-
-        # Identifier — look up in file/global constants of int (no), str-list raw
-        if re.match(r'^[A-Za-z_][\w]*$', expr):
-            raw_slots = file_str_list_globals_raw.get(fname, {})
-            if expr in raw_slots:
-                items = _split_top_level(raw_slots[expr])
-                # Filter empty (handles `KEYS = []`)
-                items = [it for it in items if it.strip()]
-                return len(items)
-            # Cross-file unique str-list global
-            for _f, slots in file_str_list_globals_raw.items():
-                if expr in slots:
-                    items = _split_top_level(slots[expr])
-                    items = [it for it in items if it.strip()]
-                    return len(items)
-        return None
+    def _eval_list_len_node(expr_node, fname: str, cname: str = None, mname: str = None,
+                            parent_cls: str = None, parent_attr: str = None):
+        if expr_node is None or _new_eval_resolver is None:
+            return None
+        try:
+            return _new_eval_resolver.eval_list_len(
+                expr_node,
+                _resolver_scope(fname, cname, mname, parent_cls, parent_attr),
+            )
+        except Exception:
+            return None
 
     # Build inheritance info - detect which classes extend nn.Module (or other user classes)
     nn_module_classes = set()
@@ -7218,13 +7504,25 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
             for _ast_cname in _fe.class_registry.keys():
                 if _fe.is_nn_module(_ast_cname):
                     nn_module_classes.add(_ast_cname)
-        for line in lines:
-            m = re.match(r'^class (\w+)\(([^)]+)\)', line.strip())
-            if m:
-                cname, bases = m.groups()
-                base_list = [b.strip() for b in bases.split(",")]
-                for b in base_list:
-                    b_short = b.split(".")[-1]
+        # AST-only:  walk the file's class definitions and inspect the bases.
+        # ``ast.ClassDef`` already gives us each base as a node — render it
+        # back to text via ``ast.unparse`` so the original "rightmost dotted
+        # name" heuristic still applies.
+        try:
+            _file_tree_for_classes = ast.parse("".join(lines))
+        except SyntaxError:
+            _file_tree_for_classes = None
+        if _file_tree_for_classes is not None:
+            for _node in ast.walk(_file_tree_for_classes):
+                if not isinstance(_node, ast.ClassDef) or not _node.bases:
+                    continue
+                cname = _node.name
+                for _base_node in _node.bases:
+                    try:
+                        _b = ast.unparse(_base_node)
+                    except Exception:
+                        _b = ""
+                    b_short = _b.split(".")[-1] if _b else ""
                     if b_short in ("Module", "nn.Module") or b_short in nn_module_classes:
                         nn_module_classes.add(cname)
                         break
@@ -7234,94 +7532,22 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
             nn_module_classes.add(cname)
 
     # ------------------------------------------------------------------
-    # PR2 — Build the new ConstantTable + ConstantResolver once per
-    # ``build_static_module_tree`` invocation.  In PR2 they coexist with
-    # the legacy evaluator: when ``USE_NEW_EVAL`` is True the legacy
-    # functions still compute their answer first (so the call graph stays
-    # identical and any side-effects are preserved) and *then* the new
-    # resolver is consulted; when both produce a result they are A/B
-    # diffed via ``_ab_record``.  When ``USE_NEW_EVAL`` is True the new
-    # result is returned to the caller (with legacy as fallback when the
-    # new resolver returns ``None``); when False, the legacy result is
-    # returned unchanged — preserving byte-identical behaviour vs PR1.
-    #
-    # The AST-frontend cache is reused so we don't re-parse files.
+    # PR3 — build the ConstantTable + ConstantResolver once and use it as the
+    # only evaluator path.
     # ------------------------------------------------------------------
     _new_eval_table = None
     _new_eval_resolver = None
-    try:
-        _new_eval_ast_frontends = {}
-        for _fname in source_files.keys():
-            _fe = _get_ast_frontend(_fname)
-            if _fe is not None:
-                _new_eval_ast_frontends[_fname] = _fe
-        _new_eval_table = ConstantTable.build_all(
-            source_files=source_files,
-            ast_frontends=_new_eval_ast_frontends,
-            nn_module_classes=set(nn_module_classes),
-        )
-        _new_eval_resolver = ConstantResolver(_new_eval_table)
-    except Exception as _e:
-        # Defensive: A/B path failure must never break the legacy path.
-        _new_eval_table = None
-        _new_eval_resolver = None
-        _warn_regex_fallback("analyze_trace_ast_refactor", "build_static_module_tree", f"new_eval_build:{type(_e).__name__}")
-
-    # Reset the global A/B diff log at the start of every build so a single
-    # process running multiple test models gets clean per-model accounting.
-    if USE_NEW_EVAL:
-        _AB_EVAL_DIFFS.clear()
-
-    def _ab_int_via_new_eval(expr_text: str, fname: str, scope_cls: str = None,
-                             scope_method: str = None, parent_cls: str = None,
-                             parent_attr: str = None):
-        """Helper: parse *expr_text* as an int expression and ask the new
-        resolver.  Returns ``None`` on parse / scope failure or when the
-        resolver fails.  Used for A/B comparison only — never mutates the
-        legacy fall-through path.
-
-        IMPORTANT: every A/B call uses a *fresh* resolver instance.  The
-        production resolver caches by ``id(node)`` (cheap and correct when
-        the AST is owned by a long-lived ``ASTFrontend``).  In the A/B path
-        we re-parse a string expression on every call, producing transient
-        nodes whose ids get recycled by CPython between calls — which would
-        poison a shared cache.  Per-call resolvers eliminate that risk.
-        """
-        if _new_eval_table is None or not expr_text:
-            return None
-        try:
-            tree = ast.parse(expr_text, mode="eval")
-            node = tree.body
-        except Exception:
-            return None
-        scope = Scope(file=fname, cls=scope_cls, method=scope_method,
-                      parent_cls=parent_cls, parent_attr=parent_attr)
-        try:
-            iv = ConstantResolver(_new_eval_table).eval_int(node, scope)
-        except Exception:
-            return None
-        return iv.value if iv is not None else None
-
-    def _ab_list_len_via_new_eval(expr_text: str, fname: str, scope_cls: str = None,
-                                  scope_method: str = None, parent_cls: str = None,
-                                  parent_attr: str = None):
-        """Helper: parse *expr_text* as a list expression and ask the new
-        resolver for its length.  Returns ``None`` on failure.  Uses a
-        per-call resolver — see ``_ab_int_via_new_eval`` for the rationale.
-        """
-        if _new_eval_table is None or not expr_text:
-            return None
-        try:
-            tree = ast.parse(expr_text, mode="eval")
-            node = tree.body
-        except Exception:
-            return None
-        scope = Scope(file=fname, cls=scope_cls, method=scope_method,
-                      parent_cls=parent_cls, parent_attr=parent_attr)
-        try:
-            return ConstantResolver(_new_eval_table).eval_list_len(node, scope)
-        except Exception:
-            return None
+    _new_eval_ast_frontends = {}
+    for _fname in source_files.keys():
+        _fe = _get_ast_frontend(_fname)
+        if _fe is not None:
+            _new_eval_ast_frontends[_fname] = _fe
+    _new_eval_table = ConstantTable.build_all(
+        source_files=source_files,
+        ast_frontends=_new_eval_ast_frontends,
+        nn_module_classes=set(nn_module_classes),
+    )
+    _new_eval_resolver = ConstantResolver(_new_eval_table)
 
 
     # Per-class attr->class mapping. We scan ALL methods (not just __init__) because
@@ -7387,30 +7613,46 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
         text = cond_text.strip()
         # Strip a trailing colon if any (defensive — _cond_if_re keeps it out).
         text = text.rstrip(':').strip()
-        # Lowercase copy for keyword search; preserve the original for ``not`` detection.
-        low = text.lower()
-        # Tokenise on word boundaries so we don't match e.g. ``training_steps``
-        # We accept four canonical names. ``is_training`` and ``training`` both
-        # mean "true when training"; ``is_serving`` / ``serving`` mean
-        # "true when serving (i.e. inference)".
+        # AST-only: parse the cond as a Python expression, then walk Name/
+        # Attribute nodes to collect tokens; track UnaryOp(Not, ...) clauses
+        # to detect polarity flips around the canonical names.
+        try:
+            _cond_node = ast.parse(text, mode="eval").body
+        except SyntaxError:
+            return None
         train_words = ("is_training", "training")
         serve_words = ("is_serving", "serving")
-        # Find any token using a word boundary regex.
-        token_re = re.compile(r'\b([A-Za-z_][A-Za-z0-9_]*)\b')
-        tokens = [t.lower() for t in token_re.findall(text)]
+
+        def _leaf_token(_node):
+            """Render the rightmost identifier of a Name/Attribute chain
+            (lowercased). Returns None for anything else."""
+            if isinstance(_node, ast.Name):
+                return _node.id.lower()
+            if isinstance(_node, ast.Attribute):
+                return _node.attr.lower()
+            return None
+
+        # Collect every leaf token anywhere in the expression so we can
+        # decide whether a train / serve canonical name appears at all.
+        tokens = []
+        for _sub in ast.walk(_cond_node):
+            if isinstance(_sub, (ast.Name, ast.Attribute)):
+                _tok = _leaf_token(_sub)
+                if _tok:
+                    tokens.append(_tok)
         has_train = any(t in train_words for t in tokens)
         has_serve = any(t in serve_words for t in tokens)
         if not (has_train or has_serve):
             return None
-        # Detect a leading / surrounding ``not`` that flips polarity.
-        # We rely on the simpler signal of whether the canonical token is
-        # immediately preceded by a ``not`` keyword.
+        # Detect a UnaryOp(Not, <name/attr>) whose leaf token is a canonical
+        # train/serve word — that flips polarity.
         flipped = False
-        for m in re.finditer(r'\bnot\s+([\w\.]+)', low):
-            tail = m.group(1).split('.')[-1]
-            if tail in train_words or tail in serve_words:
-                flipped = True
-                break
+        for _sub in ast.walk(_cond_node):
+            if isinstance(_sub, ast.UnaryOp) and isinstance(_sub.op, ast.Not):
+                _tail = _leaf_token(_sub.operand)
+                if _tail and (_tail in train_words or _tail in serve_words):
+                    flipped = True
+                    break
         # Compute base polarity from which keyword family appeared.
         if has_train and not has_serve:
             base = "train"
@@ -7449,10 +7691,15 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
 
     def _normalize_str_key(expr: str):
         expr = (expr or '').strip()
-        m = re.match(r"^([\"\'])(.*)\1$", expr)
-        if not m:
+        if not expr:
             return None
-        return m.group(2)
+        try:
+            node = ast.parse(expr, mode='eval').body
+        except SyntaxError:
+            return None
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        return None
 
     def _elem_attr_list(container: str, idx: int) -> str:
         return f"{container}[{idx}]"
@@ -7510,15 +7757,18 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
     # e.g. "['relation_layer', 'gift_layer', \"stay_layer\"]"
     # Returns list of strings, or None if any non-string-literal element exists.
     def _parse_str_literal_list(list_inner: str):
+        try:
+            node = ast.parse('[' + list_inner + ']', mode='eval').body
+        except SyntaxError:
+            return None
+        if not isinstance(node, ast.List):
+            return None
         result = []
-        for p in _split_top_level_commas(list_inner):
-            p = p.strip()
-            if not p:
-                continue
-            mlit = re.match(r"^[\"\']([^\"\']+)[\"\']$", p)
-            if not mlit:
+        for elt in node.elts:
+            if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                result.append(elt.value)
+            else:
                 return None
-            result.append(mlit.group(1))
         return result if result else None
 
     # Iter13 Step2: realise the str-list globals lookup now that
@@ -7559,21 +7809,31 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
         # 2. loop variable
         if e in loop_var_to_str_items:
             return list(loop_var_to_str_items[e])
+        # Parse expression as AST once for the remaining cases.
+        try:
+            _node = ast.parse(e, mode='eval').body
+        except SyntaxError:
+            return None
         # 3. self.<attr>
-        m_self = re.match(r'^self\.(\w+)$', e)
-        if m_self:
-            items = class_str_list_attrs.get(cname, {}).get(m_self.group(1))
+        if (isinstance(_node, ast.Attribute)
+                and isinstance(_node.value, ast.Name)
+                and _node.value.id == 'self'):
+            items = class_str_list_attrs.get(cname, {}).get(_node.attr)
             if items:
                 return list(items)
-        # 4. UPPER_CASE constant
-        m_const = re.match(r'^(?:[\w.]+\.)?([A-Z][A-Z0-9_]*)$', e)
-        if m_const:
-            name = m_const.group(1)
+        # 4. UPPER_CASE constant: bare name, or dotted path ending in UPPER_CASE.
+        _const_name = None
+        if isinstance(_node, ast.Name):
+            _const_name = _node.id
+        elif isinstance(_node, ast.Attribute):
+            _const_name = _node.attr
+        if _const_name and _const_name.isupper() and _const_name[:1].isalpha() \
+                and all(c.isalnum() or c == '_' for c in _const_name):
             file_slots = file_str_list_globals.get(fname, {})
-            if name in file_slots:
-                return list(file_slots[name])
-            if name in _global_str_lists_unique:
-                return list(_global_str_lists_unique[name])
+            if _const_name in file_slots:
+                return list(file_slots[_const_name])
+            if _const_name in _global_str_lists_unique:
+                return list(_global_str_lists_unique[_const_name])
         return None
 
     for (fname, cname), info in class_map.items():
@@ -7642,9 +7902,6 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
             # we pop. Only top-level (single-frame) conditionals are honoured —
             # nested is_training/is_serving conditionals stack as expected.
             _cond_branch_stack = []  # [(if_indent, branch_polarity)]
-            _COND_IF_RE = re.compile(r'^\s*if\s+(.+?)\s*:\s*$')
-            _COND_ELIF_RE = re.compile(r'^\s*elif\s+(.+?)\s*:\s*$')
-            _COND_ELSE_RE = re.compile(r'^\s*else\s*:\s*$')
 
             # Iter16: per-method local-variable constructor table.
             # Tracks `var = ClassName(...)` where ClassName is a known
@@ -7832,8 +8089,9 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                 # preserves blank/comment lines (with the leading ``#``) when no
                 # multi-line buffer is in flight, so without this guard a
                 # commented-out ``# self.dense_towers.append(DenseTower(`` would
-                # be matched by ``re.search`` below and pollute attr_def_loc /
-                # attr enumeration with attrs that have no real call site.
+                # be matched by the AST setattr/append helpers below and pollute
+                # attr_def_loc / attr enumeration with attrs that have no real
+                # call site.
                 if line.lstrip().startswith('#'):
                     continue
                 _local_stmt = _parse_local_stmt(line)
@@ -7846,8 +8104,27 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                 # >= current indent (we left their body) — but only when the
                 # current line is NOT the matching ``else:`` (which lives at the
                 # same indent as the if header).
-                _is_else_line = bool(_COND_ELSE_RE.match(line))
-                _is_elif_line = bool(_COND_ELIF_RE.match(line))
+                # Detect ``if/elif/else:`` headers via AST instead of regex.
+                # Strategy: try parsing ``<line>\n    pass`` so a header line
+                # becomes a syntactically complete If statement.
+                _hdr_node = None
+                _stripped_line = line.rstrip()
+                if _stripped_line.endswith(':'):
+                    _stripped_left = _stripped_line.lstrip()
+                    if _stripped_left.startswith(('if ', 'elif ', 'else:', 'if(', 'elif(')) \
+                            or _stripped_left == 'else:':
+                        try:
+                            _hdr_mod = ast.parse(_stripped_line + "\n    pass")
+                        except SyntaxError:
+                            _hdr_mod = None
+                        if _hdr_mod and len(_hdr_mod.body) == 1 \
+                                and isinstance(_hdr_mod.body[0], ast.If):
+                            _hdr_node = _hdr_mod.body[0]
+                _is_else_line = (_hdr_node is not None
+                                 and _stripped_line.lstrip().startswith('else'))
+                _is_elif_line = (_hdr_node is not None
+                                 and _stripped_line.lstrip().startswith('elif'))
+                _is_if_line = (_hdr_node is not None and not _is_else_line and not _is_elif_line)
                 while _cond_branch_stack:
                     _if_ind, _polarity = _cond_branch_stack[-1]
                     if _cur_indent < _if_ind:
@@ -7874,9 +8151,12 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
 
                 # Detect new ``if <cond>:`` whose cond polarity is train/infer.
                 # We treat a fresh ``if`` (not elif) as opening a new frame.
-                _m_if = _COND_IF_RE.match(line)
-                if _m_if and not _is_elif_line:
-                    _pol = _cond_branch_polarity(_m_if.group(1))
+                if _is_if_line and _hdr_node is not None:
+                    try:
+                        _cond_text = ast.unparse(_hdr_node.test)
+                    except Exception:
+                        _cond_text = ""
+                    _pol = _cond_branch_polarity(_cond_text)
                     if _pol is not None:
                         _cond_branch_stack.append((_cur_indent, _pol))
 
@@ -7888,79 +8168,126 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                 #   self.xxx_names = ['a', 'b', ...]
                 # Tracked separately from `attrs` because the elements are not nn.Modules
                 # by themselves; they are *names* used to drive setattr/getattr.
-                m_strlist = re.match(r'\s*self\.(\w+)\s*=\s*\[(.*)\]\s*$', line)
-                if m_strlist:
-                    _attr_name = m_strlist.group(1)
-                    _items = _parse_str_literal_list(m_strlist.group(2))
-                    if _items:
-                        class_str_list_attrs[cname][_attr_name] = list(_items)
+                if (isinstance(_local_stmt, ast.Assign)
+                        and len(_local_stmt.targets) == 1
+                        and isinstance(_local_stmt.value, ast.List)):
+                    _slt_attr = _self_attr_from_target(_local_stmt.targets[0])
+                    if _slt_attr:
+                        _slt_items = []
+                        _slt_ok = True
+                        for _e in _local_stmt.value.elts:
+                            if isinstance(_e, ast.Constant) and isinstance(_e.value, str):
+                                _slt_items.append(_e.value)
+                            else:
+                                _slt_ok = False
+                                break
+                        if _slt_ok and _slt_items:
+                            class_str_list_attrs[cname][_slt_attr] = list(_slt_items)
 
                 # Iter11: detect `for [i,] name in [enumerate(]self.xxx_names[)]:`
                 # If self.xxx_names is a known literal string list, record the loop var
                 # so subsequent setattr(self, name, Cls(...)) can be expanded.
-                _m_for1 = re.match(
-                    r'\s*for\s+(\w+)\s+in\s+self\.(\w+)\s*:', line)
-                _m_for2 = re.match(
-                    r'\s*for\s+(?:\w+\s*,\s*)(\w+)\s+in\s+enumerate\(\s*self\.(\w+)\s*\)\s*:', line)
-                _m_for_use = _m_for1 or _m_for2
-                if _m_for_use:
-                    _lv = _m_for_use.group(1)
-                    _src_attr = _m_for_use.group(2)
-                    _items = class_str_list_attrs.get(cname, {}).get(_src_attr)
-                    if _items:
-                        _loop_var_to_str_items[_lv] = list(_items)
-                        _loop_indent_stack.append((_cur_indent, _lv))
+                # AST-based: parse via "<line>\n    pass" so we get a real ast.For.
+                _for_node = None
+                _stripped_for_line = line.rstrip()
+                if _stripped_for_line.lstrip().startswith('for ') and _stripped_for_line.endswith(':'):
+                    try:
+                        _for_mod = ast.parse(_stripped_for_line + "\n    pass")
+                    except SyntaxError:
+                        _for_mod = None
+                    if (_for_mod and len(_for_mod.body) == 1
+                            and isinstance(_for_mod.body[0], ast.For)):
+                        _for_node = _for_mod.body[0]
 
-                # Iter11 unroll2 — Rule 1: inline literal-list for-loop:
-                #   for name in ["query_dense", "key_dense", "value_dense"]:
-                #       setattr(self, name, SomeModule(...))
-                # Detect the loop var as iterating over an inline string-literal list
-                # (no enumerate) and record it for the setattr expansion below.
-                # Also support enumerate(["a","b",...]).
-                _m_for_lit1 = re.match(
-                    r'\s*for\s+(\w+)\s+in\s+\[(.*)\]\s*:', line)
-                _m_for_lit2 = re.match(
-                    r'\s*for\s+(?:\w+\s*,\s*)(\w+)\s+in\s+enumerate\(\s*\[(.*)\]\s*\)\s*:', line)
-                _m_for_lit = _m_for_lit1 or _m_for_lit2
-                if _m_for_lit and not _m_for_use:
-                    _lv = _m_for_lit.group(1)
-                    _items = _parse_str_literal_list(_m_for_lit.group(2))
-                    if _items:
-                        _loop_var_to_str_items[_lv] = list(_items)
-                        _loop_indent_stack.append((_cur_indent, _lv))
+                def _self_attr_simple(_n):
+                    if (isinstance(_n, ast.Attribute)
+                            and isinstance(_n.value, ast.Name)
+                            and _n.value.id == 'self'):
+                        return _n.attr
+                    return None
 
-                # Iter11 unroll2 — Rule 1 extension: tuple-unpacking inline list:
-                #   for (name, in_dim, out_dim) in [("fc1", H, I), ("gate", H, I), ...]:
-                #       setattr(self, name, ...)
-                # We extract the FIRST element of each tuple as the string-name
-                # iteration domain. Other tuple positions are ignored — only the
-                # first variable (the setattr name) matters here.
-                _m_for_tup = re.match(
-                    r'\s*for\s+\(\s*(\w+)(?:\s*,\s*\w+)+\s*\)\s+in\s+\[(.*)\]\s*:', line)
-                if _m_for_tup and not _m_for_lit and not _m_for_use:
-                    _lv = _m_for_tup.group(1)
-                    _list_inner = _m_for_tup.group(2)
-                    # Split top-level commas to get each tuple
-                    _str_items = []
-                    _ok = True
-                    for _tup_str in _split_top_level_commas(_list_inner):
-                        _tup_str = _tup_str.strip()
-                        # match leading "(...)" or just bare "(...)"
-                        m_tup = re.match(r'^\(\s*(.*?)\s*\)$', _tup_str)
-                        inner = m_tup.group(1) if m_tup else _tup_str
-                        # First field of each tuple
-                        first = _split_top_level_commas(inner)
-                        if not first:
-                            _ok = False
-                            break
-                        m_lit = re.match(r"^[\"\']([^\"\']+)[\"\']$", first[0].strip())
-                        if not m_lit:
-                            _ok = False
-                            break
-                        _str_items.append(m_lit.group(1))
-                    if _ok and _str_items:
-                        _loop_var_to_str_items[_lv] = _str_items
-                        _loop_indent_stack.append((_cur_indent, _lv))
+                def _str_list_from_node(_n):
+                    if not isinstance(_n, ast.List):
+                        return None
+                    out = []
+                    for _e in _n.elts:
+                        if isinstance(_e, ast.Constant) and isinstance(_e.value, str):
+                            out.append(_e.value)
+                        else:
+                            return None
+                    return out if out else None
+
+                _m_for_use_hit = False
+                _m_for_lit_hit = False
+                _m_for_tup_hit = False
+                if _for_node is not None:
+                    _iter = _for_node.iter
+                    _tgt = _for_node.target
+                    # Determine "second variable" (the name var) for both
+                    # Name and Tuple targets.
+                    _name_var = None
+                    if isinstance(_tgt, ast.Name):
+                        _name_var = _tgt.id
+                    elif isinstance(_tgt, ast.Tuple) and len(_tgt.elts) >= 2 \
+                            and all(isinstance(e, ast.Name) for e in _tgt.elts):
+                        # `for i, name in enumerate(...)` → name var = last
+                        _name_var = _tgt.elts[-1].id
+
+                    # Strip outer enumerate(...) wrapper.
+                    _enum_inner = None
+                    if (isinstance(_iter, ast.Call)
+                            and isinstance(_iter.func, ast.Name)
+                            and _iter.func.id == 'enumerate'
+                            and len(_iter.args) >= 1):
+                        _enum_inner = _iter.args[0]
+
+                    # Rule: for x in self.xxx: / for i, x in enumerate(self.xxx):
+                    _src_self = _self_attr_simple(_iter) or (
+                        _self_attr_simple(_enum_inner) if _enum_inner is not None else None)
+                    if _src_self and _name_var and (
+                            isinstance(_tgt, ast.Name)
+                            or (_enum_inner is not None and isinstance(_tgt, ast.Tuple))):
+                        _items = class_str_list_attrs.get(cname, {}).get(_src_self)
+                        if _items:
+                            _loop_var_to_str_items[_name_var] = list(_items)
+                            _loop_indent_stack.append((_cur_indent, _name_var))
+                            _m_for_use_hit = True
+
+                    # Rule: for x in [literals]: / for i, x in enumerate([literals]):
+                    if not _m_for_use_hit and _name_var:
+                        _lit_node = _iter if isinstance(_iter, ast.List) else (
+                            _enum_inner if _enum_inner is not None else None)
+                        _items = _str_list_from_node(_lit_node) if _lit_node is not None else None
+                        if _items and (
+                                isinstance(_tgt, ast.Name)
+                                or (_enum_inner is not None and isinstance(_tgt, ast.Tuple))):
+                            _loop_var_to_str_items[_name_var] = list(_items)
+                            _loop_indent_stack.append((_cur_indent, _name_var))
+                            _m_for_lit_hit = True
+
+                    # Rule: for (name, a, b, ...) in [(s, ..), (s, ..), ...]:
+                    if (not _m_for_use_hit and not _m_for_lit_hit
+                            and isinstance(_tgt, ast.Tuple)
+                            and len(_tgt.elts) >= 2
+                            and all(isinstance(e, ast.Name) for e in _tgt.elts)
+                            and isinstance(_iter, ast.List)):
+                        _first_var = _tgt.elts[0].id
+                        _str_items = []
+                        _ok = True
+                        for _outer_elt in _iter.elts:
+                            if not isinstance(_outer_elt, ast.Tuple) or not _outer_elt.elts:
+                                _ok = False
+                                break
+                            _first_inner = _outer_elt.elts[0]
+                            if not (isinstance(_first_inner, ast.Constant)
+                                    and isinstance(_first_inner.value, str)):
+                                _ok = False
+                                break
+                            _str_items.append(_first_inner.value)
+                        if _ok and _str_items:
+                            _loop_var_to_str_items[_first_var] = _str_items
+                            _loop_indent_stack.append((_cur_indent, _first_var))
+                            _m_for_tup_hit = True
 
                 _ast_init_item = _ast_init_assignments_by_line.get(phys_lineno)
 
@@ -7972,10 +8299,11 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                     if _cls:
                         _kw_lens = {}
                         for k, v_expr in (_ast_ctor_assign.get("kwargs") or {}).items():
-                            v = _eval_int_atom(v_expr, fname)
+                            v_node = _eval_expr_node(v_expr)
+                            v = _eval_int_node(v_node, fname, cname, mname)
                             if v is not None:
                                 ctor_kw_int_args[_cls][k].add(v)
-                            n = _eval_list_len(v_expr, fname)
+                            n = _eval_list_len_node(v_node, fname, cname, mname)
                             if n is not None:
                                 ctor_kw_list_lens[_cls][k].add(n)
                                 _kw_lens[k] = n
@@ -7988,10 +8316,11 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                     if _cls:
                         _kw_lens = {}
                         for k, v_expr in (_ast_init_item.get("kwargs") or {}).items():
-                            v = _eval_int_atom(v_expr, fname)
+                            v_node = _eval_expr_node(v_expr)
+                            v = _eval_int_node(v_node, fname, cname, mname)
                             if v is not None:
                                 ctor_kw_int_args[_cls][k].add(v)
-                            n = _eval_list_len(v_expr, fname)
+                            n = _eval_list_len_node(v_node, fname, cname, mname)
                             if n is not None:
                                 ctor_kw_list_lens[_cls][k].add(n)
                                 _kw_lens[k] = n
@@ -8062,7 +8391,7 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                         _cls_ref = _node_to_text(_arg0.elt.func).split('.')[-1]
                         _n = None
                         if _gen0 and isinstance(_gen0.iter, ast.Call) and (_expr_leaf_name(_gen0.iter.func) == "range") and len(_gen0.iter.args) == 1:
-                            _n = _eval_int_atom(_node_to_text(_gen0.iter.args[0]), fname)
+                            _n = _eval_int_node(_gen0.iter.args[0], fname, cname, mname)
                         if _n is not None and _cls_ref in nn_module_classes:
                             attrs.setdefault(cont, _cls_ref)
                             attr_def_loc.setdefault((cname, cont), (fname, phys_lineno))
@@ -8095,14 +8424,9 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                                 _ensure_elem(cont, cname, _elem_attr_dict(cont, k), cls_ref, fname, phys_lineno, attrs)
                 # ModuleList append: self.xxx.append(ClassName(...))
                 _ast_append_ctor = _parse_local_append_ctor(_local_stmt)
-                m2 = re.search(r'self\.(\w+)\.append\(\s*([\w.]+)\(', line)
-                if _ast_append_ctor or m2:
-                    if _ast_append_ctor:
-                        attr_name = _ast_append_ctor.get("attr")
-                        cls_ref_full = _ast_append_ctor.get("class_full") or ""
-                    else:
-                        _warn_regex_fallback("analyze_trace_ast_refactor", "build_static_module_tree", "append_ctor")
-                        attr_name, cls_ref_full = m2.groups()
+                if _ast_append_ctor:
+                    attr_name = _ast_append_ctor.get("attr")
+                    cls_ref_full = _ast_append_ctor.get("class_full") or ""
                     cls_ref = cls_ref_full.split('.')[-1]
                     if cls_ref in nn_module_classes:
                         # 保留基线：container 名仍映射到子类
@@ -8116,15 +8440,10 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                         _record_container_kind(cname, attr_name, "list")
                 # ModuleDict / list assignment: self.xxx[key] = ClassName(...)
                 _ast_subscript_ctor = _parse_local_subscript_ctor(_local_stmt)
-                m3 = re.match(r'\s*self\.(\w+)\[\s*([^\]]+?)\s*\]\s*=\s*([\w.]+)\(', line)
-                if _ast_subscript_ctor or m3:
-                    if _ast_subscript_ctor:
-                        attr_name = _ast_subscript_ctor.get("attr")
-                        key_expr = _ast_subscript_ctor.get("key_expr") or ""
-                        cls_ref_full = _ast_subscript_ctor.get("class_full") or ""
-                    else:
-                        _warn_regex_fallback("analyze_trace_ast_refactor", "build_static_module_tree", "subscript_ctor")
-                        attr_name, key_expr, cls_ref_full = m3.groups()
+                if _ast_subscript_ctor:
+                    attr_name = _ast_subscript_ctor.get("attr")
+                    key_expr = _ast_subscript_ctor.get("key_expr") or ""
+                    cls_ref_full = _ast_subscript_ctor.get("class_full") or ""
                     cls_ref = cls_ref_full.split('.')[-1]
                     if cls_ref in nn_module_classes:
                         attrs[attr_name] = cls_ref
@@ -8180,15 +8499,9 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                 #     setattr(self, f"combine_tower_mha_{name}", combine_tower)
                 # is treated as a direct setattr-with-ctor.
                 _ast_local_ctor = _parse_local_var_ctor(_local_stmt)
-                m_lvc = re.match(r'^\s*(\w+)\s*=\s*([\w.]+)\s*\(', line)
-                if _ast_local_ctor or m_lvc:
-                    if _ast_local_ctor:
-                        _lv_name = _ast_local_ctor.get("name")
-                        _lv_cls = (_ast_local_ctor.get("class_full") or "").split('.')[-1]
-                    else:
-                        _warn_regex_fallback("analyze_trace_ast_refactor", "build_static_module_tree", "local_var_ctor")
-                        _lv_name = m_lvc.group(1)
-                        _lv_cls = m_lvc.group(2).split('.')[-1]
+                if _ast_local_ctor:
+                    _lv_name = _ast_local_ctor.get("name")
+                    _lv_cls = (_ast_local_ctor.get("class_full") or "").split('.')[-1]
                     # Avoid clobbering reserved names; skip `self`/`super`.
                     if (_lv_name not in ("self", "super")
                             and _lv_cls in nn_module_classes):
@@ -8208,7 +8521,6 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                 # argument is a bare local variable previously assigned via
                 # `<var> = ClassName(...)` (see _local_var_ctor above).
                 _ast_setattr_ctor = _parse_local_setattr_ctor(_local_stmt)
-                m4 = re.search(r'setattr\(\s*self\s*,\s*([^,]+?)\s*,\s*([\w.]+)\(', line)
                 _is_two_step = False
                 if _ast_setattr_ctor:
                     name_expr = (_ast_setattr_ctor.get("name_expr") or "").strip()
@@ -8221,160 +8533,195 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                             cls_ref_full = ""
                     else:
                         cls_ref_full = _ast_setattr_ctor.get("class_full") or ""
-                    if not cls_ref_full:
-                        _ast_setattr_ctor = None
-                if not _ast_setattr_ctor and not m4:
-                    # Iter16: try `setattr(self, <name_expr>, <bare_var>)` and
-                    # resolve <bare_var> through the per-method ctor table.
-                    m4b = re.match(
-                        r'\s*setattr\(\s*self\s*,\s*(.+?)\s*,\s*(\w+)\s*\)\s*$',
-                        line)
-                    if m4b:
-                        _warn_regex_fallback("analyze_trace_ast_refactor", "build_static_module_tree", "setattr_two_step")
-                        _bv = m4b.group(2).strip()
-                        if _bv in _local_var_ctor:
-                            class _M:
-                                pass
-                            m4 = _M()
-                            m4.group = (lambda groups: (lambda i: groups[i - 1]))(
-                                [m4b.group(1).strip(), _local_var_ctor[_bv][0]])
-                            _is_two_step = True
-                if _ast_setattr_ctor or m4:
-                    if _ast_setattr_ctor:
+                    if cls_ref_full:
                         cls_ref = cls_ref_full.split('.')[-1]
-                    else:
-                        _warn_regex_fallback("analyze_trace_ast_refactor", "build_static_module_tree", "setattr_ctor")
-                        name_expr = m4.group(1).strip()
-                        cls_ref_full = m4.group(2)
-                        cls_ref = cls_ref_full.split('.')[-1]
-                    if cls_ref in nn_module_classes:
-                        # name literal: 'xxx' / "xxx" / f'xxx'(no {}) / f"xxx"(no {})
-                        real_attr = None
-                        m_lit = re.match(r"^[fF]?[\"\']([^\"\']+)[\"\']$", name_expr)
-                        if m_lit:
-                            s = m_lit.group(1)
-                            # If it's an f-string with interpolation, keep dynamic
-                            if '{' not in name_expr and '}' not in name_expr:
-                                real_attr = s
-                        if real_attr:
-                            attrs[real_attr] = cls_ref
-                            attr_def_loc.setdefault((cname, real_attr), (fname, phys_lineno))
-                        elif name_expr in _loop_var_to_str_items:
-                            # Iter11: expand using the literal string list driven by the loop variable.
-                            for _real in _loop_var_to_str_items[name_expr]:
-                                attrs[_real] = cls_ref
-                                attr_def_loc.setdefault((cname, _real), (fname, phys_lineno))
-                        else:
-                            # Iter11: use the class name itself as the synthetic attr name
-                            # (no `__setattr_` prefix). Tracked in dynamic_attrs_per_class.
-                            synth_attr = cls_ref
-                            # Only register if no real literal attr already maps to this class
-                            if synth_attr not in attrs and not any(v == cls_ref for v in attrs.values()):
-                                attrs[synth_attr] = cls_ref
-                                attr_def_loc.setdefault((cname, synth_attr), (fname, phys_lineno))
-                                dynamic_attrs_per_class[cname].add(synth_attr)
+                        if cls_ref in nn_module_classes:
+                            # name literal: 'xxx' / "xxx" / f'xxx'(no {}) / f"xxx"(no {})
+                            real_attr = None
+                            try:
+                                _name_node = ast.parse(name_expr, mode='eval').body
+                            except SyntaxError:
+                                _name_node = None
+                            if isinstance(_name_node, ast.Constant) and isinstance(_name_node.value, str):
+                                real_attr = _name_node.value
+                            elif isinstance(_name_node, ast.JoinedStr):
+                                # f-string with no interpolations → all values are
+                                # ast.Constant strings; concatenate them.
+                                if all(isinstance(v, ast.Constant) and isinstance(v.value, str)
+                                       for v in _name_node.values):
+                                    real_attr = ''.join(v.value for v in _name_node.values)
+                            if real_attr:
+                                attrs[real_attr] = cls_ref
+                                attr_def_loc.setdefault((cname, real_attr), (fname, phys_lineno))
+                            elif name_expr in _loop_var_to_str_items:
+                                # Iter11: expand using the literal string list driven by the loop variable.
+                                for _real in _loop_var_to_str_items[name_expr]:
+                                    attrs[_real] = cls_ref
+                                    attr_def_loc.setdefault((cname, _real), (fname, phys_lineno))
+                            else:
+                                # Iter11: use the class name itself as the synthetic attr name
+                                # (no `__setattr_` prefix). Tracked in dynamic_attrs_per_class.
+                                synth_attr = cls_ref
+                                # Only register if no real literal attr already maps to this class
+                                if synth_attr not in attrs and not any(v == cls_ref for v in attrs.values()):
+                                    attrs[synth_attr] = cls_ref
+                                    attr_def_loc.setdefault((cname, synth_attr), (fname, phys_lineno))
+                                    dynamic_attrs_per_class[cname].add(synth_attr)
         class_attrs[cname] = attrs
 
     # ------------------------------------------------------------------
     # 二次扫描（保守增强）：识别 range(N) 循环中的 `var = ClassName(...)` + `self.list.append(var)`
-    # 用于展开像 Transformer.resblocks 这种“先构造到局部变量再 append”的写法。
+    # 用于展开像 Transformer.resblocks 这种"先构造到局部变量再 append"的写法。
     # 仅当 N 可解析为 int 时展开为 N 个 [i] 节点；解析失败则不影响基线（仍保留 container 映射）。
     # ------------------------------------------------------------------
-    _FOR_RANGE_RE = re.compile(r'^(\s*)for\s+\w+\s+in\s+range\(\s*([^\)]+)\s*\)\s*:\s*$')
-    # Iter17: enumerate(<expr>) and bare-iter forms with optional `i,` index unpack.
-    _FOR_ENUM_RE = re.compile(r'^(\s*)for\s+(?:\w+\s*,\s*)?\w+\s+in\s+enumerate\(\s*([^\)]+?)\s*\)\s*:\s*$')
-    _FOR_ITER_RE = re.compile(r'^(\s*)for\s+\w+\s+in\s+([\w.]+)\s*:\s*$')
-    _ASSIGN_CTOR_RE = re.compile(r'^\s*(\w+)\s*=\s*([\w.]+)\s*\(')
-    _APPEND_VAR_RE = re.compile(r'^\s*self\.(\w+)\.append\(\s*(\w+)\s*\)')
-    # Iter17: inline ctor append: self.xxx.append(ClassName(...))
-    _APPEND_CTOR_RE = re.compile(r'^\s*self\.(\w+)\.append\(\s*([\w.]+)\s*\(')
-    _SELF_SET_RE = re.compile(r'^\s*self\.(\w+)\s*=\s*(\w+)\s*$')
+
+    # AST helpers — replace the legacy regexes _FOR_RANGE_RE / _FOR_ENUM_RE /
+    # _FOR_ITER_RE / _ASSIGN_CTOR_RE / _APPEND_VAR_RE / _APPEND_CTOR_RE /
+    # _SELF_SET_RE.
+    def _parse_for_header(_text: str):
+        """Return (kind, base_indent, iter_expr) for a single ``for ...:`` line.
+
+        kind: 'range' | 'enumerate' | 'iter' | None.
+        Returns None when the line is not a parseable for-header.
+        """
+        if not _text:
+            return None
+        _stripped = _text.rstrip()
+        _left = _stripped.lstrip()
+        if not _left.startswith('for ') or not _stripped.endswith(':'):
+            return None
+        try:
+            _mod = ast.parse(_stripped + "\n    pass")
+        except SyntaxError:
+            return None
+        if not (_mod.body and isinstance(_mod.body[0], ast.For)):
+            return None
+        _f = _mod.body[0]
+        _indent = len(_text) - len(_text.lstrip())
+        _it = _f.iter
+        # range(...)
+        if (isinstance(_it, ast.Call)
+                and isinstance(_it.func, ast.Name)
+                and _it.func.id == 'range'
+                and len(_it.args) >= 1):
+            try:
+                _expr = ast.unparse(_it.args[0])
+            except Exception:
+                _expr = ""
+            return ('range', _indent, _expr)
+        # enumerate(<iter>)
+        if (isinstance(_it, ast.Call)
+                and isinstance(_it.func, ast.Name)
+                and _it.func.id == 'enumerate'
+                and len(_it.args) >= 1):
+            try:
+                _expr = ast.unparse(_it.args[0])
+            except Exception:
+                _expr = ""
+            return ('enumerate', _indent, _expr)
+        # plain `for x in <Name|Attr>:`  — only Name/dotted Attr (no Call).
+        if isinstance(_f.target, ast.Name) and isinstance(_it, (ast.Name, ast.Attribute)):
+            try:
+                _expr = ast.unparse(_it)
+            except Exception:
+                _expr = ""
+            return ('iter', _indent, _expr)
+        return None
+
+    def _parse_assign_ctor_line(_text: str):
+        """For ``var = ClassName(...)`` (simple Name target, Call value with
+        Name/Attribute func), return (var_name, class_leaf). Else None."""
+        try:
+            _mod = ast.parse(_text)
+        except SyntaxError:
+            return None
+        if not _mod.body or not isinstance(_mod.body[0], ast.Assign):
+            return None
+        _a = _mod.body[0]
+        if len(_a.targets) != 1 or not isinstance(_a.targets[0], ast.Name):
+            return None
+        if not isinstance(_a.value, ast.Call):
+            return None
+        _f = _a.value.func
+        if isinstance(_f, ast.Name):
+            _leaf = _f.id
+        elif isinstance(_f, ast.Attribute):
+            _leaf = _f.attr
+        else:
+            return None
+        return (_a.targets[0].id, _leaf)
+
+    def _parse_append_var_line(_text: str):
+        """For ``self.cont.append(var)`` (Name arg) return (cont, var). Else None."""
+        try:
+            _mod = ast.parse(_text)
+        except SyntaxError:
+            return None
+        if not _mod.body or not isinstance(_mod.body[0], ast.Expr):
+            return None
+        _c = _mod.body[0].value
+        if not isinstance(_c, ast.Call):
+            return None
+        _func = _c.func
+        if not (isinstance(_func, ast.Attribute) and _func.attr == 'append'):
+            return None
+        _owner = _func.value
+        if not (isinstance(_owner, ast.Attribute)
+                and isinstance(_owner.value, ast.Name)
+                and _owner.value.id == 'self'):
+            return None
+        if len(_c.args) != 1 or _c.keywords:
+            return None
+        if not isinstance(_c.args[0], ast.Name):
+            return None
+        return (_owner.attr, _c.args[0].id)
+
+    def _parse_append_ctor_line(_text: str):
+        """For ``self.cont.append(ClassName(...))`` return (cont, class_leaf). Else None."""
+        try:
+            _mod = ast.parse(_text)
+        except SyntaxError:
+            return None
+        if not _mod.body or not isinstance(_mod.body[0], ast.Expr):
+            return None
+        _c = _mod.body[0].value
+        if not isinstance(_c, ast.Call):
+            return None
+        _func = _c.func
+        if not (isinstance(_func, ast.Attribute) and _func.attr == 'append'):
+            return None
+        _owner = _func.value
+        if not (isinstance(_owner, ast.Attribute)
+                and isinstance(_owner.value, ast.Name)
+                and _owner.value.id == 'self'):
+            return None
+        if len(_c.args) < 1:
+            return None
+        _arg0 = _c.args[0]
+        if not isinstance(_arg0, ast.Call):
+            return None
+        _af = _arg0.func
+        if isinstance(_af, ast.Name):
+            _leaf = _af.id
+        elif isinstance(_af, ast.Attribute):
+            _leaf = _af.attr
+        else:
+            return None
+        return (_owner.attr, _leaf)
 
     # Iter17: per-class container -> driving kw param name (for per-instance prune).
     # class_container_kw[cname][container_attr] = kw_name (the ctor kw whose
     # list-length determines the iteration length).
     class_container_kw = defaultdict(dict)
 
-    def _resolve_iter_len_legacy(expr: str, fname: str, cname: str, self_to_param: dict, local_vars: dict):
-        """Legacy iteration-length resolver (kept verbatim for A/B)."""
-        expr = (expr or '').strip()
-        # Direct kw param name.
-        if expr in ctor_kw_list_lens.get(cname, {}):
-            vals = sorted(ctor_kw_list_lens[cname][expr])
-            if vals:
-                # Use MAX so different instances are still covered; per-instance
-                # pruning happens later in build_dag_recursive.
-                return max(vals), expr
-        # self.<attr> -> ctor kw param.
-        if expr.startswith('self.'):
-            an = expr.split('.', 1)[1]
-            pn = self_to_param.get(an)
-            if pn and pn in ctor_kw_list_lens.get(cname, {}):
-                vals = sorted(ctor_kw_list_lens[cname][pn])
-                if vals:
-                    return max(vals), pn
-        # File-level str-list constant.
-        n = _eval_list_len_legacy(expr, fname)
-        if n is not None:
-            return n, None
-        return None, None
+    def _resolve_iter_len(expr_node, fname: str, cname: str, mname: str = "__init__",
+                          parent_cls: str = None, parent_attr: str = None):
+        n = _eval_list_len_node(expr_node, fname, cname, mname, parent_cls, parent_attr)
+        return n, None
 
-    def _resolve_iter_len(expr: str, fname: str, cname: str, self_to_param: dict, local_vars: dict):
-        """A/B-aware iteration-length resolver.
-
-        Tries (in order):
-          1. local int variables (rare for list iters);
-          2. ctor_kw_list_lens[cname][expr] when expr is a kw param name;
-          3. self.<attr> via self_to_param mapping;
-          4. file-level str-list constants via _eval_list_len.
-        Returns (n, kw_name) where kw_name is the ctor kw if known (else None),
-        or (None, None).
-        """
-        legacy = _resolve_iter_len_legacy(expr, fname, cname, self_to_param, local_vars)
-        if not USE_NEW_EVAL:
-            return legacy
-        # New resolver path — only the integer length is comparable; the kw_name
-        # remains a legacy artifact.  We pass full scope (cls/method) so the
-        # new resolver can reach instance-level overrides.
-        new_n = _ab_list_len_via_new_eval(expr, fname, scope_cls=cname, scope_method="__init__")
-        legacy_n = legacy[0] if legacy else None
-        _ab_record("_resolve_iter_len", str(expr), legacy_n, new_n)
-        if new_n is not None:
-            # Preserve legacy kw_name (the new resolver doesn't track that yet).
-            return new_n, (legacy[1] if legacy else None)
-        return legacy
-
-    def _resolve_range_n_legacy(expr: str, fname: str, cname: str, self_to_param: dict, local_vars: dict):
-        """Legacy range(N) resolver (kept verbatim for A/B)."""
-        expr = (expr or '').strip()
-        if expr in local_vars and isinstance(local_vars[expr], int):
-            return local_vars[expr]
-        v = _eval_int_atom_legacy(expr, fname)
-        if v is not None:
-            return v
-        # 参数名（如 layers）
-        if expr in ctor_kw_int_args.get(cname, {}):
-            vals = sorted(ctor_kw_int_args[cname][expr])
-            if len(vals) == 1:
-                return vals[0]
-        # self.xxx -> 参数
-        if expr.startswith('self.'):
-            an = expr.split('.', 1)[1]
-            pn = self_to_param.get(an)
-            if pn and pn in ctor_kw_int_args.get(cname, {}):
-                vals = sorted(ctor_kw_int_args[cname][pn])
-                if len(vals) == 1:
-                    return vals[0]
-        return None
-
-    def _resolve_range_n(expr: str, fname: str, cname: str, self_to_param: dict, local_vars: dict):
-        """A/B-aware range(N) resolver."""
-        legacy = _resolve_range_n_legacy(expr, fname, cname, self_to_param, local_vars)
-        if not USE_NEW_EVAL:
-            return legacy
-        new = _ab_int_via_new_eval(expr, fname, scope_cls=cname, scope_method="__init__")
-        _ab_record("_resolve_range_n", str(expr), legacy, new)
-        return new if new is not None else legacy
+    def _resolve_range_n(expr_node, fname: str, cname: str, mname: str = "__init__",
+                         parent_cls: str = None, parent_attr: str = None):
+        return _eval_int_node(expr_node, fname, cname, mname, parent_cls, parent_attr)
 
     for (fname, cname), info in class_map.items():
         if cname not in nn_module_classes:
@@ -8384,51 +8731,19 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
         _fe = _get_ast_frontend(fname)
         # 建立 self.attr = param 的映射（如 self.layers = layers）
         self_to_param = _fe.get_self_param_aliases(cname, "__init__") if _fe else {}
-        if not self_to_param and _fe is None:
-            init_rng = info['methods'].get('__init__')
-            if init_rng:
-                _warn_regex_fallback("analyze_trace_ast_refactor", "build_static_module_tree", "self_param_aliases")
-                init_lines = lines[init_rng[0] - 1: min(init_rng[1], len(lines))]
-                for ln in init_lines:
-                    m = _SELF_SET_RE.match(ln)
-                    if m:
-                        self_to_param[m.group(1)] = m.group(2)
 
         # Iter17 guard: collect the set of self.<attr> containers that are
         # accessed via dynamic indexing (`self.x[idx]` where idx is NOT a
         # literal integer) in any non-__init__ method of this class.  When a
         # container is used dynamically the analyzer's downstream logic
         # already handles it via a wildcard route; expanding it to per-index
-        # nodes via _APPEND_CTOR_RE would only add nodes the dynamic call
+        # nodes via AST loop expansion would only add nodes the dynamic call
         # can't supply var_history evidence for (Rule6_out regression).
         dyn_indexed_containers = _fe.get_dynamic_indexed_self_attrs(cname) if _fe else set()
-        if not dyn_indexed_containers and _fe is None:
-            _DYN_IDX_RE = re.compile(r'self\.(\w+)\[\s*([^\]]+?)\s*\]')
-            has_non_init = any(_mname != '__init__' for _mname in info['methods'])
-            if has_non_init:
-                _warn_regex_fallback("analyze_trace_ast_refactor", "build_static_module_tree", "dynamic_indexed_containers")
-            for _mname, (_ms, _me) in info['methods'].items():
-                if _mname == '__init__':
-                    continue
-                for _ln in lines[_ms - 1: min(_me, len(lines))]:
-                    for _dm in _DYN_IDX_RE.finditer(_ln):
-                        _idx = _dm.group(2).strip()
-                        # literal int → static index, OK to expand
-                        if re.fullmatch(r'-?\d+', _idx):
-                            continue
-                        dyn_indexed_containers.add(_dm.group(1))
 
         # 扫描各方法，找 for-range 的 append(var)
         for mname, (ms, me) in info['methods'].items():
             method_lines = lines[ms - 1: min(me, len(lines))]
-            local_vars = {}
-            for raw in method_lines:
-                m_lv = re.match(r'^\s*(\w+)\s*=\s*([A-Z][A-Z0-9_]*|\d+)\s*(?:#.*)?$', raw)
-                if m_lv:
-                    vv = _eval_int_atom(m_lv.group(2), fname)
-                    if vv is not None:
-                        local_vars[m_lv.group(1)] = vv
-
             _ast_loop_records = _fe.get_loop_expansion_records(cname, mname) if _fe else []
             if _ast_loop_records:
                 _ast_line_to_records = defaultdict(list)
@@ -8438,15 +8753,16 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                     for _rec in _ast_line_to_records[_line_no]:
                         _loop_kind = _rec.get("loop_kind")
                         _iter_expr = (_rec.get("iter_expr") or "").strip()
+                        _iter_expr_node = _eval_expr_node(_iter_expr)
                         _kw_for_loop = None
                         if _loop_kind == "range":
-                            n = _resolve_range_n(_iter_expr, fname, cname, self_to_param, local_vars)
+                            n = _resolve_range_n(_iter_expr_node, fname, cname, mname)
                         elif _loop_kind == "enumerate":
-                            n, _kw_for_loop = _resolve_iter_len(_iter_expr, fname, cname, self_to_param, local_vars)
+                            n, _kw_for_loop = _resolve_iter_len(_iter_expr_node, fname, cname, mname)
                         else:
                             if _iter_expr.startswith('self.') or _iter_expr in ('range',):
                                 continue
-                            n, _kw_for_loop = _resolve_iter_len(_iter_expr, fname, cname, self_to_param, local_vars)
+                            n, _kw_for_loop = _resolve_iter_len(_iter_expr_node, fname, cname, mname)
                         if n is None:
                             continue
                         cont = _rec.get("container_attr")
@@ -8464,64 +8780,30 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                             class_container_kw[cname][cont] = _kw_for_loop
                 continue
 
-            # Iter19: keep legacy regex as final fallback only.
-            # Warn only if the regex path actually discovers a loop-shaped
-            # construct; methods with no expandable loops should stay quiet.
-            # Iter17: also produce a parallel joined-logical-lines view so
-            # multi-line statements like `self.x.append(\n  Cls(\n    ...\n  )\n)`
-            # are matched as a single line by _APPEND_CTOR_RE.  We map each
-            # joined logical to (start_lineno, indent, joined_text).
+            # AST loop extraction should be the primary path. Keep a regex
+            # fallback here for older sources whose loop bodies are not yet
+            # covered by get_loop_expansion_records(), but route evaluation
+            # through ConstantResolver only.
             _logical_method = _join_logical_lines(method_lines, ms)
             var_to_cls = {}
-            _loop_regex_warned = False
             i = 0
             while i < len(method_lines):
                 raw = method_lines[i]
-                # 记录本地 int 常量：x = 6 / x = CONST
-                m_lv = re.match(r'^\s*(\w+)\s*=\s*([A-Z][A-Z0-9_]*|\d+)\s*(?:#.*)?$', raw)
-                if m_lv:
-                    vv = _eval_int_atom(m_lv.group(2), fname)
-                    if vv is not None:
-                        local_vars[m_lv.group(1)] = vv
-
-                fm = _FOR_RANGE_RE.match(raw)
-                fm_enum = None
-                fm_iter = None
-                _kw_for_loop = None  # tracking which kw drives this loop length
-                if not fm:
-                    fm_enum = _FOR_ENUM_RE.match(raw)
-                if not fm and not fm_enum:
-                    fm_iter = _FOR_ITER_RE.match(raw)
-                if not fm and not fm_enum and not fm_iter:
+                _hdr = _parse_for_header(raw)
+                if _hdr is None:
                     i += 1
                     continue
-                if not _loop_regex_warned:
-                    _warn_regex_fallback("analyze_trace_ast_refactor", "build_static_module_tree", f"loop_expansion:{cname}.{mname}")
-                    _loop_regex_warned = True
-                if fm:
-                    base_indent = len(fm.group(1))
-                    range_expr = fm.group(2).strip()
-                    n = _resolve_range_n(range_expr, fname, cname, self_to_param, local_vars)
-                elif fm_enum:
-                    base_indent = len(fm_enum.group(1))
-                    iter_expr = fm_enum.group(2).strip()
-                    n, _kw_for_loop = _resolve_iter_len(iter_expr, fname, cname, self_to_param, local_vars)
-                else:
-                    # fm_iter — bare `for x in NAME:` form. Only treat as
-                    # expandable if NAME refers to a kw list-length we know
-                    # statically (e.g. `for dim in output_dims:`).
-                    base_indent = len(fm_iter.group(1))
-                    iter_expr = fm_iter.group(2).strip()
-                    # Skip self-iters and built-ins; those are handled elsewhere.
-                    if iter_expr.startswith('self.') or iter_expr in ('range',):
+                _kind, base_indent, _iter_expr = _hdr
+                _kw_for_loop = None
+                if _kind == 'range':
+                    n = _resolve_range_n(_eval_expr_node(_iter_expr), fname, cname, mname)
+                elif _kind == 'enumerate':
+                    n, _kw_for_loop = _resolve_iter_len(_eval_expr_node(_iter_expr), fname, cname, mname)
+                else:  # 'iter'
+                    if _iter_expr.startswith('self.') or _iter_expr in ('range',):
                         i += 1
                         continue
-                    n, _kw_for_loop = _resolve_iter_len(iter_expr, fname, cname, self_to_param, local_vars)
-                # 扫描 loop body
-                # Iter17: build a phys_lineno → joined-logical map covering
-                # the body window so multi-line statements (notably the
-                # ``self.x.append(\n  Cls(...)\n)`` DenseTower pattern) get
-                # matched as a single logical line by _APPEND_CTOR_RE.
+                    n, _kw_for_loop = _resolve_iter_len(_eval_expr_node(_iter_expr), fname, cname, mname)
                 _logical_starts = {start_ln: text for (start_ln, text) in _logical_method}
                 j = i + 1
                 while j < len(method_lines):
@@ -8532,57 +8814,32 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                     ind = len(body_raw) - len(body_raw.lstrip())
                     if ind <= base_indent:
                         break
-                    am = _ASSIGN_CTOR_RE.match(body_raw)
-                    if am:
-                        vname = am.group(1)
-                        cls_ref = am.group(2).split('.')[-1]
+                    am = _parse_assign_ctor_line(body_raw)
+                    if am is not None:
+                        vname, cls_ref = am
                         if cls_ref in nn_module_classes:
                             var_to_cls[vname] = cls_ref
-                    ap = _APPEND_VAR_RE.match(body_raw)
+                    ap = _parse_append_var_line(body_raw)
                     ap_ctor = None
-                    # Try matching the inline-ctor append on the joined
-                    # logical line that begins at this physical line.
                     _phys_at_j = ms + j
                     _joined_text = _logical_starts.get(_phys_at_j)
-                    if not ap and _joined_text:
-                        # Joined text drops indent; re-pad with base_indent so
-                        # _APPEND_CTOR_RE's leading whitespace matches.
-                        ap_ctor = _APPEND_CTOR_RE.match(' ' * (base_indent + 1) + _joined_text.lstrip())
-                    if not ap and ap_ctor is None:
-                        ap_ctor = _APPEND_CTOR_RE.match(body_raw)
-                    if ap and n is not None:
-                        cont = ap.group(1)
-                        vname = ap.group(2)
+                    if ap is None and _joined_text:
+                        ap_ctor = _parse_append_ctor_line(' ' * (base_indent + 1) + _joined_text.lstrip())
+                    if ap is None and ap_ctor is None:
+                        ap_ctor = _parse_append_ctor_line(body_raw)
+                    if ap is not None and n is not None:
+                        cont, vname = ap
                         cls_ref = var_to_cls.get(vname)
                         if cls_ref and cls_ref in nn_module_classes:
-                            # 保留基线 container
                             attrs.setdefault(cont, cls_ref)
                             attr_def_loc.setdefault((cname, cont), (fname, ms + j))
-                            # 展开 N 个 element
                             for k in range(n):
                                 _ensure_elem(cont, cname, _elem_attr_list(cont, k), cls_ref, fname, ms + j, attrs)
-                            # range-loop append is most commonly used with ``ModuleList``
-                            # via ``self.x = nn.ModuleList()`` declared outside the loop;
-                            # default to ModuleList (will be downgraded only if no other
-                            # signal is recorded).
                             _record_container_kind(cname, cont, "ModuleList")
-                            # Iter17: record kw-driver for per-instance pruning.
                             if _kw_for_loop is not None:
                                 class_container_kw[cname][cont] = _kw_for_loop
-                    elif ap_ctor and n is not None and (fm_enum is not None or fm_iter is not None):
-                        # Iter17: inline ctor append — self.list.append(Cls(...))
-                        # without a local variable. This is the DenseTower pattern.
-                        # Only enabled for enumerate(<list>) / for-in-list loops
-                        # to avoid regressing existing behavior on range(N) loops
-                        # (some models embed inline-ctor appends inside if-blocks
-                        # that should NOT expand to N elements).
-                        cont = ap_ctor.group(1)
-                        cls_ref = ap_ctor.group(2).split('.')[-1]
-                        # Iter17 guard: if this container is accessed via a
-                        # dynamic index in any forward method of this class,
-                        # do NOT expand it to per-index nodes — the dynamic
-                        # call cannot supply per-index var_history (would
-                        # regress Rule6_out).  Keep wildcard behavior.
+                    elif ap_ctor is not None and n is not None and _kind in ('enumerate', 'iter'):
+                        cont, cls_ref = ap_ctor
                         if cont in dyn_indexed_containers:
                             j += 1
                             continue
@@ -8608,78 +8865,151 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
     # tracked in dynamic_attrs_per_class so getattr-based calls can wildcard-route.
     # This pass runs AFTER the main scan so `ctor_kw_int_args` is fully populated.
     # ------------------------------------------------------------------
-    _FOR_RANGE_RE_U2 = re.compile(r'^(\s*)for\s+(\w+)\s+in\s+range\(\s*([^\)]+?)\s*\)\s*:\s*$')
-    # setattr(self, f"...{i}...", ClassName(...))
-    _SETATTR_FSTR_RE = re.compile(
-        r'setattr\(\s*self\s*,\s*[fF]([\"\'])([^\"\']*)\1\s*,\s*([\w.]+)\(')
+    def _parse_for_range_var(_text: str):
+        """For ``for <var> in range(<expr>):`` return (base_indent, var, expr_text).
+        Else None."""
+        if not _text:
+            return None
+        _stripped = _text.rstrip()
+        if not _stripped.lstrip().startswith('for ') or not _stripped.endswith(':'):
+            return None
+        try:
+            _mod = ast.parse(_stripped + "\n    pass")
+        except SyntaxError:
+            return None
+        if not (_mod.body and isinstance(_mod.body[0], ast.For)):
+            return None
+        _f = _mod.body[0]
+        if not isinstance(_f.target, ast.Name):
+            return None
+        _it = _f.iter
+        if not (isinstance(_it, ast.Call)
+                and isinstance(_it.func, ast.Name)
+                and _it.func.id == 'range'
+                and len(_it.args) >= 1):
+            return None
+        try:
+            _expr = ast.unparse(_it.args[0])
+        except Exception:
+            _expr = ""
+        _indent = len(_text) - len(_text.lstrip())
+        return (_indent, _f.target.id, _expr)
 
-    def _expand_fstring_template(template: str, loop_var: str, idx_value):
-        """Replace {loop_var} in template with idx_value. If template contains
-        any other {expr} interpolations we cannot evaluate, return None.
-        Allows simple format spec like {i:02d}.
+    def _find_setattr_fstr_call(_body_line: str):
+        """Find the first ``setattr(self, f"...", ClassName(...))`` call in a
+        joined logical line. Returns (template_node, class_leaf, template_text)
+        where template_node is the ast.JoinedStr literal and template_text is
+        ast.unparse(template_node) (best effort). Returns None if not found.
         """
-        # Find ALL {...} fields
+        if not _body_line:
+            return None
+        try:
+            _mod = ast.parse(_body_line.strip())
+        except SyntaxError:
+            return None
+        for _n in ast.walk(_mod):
+            if not isinstance(_n, ast.Call):
+                continue
+            _func = _n.func
+            if not (isinstance(_func, ast.Name) and _func.id == 'setattr'):
+                continue
+            if len(_n.args) < 3:
+                continue
+            _arg0, _arg1, _arg2 = _n.args[0], _n.args[1], _n.args[2]
+            if not (isinstance(_arg0, ast.Name) and _arg0.id == 'self'):
+                continue
+            if not isinstance(_arg1, ast.JoinedStr):
+                continue
+            if not isinstance(_arg2, ast.Call):
+                continue
+            _vf = _arg2.func
+            if isinstance(_vf, ast.Name):
+                _leaf = _vf.id
+            elif isinstance(_vf, ast.Attribute):
+                _leaf = _vf.attr
+            else:
+                continue
+            return (_arg1, _leaf)
+        return None
+
+    def _joinedstr_references_var(_jstr: ast.JoinedStr, var_name: str) -> bool:
+        """True if any FormattedValue inside <_jstr> references the bare Name <var_name>."""
+        for _v in _jstr.values:
+            if isinstance(_v, ast.FormattedValue) and isinstance(_v.value, ast.Name) \
+                    and _v.value.id == var_name:
+                return True
+        return False
+
+    def _expand_fstring_template_ast(_jstr: ast.JoinedStr, loop_var: str, idx_value):
+        """AST-based version of _expand_fstring_template.
+        Substitutes references to <loop_var> in FormattedValue with idx_value.
+        Returns None if any FormattedValue references something other than
+        <loop_var>.
+        Supports format spec ``[0]?<width>d`` for zero-padding.
+        """
         out_parts = []
-        last = 0
-        for m in re.finditer(r'\{([^{}]*)\}', template):
-            field = m.group(1)
-            # Strip format spec
-            name = field.split(':', 1)[0].split('!', 1)[0].strip()
-            if name != loop_var:
-                # Has another interpolation we can't resolve
+        for _v in _jstr.values:
+            if isinstance(_v, ast.Constant) and isinstance(_v.value, str):
+                out_parts.append(_v.value)
+                continue
+            if not isinstance(_v, ast.FormattedValue):
                 return None
-            out_parts.append(template[last:m.start()])
-            # Apply (very minimal) format spec for digits only; otherwise plain
-            if ':' in field:
-                spec = field.split(':', 1)[1]
-                m_spec = re.match(r'^0?(\d+)d$', spec)
-                if m_spec:
-                    width = int(m_spec.group(1))
-                    out_parts.append(str(idx_value).zfill(width))
+            if not (isinstance(_v.value, ast.Name) and _v.value.id == loop_var):
+                return None
+            # Format spec — only digit-width supported.
+            _spec_text = None
+            if _v.format_spec is not None:
+                if not isinstance(_v.format_spec, ast.JoinedStr):
+                    return None
+                _parts = []
+                for _sv in _v.format_spec.values:
+                    if isinstance(_sv, ast.Constant) and isinstance(_sv.value, str):
+                        _parts.append(_sv.value)
+                    else:
+                        return None
+                _spec_text = ''.join(_parts)
+            if _spec_text:
+                # Match the original "0?<digits>d" semantics.
+                _spec = _spec_text.strip()
+                _digits = _spec[:-1] if _spec.endswith('d') else None
+                if _digits is not None and _digits.startswith('0'):
+                    _digits = _digits[1:]
+                if _digits is not None and _digits.isdigit():
+                    out_parts.append(str(idx_value).zfill(int(_digits)))
                 else:
                     out_parts.append(str(idx_value))
             else:
                 out_parts.append(str(idx_value))
-            last = m.end()
-        out_parts.append(template[last:])
         return ''.join(out_parts)
+
+    def _wildcard_template_from_jstr(_jstr: ast.JoinedStr) -> str:
+        """Replace every FormattedValue in <_jstr> with ``*`` and return the resulting string."""
+        _parts = []
+        for _v in _jstr.values:
+            if isinstance(_v, ast.Constant) and isinstance(_v.value, str):
+                _parts.append(_v.value)
+            else:
+                _parts.append('*')
+        return ''.join(_parts)
 
     for (fname, cname), info in class_map.items():
         if cname not in nn_module_classes:
             continue
         lines = source_files.get(fname, [])
         attrs = class_attrs.get(cname, {})
-        # self.attr = param  for resolving range(self.xxx) via ctor params
-        self_to_param = {}
-        init_rng = info['methods'].get('__init__')
-        if init_rng:
-            init_lines = lines[init_rng[0] - 1: min(init_rng[1], len(lines))]
-            for ln in init_lines:
-                m = _SELF_SET_RE.match(ln)
-                if m:
-                    self_to_param[m.group(1)] = m.group(2)
 
         for mname, (ms, me) in info['methods'].items():
             method_lines = lines[ms - 1: min(me, len(lines))]
-            local_vars = {}
             i = 0
             while i < len(method_lines):
                 raw = method_lines[i]
-                # Track local int constants: x = 6 / x = CONST
-                m_lv = re.match(r'^\s*(\w+)\s*=\s*([A-Z][A-Z0-9_]*|\d+)\s*(?:#.*)?$', raw)
-                if m_lv:
-                    vv = _eval_int_atom(m_lv.group(2), fname)
-                    if vv is not None:
-                        local_vars[m_lv.group(1)] = vv
 
-                fm = _FOR_RANGE_RE_U2.match(raw)
-                if not fm:
+                _hdr = _parse_for_range_var(raw)
+                if _hdr is None:
                     i += 1
                     continue
-                base_indent = len(fm.group(1))
-                loop_var = fm.group(2)
-                range_expr = fm.group(3).strip()
-                n = _resolve_range_n(range_expr, fname, cname, self_to_param, local_vars)
+                base_indent, loop_var, range_expr = _hdr
+                n = _resolve_range_n(_eval_expr_node(range_expr), fname, cname, mname)
 
                 # Walk body and join multi-line statements (parenthesis-aware)
                 # so that setattr(...) spanning multiple lines is matched as one.
@@ -8715,27 +9045,25 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                     joined.append((body_buf_start, body_buf))
 
                 for body_lineno, body_line in joined:
-                    sm = _SETATTR_FSTR_RE.search(body_line)
-                    if not sm:
+                    _hit = _find_setattr_fstr_call(body_line)
+                    if _hit is None:
                         continue
-                    template = sm.group(2)
-                    cls_ref = sm.group(3).split('.')[-1]
+                    template_jstr, cls_ref = _hit
                     if cls_ref not in nn_module_classes:
                         continue
                     # Skip f-strings that DO NOT reference the loop variable —
                     # those aren't this rule's domain (e.g. setattr(self, f"{name}_out", v)
                     # with `name` from a different loop). Let other passes / wildcards
                     # handle them.
-                    if (('{' + loop_var + '}') not in template) and \
-                       (re.search(r'\{' + re.escape(loop_var) + r'\b[!:][^}]*\}', template) is None):
+                    if not _joinedstr_references_var(template_jstr, loop_var):
                         continue
                     if n is not None:
                         # Bounded expansion
                         for idx in range(n):
-                            real = _expand_fstring_template(template, loop_var, idx)
+                            real = _expand_fstring_template_ast(template_jstr, loop_var, idx)
                             if real is None:
                                 # Unsupported interpolation — fall back to wildcard
-                                synth = re.sub(r'\{[^{}]*\}', '*', template) or cls_ref
+                                synth = _wildcard_template_from_jstr(template_jstr) or cls_ref
                                 if synth not in attrs:
                                     attrs[synth] = cls_ref
                                     attr_def_loc.setdefault((cname, synth), (fname, body_lineno))
@@ -8747,7 +9075,7 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                     else:
                         # Unbounded — conservative wildcard node:
                         # replace {loop_var}/{loop_var:fmt} with '*'
-                        synth = re.sub(r'\{[^{}]*\}', '*', template) or cls_ref
+                        synth = _wildcard_template_from_jstr(template_jstr) or cls_ref
                         if synth not in attrs:
                             attrs[synth] = cls_ref
                             attr_def_loc.setdefault((cname, synth), (fname, body_lineno))
@@ -8870,8 +9198,8 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
 
     # Build first_call_loc: first forward() call line for each attr.
     # Strategy 1: derive from dep_edge_locs (edges between siblings).
-    # Strategy 2: ask ASTFrontend for the earliest reachable call site.
-    # Strategy 3: fall back to the legacy forward() regex scan.
+    # Strategy 2: ask ASTFrontend for the earliest reachable call site,
+    # including dynamic getattr(self, f"...") calls via pure AST walk.
     for cname in tree:
         edge_locs_c = tree[cname].get("dep_edge_locs", {})
         first_call = {}  # attr -> (file, lineno)
@@ -8900,64 +9228,6 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
         for _attr_name, _loc in _ast_first_call_map.items():
             if _attr_name not in first_call or _loc[1] < first_call[_attr_name][1]:
                 first_call[_attr_name] = _loc
-        # Strategy 3: scan forward() for attrs still not yet found
-        missing_attrs = known_attrs_c - set(first_call.keys())
-        if missing_attrs:
-            # For container elements like "ordinal_towers[0]", look for the base container name
-            _base_name_map = {}  # base_container_name -> set of element attrs needing it
-            _direct_missing = set()
-            for a in missing_attrs:
-                if '[' in a:
-                    base = a.split('[')[0]
-                    _base_name_map.setdefault(base, set()).add(a)
-                else:
-                    _direct_missing.add(a)
-            for (fname, cm_name), cm_info in class_map.items():
-                if cm_name != cname:
-                    continue
-                fwd_range = cm_info["methods"].get("forward")
-                if not fwd_range:
-                    continue
-                lines_c = source_files.get(fname, [])
-                for i in range(fwd_range[0] - 1, min(fwd_range[1], len(lines_c))):
-                    line_text = lines_c[i]
-                    phys_ln = i + 1
-                    for m_call in re.finditer(r'self\.(\w+)\s*[\(\[]', line_text):
-                        a = m_call.group(1)
-                        if a in _direct_missing and a not in first_call:
-                            first_call[a] = (fname, phys_ln)
-                        if a in _base_name_map:
-                            for elem_attr in _base_name_map[a]:
-                                if elem_attr not in first_call:
-                                    first_call[elem_attr] = (fname, phys_ln)
-                    # Iter13d: detect container iteration forms — these are real
-                    # forward call sites for container element attrs even though
-                    # there's no literal "self.X(" or "self.X[".  Examples:
-                    #   for tower in self.task_towers
-                    #   [tower(x) for tower in self.task_towers]
-                    #   for k, v in self.dict_attr.items()
-                    #   for v in self.dict_attr.values()
-                    #   for i, m in enumerate(self.list_attr)
-                    _loop_container_pat = re.compile(
-                        r'(?:for\s+(?:[\w]+\s*,\s*)?\w+\s+in\s+)'
-                        r'(?:enumerate\(\s*)?'
-                        r'self\.(\w+)(?:\.(?:items|values|keys)\(\))?\b'
-                    )
-                    for m_loop in _loop_container_pat.finditer(line_text):
-                        a = m_loop.group(1)
-                        # Direct match (e.g., attr is the container itself)
-                        if a in _direct_missing and a not in first_call:
-                            first_call[a] = (fname, phys_ln)
-                        # Container element match
-                        if a in _base_name_map:
-                            for elem_attr in _base_name_map[a]:
-                                if elem_attr not in first_call:
-                                    first_call[elem_attr] = (fname, phys_ln)
-                    for m_ga in re.finditer(r'getattr\(\s*self\s*,\s*["\']([^"\']+)["\']\s*\)', line_text):
-                        a = m_ga.group(1)
-                        if a in _direct_missing and a not in first_call:
-                            first_call[a] = (fname, phys_ln)
-                break
         tree[cname]["first_call_loc"] = first_call
 
     # Stash input_source_attrs on the tree for downstream consumers
@@ -9321,16 +9591,15 @@ def main():
     parser.add_argument("--screenshot", action="store_true", help="生成 Chrome Tracing 可视化截图")
     parser.add_argument("--html-flowchart", type=str, default=None, help="生成 HTML 模块流程图路径")
     parser.add_argument("--use-new-eval", action="store_true",
-                        help="启用 PR2 新求值器 (ConstantTable+ConstantResolver) 并记录 A/B diff")
+                        help="兼容旧脚本参数；PR3 起 ConstantResolver 已默认启用")
     parser.add_argument("--ab-eval-report", type=str, default=None,
-                        help="将 A/B diff 摘要写入 JSON 文件 (仅当 --use-new-eval 时生效)")
+                        help="写入当前求值器状态摘要 JSON（PR3 起不再产出 legacy/new diff）")
     args = parser.parse_args()
 
-    # PR2: flip the module-level switch before any analysis runs.
+    global USE_NEW_EVAL
+    USE_NEW_EVAL = True
     if args.use_new_eval:
-        global USE_NEW_EVAL
-        USE_NEW_EVAL = True
-        print("  [PR2] --use-new-eval enabled: ConstantResolver A/B compare active")
+        print("  [PR3] --use-new-eval 已是默认行为；当前仍使用 ConstantResolver")
 
     # Mode 1: Source-code only flowchart (no trace required)
     if args.html_flowchart and args.code_path and not args.trace_file:
@@ -9610,34 +9879,24 @@ def main():
 
 
 def _emit_ab_summary_if_enabled(args):
-    """PR2: print + optionally persist the A/B diff summary."""
-    if not getattr(args, "use_new_eval", False):
-        return
-    matches, mismatch_count, mismatch_examples = _ab_summary()
-    print()
-    print("  =========================================================")
-    print("  [PR2] A/B Eval Diff Summary")
-    print(f"  total_observations = {len(_AB_EVAL_DIFFS)}")
-    print(f"  matches            = {matches}")
-    print(f"  mismatches         = {mismatch_count}")
-    if mismatch_examples:
-        print("  first up to 20 mismatches:")
-        for e in mismatch_examples:
-            print(f"    [{e['site']}] expr={e['expr']!r} legacy={e['legacy']!r} new={e['new']!r}")
-    print("  =========================================================")
+    """PR3: optionally persist the current evaluator status for debugging."""
     report = getattr(args, "ab_eval_report", None)
-    if report:
-        try:
-            with open(report, "w", encoding="utf-8") as f:
-                json.dump({
-                    "total": len(_AB_EVAL_DIFFS),
-                    "matches": matches,
-                    "mismatches": mismatch_count,
-                    "all": _AB_EVAL_DIFFS,
-                }, f, ensure_ascii=False, indent=2)
-            print(f"  A/B diff full log saved to: {report}")
-        except Exception as e:
-            print(f"  ⚠️ failed to write A/B diff report: {e}")
+    if not report:
+        return
+    payload = {
+        "mode": "constant_resolver_only",
+        "use_new_eval": True,
+        "total": len(_AB_EVAL_DIFFS),
+        "matches": 0,
+        "mismatches": 0,
+        "all": _AB_EVAL_DIFFS,
+    }
+    try:
+        with open(report, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        print(f"  [PR3] evaluator status saved to: {report}")
+    except Exception as e:
+        print(f"  ⚠️ failed to write evaluator status report: {e}")
 
 
 def _ast_frontend_smoke_test():
