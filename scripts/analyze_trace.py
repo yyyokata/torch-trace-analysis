@@ -1777,19 +1777,40 @@ def _extract_instance_keys_from_stack(frames, class_map):
         cls = _frame_class(f[0], f[1], class_map)
         frame_classes.append(cls)
     keys = []
-    ancestors = []  # outermost→inner
-    last_class = frame_classes[0]
-    last_frame = frames[0]
-    for i in range(1, len(frames)):
-        cur_class = frame_classes[i]
-        if cur_class and last_class and cur_class != last_class:
-            anc_tuple = tuple(ancestors)
-            key = (cur_class, last_frame[0], last_frame[1], anc_tuple)
-            keys.append(key)
-            ancestors = list(ancestors) + [(last_frame[0], last_frame[1])]
-        if cur_class:
-            last_class = cur_class
-        last_frame = frames[i]
+    # Find the first frame that maps to a class.
+    first_idx = -1
+    for i, cls in enumerate(frame_classes):
+        if cls:
+            first_idx = i
+            break
+
+    if first_idx != -1:
+        # Outermost class attribution. If it was called from a user frame
+        # that doesn't map to a class (e.g. main.py), use that as callsite.
+        # If it's the very first frame in the stack, use a <root> anchor.
+        cls = frame_classes[first_idx]
+        if first_idx > 0:
+            cf, cl = frames[first_idx-1][0], frames[first_idx-1][1]
+        else:
+            # Use the class's start line as a stable anchor for the root.
+            cf, cl = "<root>", class_map.get((frames[0][0], cls), {}).get("start", 0)
+        
+        root_key = (cls, cf, cl, ())
+        keys.append(root_key)
+        
+        ancestors = [(cf, cl)]
+        last_class = cls
+        last_frame = frames[first_idx]
+        for i in range(first_idx + 1, len(frames)):
+            cur_class = frame_classes[i]
+            if cur_class and last_class and cur_class != last_class:
+                key = (cur_class, last_frame[0], last_frame[1], tuple(ancestors))
+                keys.append(key)
+                ancestors.append((last_frame[0], last_frame[1]))
+            if cur_class:
+                last_class = cur_class
+            last_frame = frames[i]
+
     if not keys:
         # No class boundary detected. Emit a weak key for the deepest
         # frame whose class is known so the kernel still gets attributed.
@@ -1859,6 +1880,7 @@ def build_kernel_attribution_table(events, source_files, class_map, step_infos, 
         "total_kernels": 0, "fwd_attributed": 0, "bwd_attributed": 0,
         "wrapped_fallback": 0, "fwd_unattributed": 0, "bwd_unattributed": 0,
         "bwd_via_flow_narrowed": 0,
+        "total_kernel_dur_us": 0.0,
     }
 
     def _wrapped_fallback(idx, mod_name):
@@ -1877,6 +1899,7 @@ def build_kernel_attribution_table(events, source_files, class_map, step_infos, 
 
     for idx, meta in kernel_meta.items():
         stats["total_kernels"] += 1
+        stats["total_kernel_dur_us"] += meta["dur"]
         traces = meta["traces"]
         is_bwd = meta["is_bwd"]
         if not traces:
@@ -1947,7 +1970,7 @@ def build_kernel_attribution_table(events, source_files, class_map, step_infos, 
 # Step 3: bottom-up self/inclusive rollup
 # --------------------------------------------------------------------------
 
-def rollup_instance_timing(kernel_attribution, events, step_infos, class_map):
+def rollup_instance_timing(kernel_attribution, events, step_infos, class_map, roots=None):
     """Step 3: aggregate kernel durations into per-InstanceKey self_us, then
     compute inclusive_us by walking the InstanceKey ancestors chain.
 
@@ -2032,6 +2055,33 @@ def rollup_instance_timing(kernel_attribution, events, step_infos, class_map):
             for ph, v in child["inclusive_us"].items():
                 rec["inclusive_us"][ph] += v
 
+    # Phase D: orphan rollup to model roots
+    if roots:
+        # Find a primary root instance to receive orphans
+        primary_root_key = None
+        for k in timings:
+            if k[0] in roots and k[1] == "<root>":
+                primary_root_key = k
+                break
+        if not primary_root_key:
+            for k in timings:
+                if k[0] in roots:
+                    primary_root_key = k
+                    break
+        
+        if primary_root_key:
+            # Find all orphans (nodes with no parent)
+            all_children = set()
+            for rec in timings.values():
+                all_children.update(rec["child_keys"])
+            
+            for k, rec in timings.items():
+                if k != primary_root_key and k not in all_children:
+                    # This is an orphan! Add its inclusive time to primary root.
+                    # This ensures model-level total inclusive time is preserved.
+                    for ph, v in rec["inclusive_us"].items():
+                        timings[primary_root_key]["inclusive_us"][ph] += v
+
     return timings
 
 
@@ -2114,7 +2164,7 @@ def build_timing_panel_data(instance_timing, class_map, step_dur_us):
     }
 
 
-def build_instance_timing_pipeline(events, source_files, class_map, step_infos, step_dur_us):
+def build_instance_timing_pipeline(events, source_files, class_map, step_infos, step_dur_us, roots=None):
     """Top-level entry: runs Step 1→4 and returns timing_data fragment.
 
     Output keys:
@@ -2126,9 +2176,18 @@ def build_instance_timing_pipeline(events, source_files, class_map, step_infos, 
     attribution, stats = build_kernel_attribution_table(
         events, source_files, class_map, step_infos, fwdbwd_index,
     )
-    instance_timing = rollup_instance_timing(attribution, events, step_infos, class_map)
+    instance_timing = rollup_instance_timing(attribution, events, step_infos, class_map, roots=roots)
     panel = build_timing_panel_data(instance_timing, class_map, step_dur_us)
     panel["_timing_pipeline_stats"] = stats
+    num_steps = max(1, len(step_infos))
+    panel["step_kernel_us"] = stats.get("total_kernel_dur_us", 0) / num_steps
+    
+    total_attributed_us = sum(
+        rec["self_us"]["forward"] + rec["self_us"]["backward"] + 
+        rec["self_us"]["optimize"] + rec["self_us"]["other"] 
+        for rec in instance_timing.values()
+    )
+    panel["unattributed_kernel_us"] = max(0, panel["step_kernel_us"] - total_attributed_us)
     return panel
 
 
@@ -8554,8 +8613,10 @@ def main():
             print("  ⚠️ 跳过 HTML 流程图生成: 需要提供源码 (--code-path)")
             print("  流程图基于源码静态结构生成，无源码时无法确定模块层级关系")
         else:
+            # Extract roots for timing rollup (Step 3 orphan aggregation)
+            _, roots, _ = build_static_module_tree(source_files, conditional_mode="train")
             # Build timing data from trace to overlay on static structure
-            timing_data = build_timing_data_from_trace(events, source_files, mod_info, step_dur_us, profiler_steps, src_info=src_info)
+            timing_data = build_timing_data_from_trace(events, source_files, mod_info, step_dur_us, profiler_steps, src_info=src_info, roots=roots)
             print("  正在生成 HTML 模块流程图 (源码结构 + 运行时层级 + 时间填充, 双 Tab: 训练/推理)...")
             result = generate_html_flowchart_dual(source_files, timing_data=timing_data, meta=meta, output_path=args.html_flowchart, trace_events=events)
             if result:

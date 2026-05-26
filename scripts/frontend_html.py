@@ -5760,6 +5760,8 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
         "meta": {
             "device": meta.get("device_name", "N/A") if meta else "N/A",
             "step_dur_us": step_dur_us,
+            "step_kernel_us": timing_data.get("step_kernel_us", 0) if timing_data else 0,
+            "unattributed_kernel_us": timing_data.get("unattributed_kernel_us", 0) if timing_data else 0,
             "step_dur_str": format_duration(step_dur_us) if step_dur_us > 0 else "N/A",
             "num_modules": len(dag_nodes) + len(dag_groups),
             "roots": roots,
@@ -5963,7 +5965,7 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
     return render_flowchart_to_file(flowchart_data, output_path)
 
 
-def build_timing_data_from_trace(events, source_files, mod_info, step_dur_us, profiler_steps, src_info=None):
+def build_timing_data_from_trace(events, source_files, mod_info, step_dur_us, profiler_steps, src_info=None, roots=None):
     """Extract per-class and per-instance timing data for the static flowchart."""
     class_map = _build_class_map(source_files)
     timing_data = {
@@ -6020,8 +6022,10 @@ def build_timing_data_from_trace(events, source_files, mod_info, step_dur_us, pr
         # Design doc: timing_fix_workdir/output/timing_redesign.md
         # ------------------------------------------------------------------
         panel = build_instance_timing_pipeline(
-            events, source_files, class_map, step_infos, step_dur_us,
+            events, source_files, class_map, step_infos, step_dur_us, roots=roots
         )
+        timing_data["step_kernel_us"] = panel.get("step_kernel_us", 0)
+        timing_data["unattributed_kernel_us"] = panel.get("unattributed_kernel_us", 0)
         # Class-level totals from instance inclusive (overwrite wrapped-event
         # estimates; new pipeline is authoritative).
         for cls, total_us in panel["class_durations"].items():
@@ -6049,9 +6053,9 @@ def build_timing_data_from_trace(events, source_files, mod_info, step_dur_us, pr
             shimmed = []
             for item in items:
                 it = dict(item)
-                it.setdefault("kernel_us", float(item.get("total_us", 0.0)))
-                it.setdefault("fwd_kernel_us", float(item.get("forward_us", 0.0)))
-                it.setdefault("bwd_kernel_us", float(item.get("backward_us", 0.0)))
+                it.setdefault("kernel_us", float(item.get("inclusive_us", item.get("total_us", 0.0))))
+                it.setdefault("fwd_kernel_us", float(item.get("inclusive_forward_us", item.get("forward_us", 0.0))))
+                it.setdefault("bwd_kernel_us", float(item.get("inclusive_backward_us", item.get("backward_us", 0.0))))
                 it.setdefault("other_kernel_us", float(item.get("other_us", 0.0)))
                 shimmed.append(it)
             filtered_runtime[class_name] = shimmed
