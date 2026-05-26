@@ -7367,6 +7367,155 @@ def save_markdown_report(meta, trace_type, step_dur_us, step_decomp, thread_info
 # HTML Flowchart Generation (Source-Code First)
 # ===========================================================================
 
+
+def _resolve_str_list_iterative(
+    expr: str,
+    fname: str,
+    cname: str,
+    source_lines,
+    loop_var_to_str_items: dict,
+    class_str_list_attrs: dict,
+    file_str_list_globals: dict,
+    cond_branch_stack: list,
+    conditional_mode: str = "default",
+    _global_str_lists_unique: dict = None,
+):
+    """Phase B iterative multi-step string-list resolver.
+
+    Resolves a dynamic key expression (used in ModuleDict subscript or setattr
+    name_expr) to a concrete list[str] of keys via iterative derivation.
+
+    Returns list[str] on success, None when resolution fails.
+    """
+    if _global_str_lists_unique is None:
+        _global_str_lists_unique = {}
+    if expr is None:
+        return None
+    e = expr.strip()
+    if not e:
+        return None
+
+    # Step 1: direct loop variable lookup
+    if e in loop_var_to_str_items:
+        items = list(loop_var_to_str_items[e])
+        # If the expression itself is a plain loop var, return its items
+        return items
+
+    # Parse the expression as AST
+    try:
+        _node = ast.parse(e, mode='eval').body
+    except SyntaxError:
+        return None
+
+    # Step 2: f-string expansion
+    # e.g. f"{name}_tower" with name ∈ ['relation', 'gift', 'stay']
+    # → ['relation_tower', 'gift_tower', 'stay_tower']
+    if isinstance(_node, ast.JoinedStr):
+        return _expand_fstring_with_loop_vars(_node, loop_var_to_str_items)
+
+    # Step 3: self.<attr> referencing a known class str-list attr
+    if (isinstance(_node, ast.Attribute)
+            and isinstance(_node.value, ast.Name)
+            and _node.value.id == 'self'):
+        items = (class_str_list_attrs.get(cname) or {}).get(_node.attr)
+        if items:
+            return list(items)
+
+    # Step 4: UPPER_CASE file/global constant
+    _const_name = None
+    if isinstance(_node, ast.Name):
+        _const_name = _node.id
+    elif isinstance(_node, ast.Attribute):
+        _const_name = _node.attr
+    if (_const_name and _const_name.isupper() and _const_name[:1].isalpha()
+            and all(c.isalnum() or c == '_' for c in _const_name)):
+        file_slots = file_str_list_globals.get(fname, {})
+        if _const_name in file_slots:
+            return list(file_slots[_const_name])
+        if _const_name in _global_str_lists_unique:
+            return list(_global_str_lists_unique[_const_name])
+
+    # Step 5: bare Name that is NOT a loop var and NOT UPPER_CASE —
+    # indicates a runtime/parameter variable we cannot statically resolve.
+    if isinstance(_node, ast.Name):
+        # Check if it might be resolvable via dotted Cfg.KEYS (already handled)
+        # or if it's truly opaque (e.g. cfg.dynamic_keys).
+        return None
+
+    # Step 6: dotted attribute that is NOT self.* (e.g. cfg.dynamic_keys)
+    if isinstance(_node, ast.Attribute):
+        return None
+
+    return None
+
+
+def _expand_fstring_with_loop_vars(joined_str_node, loop_var_to_str_items: dict):
+    """Expand an f-string AST node by substituting loop variables.
+
+    For each FormattedValue in the JoinedStr, if the referenced variable is a
+    known loop variable with string items, produce the cartesian expansion.
+    Only single-variable f-strings are supported (one FormattedValue referencing
+    one loop var); multi-variable f-strings return None.
+
+    Returns list[str] on success, None on failure.
+    """
+    # Collect parts: each is either a constant string or a variable reference
+    parts = []  # list of (kind, data) where kind='const' data=str | kind='var' data=items_list
+    for value in joined_str_node.values:
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            parts.append(('const', value.value))
+        elif isinstance(value, ast.FormattedValue):
+            # Only support simple Name references
+            inner = value.value
+            if isinstance(inner, ast.Name):
+                var_name = inner.id
+                if var_name in loop_var_to_str_items:
+                    parts.append(('var', list(loop_var_to_str_items[var_name])))
+                else:
+                    return None
+            else:
+                return None
+        else:
+            return None
+
+    if not parts:
+        return None
+
+    # Check we have at least one variable part
+    has_var = any(k == 'var' for k, _ in parts)
+    if not has_var:
+        # Pure constant f-string (no interpolation) — just concat
+        result = ''.join(d for _, d in parts)
+        return [result]
+
+    # Cartesian expansion: for each variable part, iterate its items;
+    # for constant parts, keep as-is.
+    # Only support single variable dimension for now (avoid combinatorial explosion).
+    var_parts = [(i, items) for i, (k, items) in enumerate(parts) if k == 'var']
+    if len(var_parts) > 1:
+        # Multiple independent variables in one f-string — check if they all
+        # reference the same loop var (same items list).
+        first_items = var_parts[0][1]
+        if all(items == first_items for _, items in var_parts):
+            # Same variable repeated — expand once
+            pass
+        else:
+            return None
+
+    # Single variable (or same variable repeated): expand
+    items_list = var_parts[0][1]
+    results = []
+    for item in items_list:
+        built = []
+        for kind, data in parts:
+            if kind == 'const':
+                built.append(data)
+            else:
+                built.append(str(item))
+        results.append(''.join(built))
+    return results
+
+
 def build_static_module_tree(source_files, preferred_root=None, conditional_mode="infer"):
     """Build module hierarchy tree purely from source code.
     Args:
@@ -7810,48 +7959,26 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
 
     def _resolve_str_list(expr: str, fname: str, cname: str,
                           loop_var_to_str_items: dict):
-        """Iter13 Step2: try multiple resolution strategies for a ModuleDict
-        key expression, returning a list[str] of keys or None.
-        Resolution order:
-          1. inline string literal (already handled by _normalize_str_key)
-          2. local for-loop variable (loop_var_to_str_items)
+        """Iter13 Step2 + Phase B: iterative multi-step string-list resolver.
+        Delegates to the module-level _resolve_str_list_iterative which handles:
+          1. direct loop variable lookup
+          2. f-string expansion with loop variable substitution
           3. self.<attr> referring to a known class str-list attr
           4. file-level / global UPPER_CASE str-list constant
+          5. bare Name / dotted attribute → None (unresolvable)
         """
-        if expr is None:
-            return None
-        e = expr.strip()
-        if not e:
-            return None
-        # 2. loop variable
-        if e in loop_var_to_str_items:
-            return list(loop_var_to_str_items[e])
-        # Parse expression as AST once for the remaining cases.
-        try:
-            _node = ast.parse(e, mode='eval').body
-        except SyntaxError:
-            return None
-        # 3. self.<attr>
-        if (isinstance(_node, ast.Attribute)
-                and isinstance(_node.value, ast.Name)
-                and _node.value.id == 'self'):
-            items = class_str_list_attrs.get(cname, {}).get(_node.attr)
-            if items:
-                return list(items)
-        # 4. UPPER_CASE constant: bare name, or dotted path ending in UPPER_CASE.
-        _const_name = None
-        if isinstance(_node, ast.Name):
-            _const_name = _node.id
-        elif isinstance(_node, ast.Attribute):
-            _const_name = _node.attr
-        if _const_name and _const_name.isupper() and _const_name[:1].isalpha() \
-                and all(c.isalnum() or c == '_' for c in _const_name):
-            file_slots = file_str_list_globals.get(fname, {})
-            if _const_name in file_slots:
-                return list(file_slots[_const_name])
-            if _const_name in _global_str_lists_unique:
-                return list(_global_str_lists_unique[_const_name])
-        return None
+        return _resolve_str_list_iterative(
+            expr=expr,
+            fname=fname,
+            cname=cname,
+            source_lines=source_files.get(fname, []),
+            loop_var_to_str_items=loop_var_to_str_items,
+            class_str_list_attrs=class_str_list_attrs,
+            file_str_list_globals=file_str_list_globals,
+            cond_branch_stack=[],
+            conditional_mode=conditional_mode,
+            _global_str_lists_unique=_global_str_lists_unique,
+        )
 
     for (fname, cname), info in class_map.items():
         if cname not in nn_module_classes:
@@ -7929,6 +8056,15 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
             # inline `setattr(self, name_expr, ClassName(...))`.
             #   {var_name: (cls_ref, fname, ctor_lineno)}
             _local_var_ctor: dict = {}
+
+            # Phase B: track local variable → string list assignments for
+            # iterative multi-step resolution. Handles patterns like:
+            #     ks0 = ['a', 'b', 'c']
+            #     ks1 = ks0
+            #     keys = ks1
+            #     for k in keys: ...
+            # {var_name: list[str]}
+            _local_var_str_list: dict = {}
 
             def _parse_local_stmt(_line: str):
                 _text = (_line or "").strip()
@@ -8201,6 +8337,33 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                         if _slt_ok and _slt_items:
                             class_str_list_attrs[cname][_slt_attr] = list(_slt_items)
 
+                # Phase B: track local variable string-list assignments
+                # Patterns: var = ['a', 'b'] | var = other_known_var | var = self.attr
+                if (isinstance(_local_stmt, ast.Assign)
+                        and len(_local_stmt.targets) == 1
+                        and isinstance(_local_stmt.targets[0], ast.Name)):
+                    _lv_name = _local_stmt.targets[0].id
+                    _lv_val = _local_stmt.value
+                    if isinstance(_lv_val, ast.List):
+                        _lv_items = []
+                        _lv_ok = True
+                        for _e in _lv_val.elts:
+                            if isinstance(_e, ast.Constant) and isinstance(_e.value, str):
+                                _lv_items.append(_e.value)
+                            else:
+                                _lv_ok = False
+                                break
+                        if _lv_ok and _lv_items:
+                            _local_var_str_list[_lv_name] = list(_lv_items)
+                    elif isinstance(_lv_val, ast.Name) and _lv_val.id in _local_var_str_list:
+                        _local_var_str_list[_lv_name] = list(_local_var_str_list[_lv_val.id])
+                    elif (isinstance(_lv_val, ast.Attribute)
+                          and isinstance(_lv_val.value, ast.Name)
+                          and _lv_val.value.id == 'self'):
+                        _ref_items = class_str_list_attrs.get(cname, {}).get(_lv_val.attr)
+                        if _ref_items:
+                            _local_var_str_list[_lv_name] = list(_ref_items)
+
                 # Iter11: detect `for [i,] name in [enumerate(]self.xxx_names[)]:`
                 # If self.xxx_names is a known literal string list, record the loop var
                 # so subsequent setattr(self, name, Cls(...)) can be expanded.
@@ -8305,6 +8468,17 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                             _loop_var_to_str_items[_first_var] = _str_items
                             _loop_indent_stack.append((_cur_indent, _first_var))
                             _m_for_tup_hit = True
+
+                    # Phase B Rule 4: for x in local_var / for i, x in enumerate(local_var)
+                    # where local_var is a tracked string-list local variable.
+                    if (not _m_for_use_hit and not _m_for_lit_hit and not _m_for_tup_hit
+                            and _name_var):
+                        _local_iter_node = _iter if _enum_inner is None else _enum_inner
+                        if isinstance(_local_iter_node, ast.Name):
+                            _local_items = _local_var_str_list.get(_local_iter_node.id)
+                            if _local_items:
+                                _loop_var_to_str_items[_name_var] = list(_local_items)
+                                _loop_indent_stack.append((_cur_indent, _name_var))
 
                 _ast_init_item = _ast_init_assignments_by_line.get(phys_lineno)
 
@@ -8555,6 +8729,7 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                         if cls_ref in nn_module_classes:
                             # name literal: 'xxx' / "xxx" / f'xxx'(no {}) / f"xxx"(no {})
                             real_attr = None
+                            _fstr_handled = False
                             try:
                                 _name_node = ast.parse(name_expr, mode='eval').body
                             except SyntaxError:
@@ -8567,15 +8742,24 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                                 if all(isinstance(v, ast.Constant) and isinstance(v.value, str)
                                        for v in _name_node.values):
                                     real_attr = ''.join(v.value for v in _name_node.values)
+                                else:
+                                    # Phase B: f-string with loop variable interpolation
+                                    _fstr_expanded = _expand_fstring_with_loop_vars(
+                                        _name_node, _loop_var_to_str_items)
+                                    if _fstr_expanded:
+                                        for _real in _fstr_expanded:
+                                            attrs[_real] = cls_ref
+                                            attr_def_loc.setdefault((cname, _real), (fname, phys_lineno))
+                                        _fstr_handled = True
                             if real_attr:
                                 attrs[real_attr] = cls_ref
                                 attr_def_loc.setdefault((cname, real_attr), (fname, phys_lineno))
-                            elif name_expr in _loop_var_to_str_items:
+                            elif not _fstr_handled and name_expr in _loop_var_to_str_items:
                                 # Iter11: expand using the literal string list driven by the loop variable.
                                 for _real in _loop_var_to_str_items[name_expr]:
                                     attrs[_real] = cls_ref
                                     attr_def_loc.setdefault((cname, _real), (fname, phys_lineno))
-                            else:
+                            elif not _fstr_handled:
                                 # Iter11: use the class name itself as the synthetic attr name
                                 # (no `__setattr_` prefix). Tracked in dynamic_attrs_per_class.
                                 synth_attr = cls_ref
