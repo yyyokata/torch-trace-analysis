@@ -310,6 +310,9 @@
   - 正则识别 loop var / `self.attr` / `UPPER_CASE` 常量。
 - 已知局限/bug 场景：
   - 对 `prefix + suffix`、局部变量转存、f-string、dict key 派生场景支持弱。
+  -  **TODO（LayerNorm / 动态 ModuleDict 字符串 key 展开）**：当前规划已覆盖“f-string / dynamic key / ModuleDict 展开”大方向，但尚未明确落到 `_loop_var_to_str_items` 的多步推导能力。已知根因是：当 ModuleDict key 需要先由 `loop var -> 中间字符串变量`，再经过 `if/else` 或条件表达式改写成最终 key 时，现有 `_loop_var_to_str_items` 只能看单步映射，导致像并行 LayerNorm 这类节点退化成 `[*]`，无法按实例展开。修复方向：在 Phase B 为 `_loop_var_to_str_items` 新增 AST 驱动的**迭代多步推导**——从 loop var 出发，沿赋值链反复展开（每一步如果结果仍未解析为字面量集合则继续推导），直到收敛到一组具体字符串 key 或确认无法静态枚举为止；不限制推导步数，支持中间经过任意次条件改写、变量转存、f-string 拼接等，并与 `_resolve_str_list()` / `_expand_fstring_template()` 共用 method-scope env。
+  -  **TODO（训练图 / 推理图区分）**：当模型代码存在 `if self.training: ... else: ...` 这类分支时，`_loop_var_to_str_items` / `_resolve_str_list()` 在迭代推导过程中可能同时收集到训练路径与推理路径的 key，导致两张图混用同一套节点展开，无法区分。可评估的设计思路是：在 AST 迭代推导启动前，先向 method-scope env 注入“训推区分变量”的提前赋值（例如训练图模式设 `env["self.training"] = True`，推理图模式设 `env["self.training"] = False`）；推导时若遇到 `ast.If`，则依据 env 中的极性裁剪分支，只保留当前图对应的路径，使 key 枚举自然收敛到 train / infer 各自独立的集合。类似 `is_training`、`training_mode`、`phase == "train"` 等常见训推区分变量，也可纳入 env 初始化范围，并复用 `_cond_branch_polarity()` 的现有极性识别逻辑。后续需要评估：① `_cond_branch_polarity()` 现有能力是否足够复用；② 应在 key 枚举阶段直接分叉 train/infer env，还是在 `build_dag_recursive` 级别维护两套独立 env；③ 对无法静态确定训推分支的场景，继续保留现有 union 行为作为兜底。
+  
 - AST 改造方案：
   - 接受 AST expression 而不是字符串。
   - 支持 `ast.Name`、`ast.Attribute`、`ast.Constant(str)`、必要时受限支持 `ast.JoinedStr` / `ast.BinOp(Add)`。

@@ -2118,9 +2118,36 @@ def load_model_code(code_path):
     return source_files
 
 
-def build_module_like_set(source_files):
+def _build_ast_frontends(source_files):
+    ast_frontends = {}
+    for fname in source_files.keys():
+        try:
+            ast_frontends[fname] = ASTFrontend(
+                source='\n'.join(source_files.get(fname, [])),
+                path=fname,
+            )
+        except Exception:
+            ast_frontends[fname] = None
+    return ast_frontends
+
+
+def build_module_like_set(source_files, ast_frontends=None):
     class_defs = {}
+    if ast_frontends is None:
+        ast_frontends = _build_ast_frontends(source_files)
     for fname, lines in source_files.items():
+        fe = ast_frontends.get(fname)
+        if fe is not None:
+            for node in fe.tree.body:
+                if isinstance(node, ast.ClassDef):
+                    bases = []
+                    for base in node.bases:
+                        try:
+                            bases.append(fe._node_to_text(base))
+                        except Exception:
+                            bases.append(getattr(base, "id", getattr(base, "attr", "")))
+                    class_defs[(fname, node.name)] = bases
+            continue
         try:
             tree = ast.parse("\n".join(lines), filename=fname)
         except Exception:
@@ -2183,7 +2210,7 @@ class _AST_ModuleTreeExtractor:
       • ``setattr(self, name, SomeModule(...))``      → dynamic / literal child
       • ``self.container.append(SomeModule(...))``    → container element
       • Local-var tracking: ``v = SomeClass(...); self.x.append(v)``
-                            ``v = SomeClass(...); setattr(self, n, v)``
+                           ``v = SomeClass(...); setattr(self, n, v)``
       • For-loop / if / with bodies are walked (no condition evaluation).
 
     Exposes:
@@ -2202,9 +2229,10 @@ class _AST_ModuleTreeExtractor:
         "defaultdict", "Counter", "deque",
     }
 
-    def __init__(self, source_files):
+    def __init__(self, source_files, ast_frontends=None):
         # source_files: {fname: [lines]}
         self.source_files = source_files
+        self.ast_frontends = ast_frontends or {}
         self.classes = {}            # cname -> {file, node, bases}
         self.class_assignments = {}  # cname -> list of dicts
         self.ast_class_attrs = defaultdict(dict)
@@ -2221,10 +2249,17 @@ class _AST_ModuleTreeExtractor:
 
     def _parse_all_files(self):
         for fname, lines in self.source_files.items():
-            try:
-                source = "\n".join(lines)
-                tree = ast.parse(source, filename=fname)
-            except SyntaxError:
+            tree = None
+            fe = self.ast_frontends.get(fname)
+            if fe is not None:
+                tree = fe.tree
+            else:
+                try:
+                    source = "\n".join(lines)
+                    tree = ast.parse(source, filename=fname)
+                except SyntaxError:
+                    tree = None
+            if tree is None:
                 continue
             for node in ast.walk(tree):
                 if isinstance(node, ast.ClassDef):
@@ -3421,13 +3456,14 @@ def analyze_source_hotspots(events, source_files):
 
 
 
-def _build_class_map_ast(source_files):
+def _build_class_map_ast(source_files, ast_frontends=None):
     class_map = {}
     failed_files = set()
+    if ast_frontends is None:
+        ast_frontends = _build_ast_frontends(source_files)
     for fname, lines in source_files.items():
-        try:
-            fe = ASTFrontend(source='\n'.join(lines), path=fname)
-        except Exception:
+        fe = ast_frontends.get(fname)
+        if fe is None:
             failed_files.add(fname)
             continue
         file_failed = False
@@ -3457,29 +3493,25 @@ def _build_class_map_ast(source_files):
     return class_map, failed_files
 
 
-def _build_class_map(source_files):
-    ast_map, failed_files = _build_class_map_ast(source_files)
+def _build_class_map(source_files, ast_frontends=None):
+    ast_map, failed_files = _build_class_map_ast(source_files, ast_frontends=ast_frontends)
     if failed_files:
         print(f"[WARN] AST parse failed for {len(failed_files)} file(s): {sorted(failed_files)}", file=sys.stderr)
     return ast_map
 
 
-def _build_source_dependency_order(source_files, class_map):
+def _build_source_dependency_order(source_files, class_map, ast_frontends=None):
     """Parse forward() methods to extract the order in which child modules are called.
     Returns a dict: {ClassName: [child_attr_name_in_order, ...]}
     Also returns attr_to_class: {(file, attr): ClassName} from __init__ self.xxx = SomeClass(...)
     """
     module_call_order = {}
     attr_to_class = {}  # (fname, attr_name) -> class_name
-    ast_frontends = {}
+    if ast_frontends is None:
+        ast_frontends = _build_ast_frontends(source_files)
 
     def _get_ast_frontend(fname):
-        if fname not in ast_frontends:
-            try:
-                ast_frontends[fname] = ASTFrontend(source='\n'.join(source_files.get(fname, [])), path=fname)
-            except Exception:
-                ast_frontends[fname] = None
-        return ast_frontends[fname]
+        return ast_frontends.get(fname)
 
     def _norm_index(idx_expr: str):
         idx_expr = (idx_expr or '').strip()
@@ -3526,7 +3558,7 @@ def _build_source_dependency_order(source_files, class_map):
     return module_call_order, attr_to_class
 
 
-def _build_data_dependency_edges(source_files, class_map, module_attrs, class_str_list_attrs=None, dynamic_attrs_per_class=None):
+def _build_data_dependency_edges(source_files, class_map, module_attrs, class_str_list_attrs=None, dynamic_attrs_per_class=None, ast_frontends=None):
     """Parse forward() methods to extract tensor data dependency edges between child modules.
 
     For each class, analyzes variable assignments from self.xxx() calls and variable
@@ -3552,6 +3584,12 @@ def _build_data_dependency_edges(source_files, class_map, module_attrs, class_st
     class_dep_edges = {}
     class_edge_locs = {}
     class_split_info = {}
+    if ast_frontends is None:
+        ast_frontends = _build_ast_frontends(source_files)
+
+    def _get_ast_frontend(fname):
+        return ast_frontends.get(fname)
+
     if class_str_list_attrs is None:
         class_str_list_attrs = {}
 
@@ -4242,16 +4280,12 @@ def _build_data_dependency_edges(source_files, class_map, module_attrs, class_st
                 _hlines = lines[_hrange[0] - 1: min(_hrange[1], len(lines))]
                 logical_lines.extend(_join_logical_lines(_hlines, _hrange[0]))
 
-            _ast_fe_dd = None
             _ast_stmt_info_by_line = {}
             _ast_var_env = {}
             _ast_alias_env = {}
             _ast_dict_slot_env = {}
             _ast_calls_by_line = {}
-            try:
-                _ast_fe_dd = ASTFrontend(source='\n'.join(lines), path=fname)
-            except Exception:
-                _ast_fe_dd = None
+            _ast_fe_dd = _get_ast_frontend(fname)
             if _ast_fe_dd:
                 _ast_method_names = ["forward"] + sorted(_reachable_helpers)
                 for _mn in _ast_method_names:
@@ -7356,21 +7390,13 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
             decide whether to render train/infer tabs.
     Returns: tree dict, root list, class_map
     """
-    _ast_frontend_cache = {}
+    ast_frontends = _build_ast_frontends(source_files)
 
     def _get_ast_frontend(fname):
-        if fname not in _ast_frontend_cache:
-            try:
-                _ast_frontend_cache[fname] = ASTFrontend(
-                    source='\n'.join(source_files.get(fname, [])),
-                    path=fname,
-                )
-            except Exception:
-                _ast_frontend_cache[fname] = None
-        return _ast_frontend_cache[fname]
+        return ast_frontends.get(fname)
 
-    class_map = _build_class_map(source_files)
-    module_call_order, _ = _build_source_dependency_order(source_files, class_map)
+    class_map = _build_class_map(source_files, ast_frontends=ast_frontends)
+    module_call_order, _ = _build_source_dependency_order(source_files, class_map, ast_frontends=ast_frontends)
 
     # Iter18: Build the AST module tree IN-PROCESS (no JSON intermediate).
     # The extractor runs once per build_static_module_tree() invocation and
@@ -7378,7 +7404,7 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
     # elements / dynamic setattrs that downstream consumers can consult when
     # the existing regex pass is uncertain.  The data is stashed on each
     # tree[cname] entry as ``_ast_*`` keys near the end of this function.
-    _ast_extractor = _AST_ModuleTreeExtractor(source_files)
+    _ast_extractor = _AST_ModuleTreeExtractor(source_files, ast_frontends=ast_frontends)
 
     # ------------------------------------------------------------------
     # 轻量常量表：用于 ModuleList/ModuleDict 展开时解析 range(N) / layers=CONST
@@ -7398,10 +7424,8 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
     for _fname, _lines in source_files.items():
         int_consts = {}
         str_list_consts_raw = {}
-        try:
-            _file_tree = ast.parse("".join(_lines))
-        except SyntaxError:
-            _file_tree = None
+        _fe = _get_ast_frontend(_fname)
+        _file_tree = _fe.tree if _fe is not None else None
         if _file_tree is not None:
             for _node in _file_tree.body:
                 if not isinstance(_node, ast.Assign) or len(_node.targets) != 1:
@@ -7504,14 +7528,7 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
             for _ast_cname in _fe.class_registry.keys():
                 if _fe.is_nn_module(_ast_cname):
                     nn_module_classes.add(_ast_cname)
-        # AST-only:  walk the file's class definitions and inspect the bases.
-        # ``ast.ClassDef`` already gives us each base as a node — render it
-        # back to text via ``ast.unparse`` so the original "rightmost dotted
-        # name" heuristic still applies.
-        try:
-            _file_tree_for_classes = ast.parse("".join(lines))
-        except SyntaxError:
-            _file_tree_for_classes = None
+        _file_tree_for_classes = _fe.tree if _fe is not None else None
         if _file_tree_for_classes is not None:
             for _node in ast.walk(_file_tree_for_classes):
                 if not isinstance(_node, ast.ClassDef) or not _node.bases:
@@ -9087,7 +9104,14 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
 
 
     # Build data dependency edges between child modules
-    dep_edges, dep_edge_locs, split_info = _build_data_dependency_edges(source_files, class_map, class_attrs, class_str_list_attrs, dynamic_attrs_per_class)
+    dep_edges, dep_edge_locs, split_info = _build_data_dependency_edges(
+        source_files,
+        class_map,
+        class_attrs,
+        class_str_list_attrs,
+        dynamic_attrs_per_class,
+        ast_frontends=ast_frontends,
+    )
 
     # Inject split nodes into class_attrs so they appear as DAG nodes.
     # e.g. if GAUBlock has split_info = {"norm": ["norm#0", "norm#1"]},
