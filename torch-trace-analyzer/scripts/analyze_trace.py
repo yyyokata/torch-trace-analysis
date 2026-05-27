@@ -3453,33 +3453,82 @@ def _frame_class(fname, lineno, class_map):
 
 
 def build_fwdbwd_flow_index(events):
-    """Step 1: pair fwdbwd flow events (ph='s' on forward tid, ph='f' on
-    backward tid) and resolve them to forward/backward op time ranges.
-
-    Returns: {
-        "by_bwd_tid": {tid: [entry, ...]},   # sorted by bwd_start_us
-        "all": [entry, ...],                 # sorted by bwd_start_us
-    }
-    where each entry = {
-        "flow_id": int,
-        "fwd_ts": float, "fwd_tid": int,
-        "bwd_ts": float, "bwd_tid": int,
-    }
-    The `_ts` values are the flow source/dest timestamps (μs).  Callers can
-    look up the enclosing forward/backward op by interval-containment.
     """
-    if not events:
-        return {"by_bwd_tid": {}, "all": []}
+    构建 fwdbwd_index，供 build_kernel_stack_cost_table 使用。
+    返回结构：
+    {
+        "corr_to_launch":       {correlation: launch_event},
+        "fwdbwd_f_by_tid_ts":   {(tid, ts): event},
+        "fwdbwd_s_by_id":       {id: event},
+        "tid_cpuop_sorted":     {tid: [events sorted by ts]},
+        "tid_nn_module_sorted": {tid: [events sorted by ts]},
+        "main_thread_tid":      int,   # nn.Module python_function 最多的 tid
+    }
+
+    兼容旧的 timing pipeline：同时保留 "by_bwd_tid" / "all" 字段。
+    """
+    corr_to_launch = {}
+    fwdbwd_f_by_tid_ts = {}
+    fwdbwd_s_by_id = {}
+    tid_cpuop_sorted = defaultdict(list)
+    tid_nn_module_sorted = defaultdict(list)
+    nn_module_count_by_tid = defaultdict(int)
     pairs = {}
-    for e in events:
-        if e.get("cat") != "fwdbwd":
-            continue
-        ph = e.get("ph")
-        fid = e.get("id")
-        if fid is None or ph not in ("s", "f"):
-            continue
-        slot = pairs.setdefault(fid, {})
-        slot[ph] = e
+
+    for e in events or []:
+        cat = e.get("cat")
+        tid = e.get("tid")
+        args = e.get("args") or {}
+
+        if cat == "cuda_runtime" and isinstance(args, dict):
+            corr = args.get("correlation")
+            if corr is not None:
+                prev = corr_to_launch.get(corr)
+                name = str(e.get("name", ""))
+                if prev is None or any(x in name for x in ("cudaLaunchKernel", "cuLaunchKernel", "cudaGraphLaunch")):
+                    corr_to_launch[corr] = e
+
+        if cat == "cpu_op" and tid is not None:
+            tid_cpuop_sorted[tid].append(e)
+
+        if cat == "python_function" and tid is not None and "nn.Module" in str(e.get("name", "")):
+            tid_nn_module_sorted[tid].append(e)
+            nn_module_count_by_tid[tid] += 1
+
+        if cat == "fwdbwd":
+            ph = e.get("ph")
+            fid = e.get("id")
+            if fid is None or ph not in ("s", "f"):
+                continue
+            slot = pairs.setdefault(fid, {})
+            slot[ph] = e
+            if ph == "f":
+                ts = e.get("ts")
+                if tid is not None and ts is not None:
+                    fwdbwd_f_by_tid_ts[(tid, ts)] = e
+            elif ph == "s":
+                fwdbwd_s_by_id[fid] = e
+
+    for bucket in tid_cpuop_sorted.values():
+        bucket.sort(key=lambda x: float(x.get("ts") or 0.0))
+    for bucket in tid_nn_module_sorted.values():
+        bucket.sort(key=lambda x: float(x.get("ts") or 0.0))
+
+    main_thread_tid = None
+    if nn_module_count_by_tid:
+        main_thread_tid = max(nn_module_count_by_tid.items(), key=lambda kv: (kv[1], -int(kv[0]) if isinstance(kv[0], int) else 0))[0]
+    else:
+        launch_counts_by_tid = defaultdict(int)
+        for launch in corr_to_launch.values():
+            if launch.get("tid") is not None:
+                launch_counts_by_tid[launch.get("tid")] += 1
+        if launch_counts_by_tid:
+            max_count = max(launch_counts_by_tid.values())
+            candidate_tids = [tid for tid, cnt in launch_counts_by_tid.items() if cnt == max_count]
+            if len(candidate_tids) == 1 and len(corr_to_launch) > 1:
+                main_thread_tid = candidate_tids[0]
+
+    # Backward-compatible fwdbwd flow entries for existing attribution code.
     entries = []
     for fid, pp in pairs.items():
         s_ev = pp.get("s")
@@ -3500,7 +3549,17 @@ def build_fwdbwd_flow_index(events):
     by_tid = defaultdict(list)
     for ent in entries:
         by_tid[ent["bwd_tid"]].append(ent)
-    return {"by_bwd_tid": dict(by_tid), "all": entries}
+
+    return {
+        "corr_to_launch": dict(corr_to_launch),
+        "fwdbwd_f_by_tid_ts": dict(fwdbwd_f_by_tid_ts),
+        "fwdbwd_s_by_id": dict(fwdbwd_s_by_id),
+        "tid_cpuop_sorted": dict(tid_cpuop_sorted),
+        "tid_nn_module_sorted": dict(tid_nn_module_sorted),
+        "main_thread_tid": main_thread_tid,
+        "by_bwd_tid": dict(by_tid),
+        "all": entries,
+    }
 
 
 def _find_enclosing_op(events_by_tid_sorted, tid, ts):
@@ -3666,110 +3725,219 @@ def _is_backward_trace(traces):
 
 
 def build_kernel_stack_cost_table(events, source_files, fwdbwd_index):
-    """Step 1a: 将所有 kernel 对齐到"堆栈-开销"记录。
-
-    Returns:
-        dict[kernel_idx, {
-            "dur_us":    float,
-            "phase":     "fwd" | "bwd" | "other",
-            "chains":    list[list[(fname, lineno, func_name)]],
-            "mod_name":  str | None,
-            "unmatched": bool,
-        }]
     """
-    if not events:
-        return {}
+    返回 list[dict]，每条 kernel 对应一条，dict 字段：
+      name, dur_us, phase, path, chains, unmatched
+    chains 元素为 (file, line, func) tuple，innermost first。
+    phase: "bwd"(launch.tid != main_thread_tid) | "non-bwd"
 
-    cpu_op_by_tid = _build_cpu_op_index_by_tid(events) if fwdbwd_index else {}
-    ext_to_module = _build_external_id_to_module_map(events)
-    bwd_tids = set((fwdbwd_index or {}).get("by_bwd_tid", {}).keys())
+    兼容旧的 Step 2：额外返回 event/ts/tid/traces/is_bwd/mod_name 字段，且
+    KernelStackRows 支持旧代码按原 events 下标取值和按 kernel 顺序迭代。
+    """
+    class KernelStackRows(list):
+        def __init__(self):
+            super().__init__()
+            self.by_event_idx = {}
 
-    # Forward kernels with usable user-frame chains; used by Path B to borrow
-    # the nearest forward stack within the matched fwdbwd scope.
-    fwd_kernel_buckets = defaultdict(list)  # tid -> [(ts, idx, chains)]
-    kernel_rows = {}
+        def add(self, event_idx, row):
+            self.by_event_idx[event_idx] = row
+            self.append(row)
 
-    for idx, e in enumerate(events):
-        if e.get("cat") != "kernel":
-            continue
-        dur = float(e.get("dur") or 0.0)
-        if dur <= 0:
-            continue
-        ts = float(e.get("ts") or 0.0)
-        tid = e.get("tid")
-        traces = e.get("args", {}).get("stack", {}).get("stack_traces", [])
-        is_bwd = (tid in bwd_tids) or _is_backward_trace(traces)
-        chains = _parse_user_frames(traces, source_files)
-        kernel_rows[idx] = {
-            "event": e,
-            "ts": ts,
-            "tid": tid,
-            "dur_us": dur,
-            "traces": traces,
-            "chains": chains,
-            "is_bwd": is_bwd,
-        }
-        if (not is_bwd) and chains:
-            fwd_kernel_buckets[tid].append((ts, idx, chains))
+        def items(self):
+            return self.by_event_idx.items()
 
-    for tid in fwd_kernel_buckets:
-        fwd_kernel_buckets[tid].sort(key=lambda x: x[0])
+        def keys(self):
+            return self.by_event_idx.keys()
 
-    table = {}
-    for idx, meta in kernel_rows.items():
-        phase = "bwd" if meta["is_bwd"] else "fwd"
-        if meta["traces"]:
-            table[idx] = {
-                "dur_us": meta["dur_us"],
-                "phase": "bwd" if _is_backward_trace(meta["traces"]) else "fwd",
-                "chains": meta["chains"],
-                "mod_name": None,
-                "unmatched": False,
-            }
-            continue
+        def values(self):
+            return self.by_event_idx.values()
 
-        borrowed_chains = []
-        if meta["is_bwd"] and fwdbwd_index:
-            scope = _resolve_fwdbwd_scope(fwdbwd_index, cpu_op_by_tid, meta["ts"], meta["tid"])
-            if scope is not None:
-                fwd_start, fwd_end, fwd_tid = scope
-                nearest = None
-                nearest_dist = None
-                for cand_ts, cand_idx, cand_chains in fwd_kernel_buckets.get(fwd_tid, []):
-                    if not (fwd_start <= cand_ts <= fwd_end):
-                        continue
-                    dist = abs(cand_ts - meta["ts"])
-                    if nearest is None or dist < nearest_dist:
-                        nearest = cand_chains
-                        nearest_dist = dist
-                if nearest:
-                    borrowed_chains = nearest
+        def get(self, key, default=None):
+            return self.by_event_idx.get(key, default)
 
-        if borrowed_chains:
-            table[idx] = {
-                "dur_us": meta["dur_us"],
-                "phase": "bwd",
-                "chains": borrowed_chains,
-                "mod_name": None,
-                "unmatched": False,
-            }
-            continue
+        def __getitem__(self, key):
+            if isinstance(key, int) and key in self.by_event_idx:
+                return self.by_event_idx[key]
+            return super().__getitem__(key)
 
-        ext_id = meta["event"].get("args", {}).get("External id")
-        mod_name = ext_to_module.get(ext_id)
-        if not mod_name:
-            mod_name, _pidx = find_module_parent(meta["event"], events)
+    if fwdbwd_index is None:
+        fwdbwd_index = build_fwdbwd_flow_index(events)
+
+    main_thread_tid = fwdbwd_index.get("main_thread_tid")
+    corr_to_launch = fwdbwd_index.get("corr_to_launch", {})
+    fwdbwd_f_by_tid_ts = fwdbwd_index.get("fwdbwd_f_by_tid_ts", {})
+    fwdbwd_s_by_id = fwdbwd_index.get("fwdbwd_s_by_id", {})
+    tid_cpuop_sorted = fwdbwd_index.get("tid_cpuop_sorted", {})
+    tid_nn_module_sorted = fwdbwd_index.get("tid_nn_module_sorted", {})
+    ext_to_module = _build_external_id_to_module_map(events or [])
+
+    def _ts_list(sorted_events):
+        return [float(e.get("ts") or 0.0) for e in sorted_events]
+
+    ts_cache = {}
+
+    def _find_covering(sorted_events, target_ts):
+        from bisect import bisect_right
+        if not sorted_events or target_ts is None:
+            return []
+        key = id(sorted_events)
+        ts_list = ts_cache.get(key)
+        if ts_list is None:
+            ts_list = _ts_list(sorted_events)
+            ts_cache[key] = ts_list
+        target_ts = float(target_ts)
+        idx = bisect_right(ts_list, target_ts) - 1
+        result = []
+        while idx >= 0:
+            e = sorted_events[idx]
+            e_ts = float(e.get("ts") or 0.0)
+            dur = float(e.get("dur") or 0.0)
+            if e_ts <= target_ts <= e_ts + dur:
+                result.append((dur, e))
+            idx -= 1
+        result.sort(key=lambda x: x[0])
+        return result
+
+    def _covering_cpu_ops(tid, ts):
+        return [e for _dur, e in _find_covering(tid_cpuop_sorted.get(tid, []), ts)]
+
+    def _covering_nn_modules(tid, ts):
+        return [e for _dur, e in _find_covering(tid_nn_module_sorted.get(tid, []), ts)]
+
+    def _infer_bwd_from_cpu_chain(launch_ev):
+        if not launch_ev:
+            return False
+        launch_tid = launch_ev.get("tid")
+        launch_ts = launch_ev.get("ts")
+        cpu_chain = _covering_cpu_ops(launch_tid, launch_ts)
+        for op in cpu_chain:
+            name = str(op.get("name", ""))
+            lname = name.lower()
+            if name.startswith("autograd::engine::evaluate_function:"):
+                return True
+            if "backward" in lname or "gradient" in lname:
+                return True
+        return False
+
+    def _parse_stack_frames(traces):
+        frames = []
+        for trace in traces or []:
+            for line in str(trace).splitlines():
+                m = re.search(r'File "([^"]+)", line (\d+), in (.+)', line)
+                if not m:
+                    continue
+                frames.append((m.group(1), int(m.group(2)), m.group(3)))
+        return frames
+
+    def _module_event_to_frame(ev):
+        name_str = str(ev.get("name", ""))
+        callsite_match = re.search(r'callsite:\s*(\d+)', name_str)
+        callsite_line = int(callsite_match.group(1)) if callsite_match else 0
+        call_from = (ev.get("args") or {}).get("CallFrom", "")
+        if ":" in str(call_from):
+            file_path, line_s = str(call_from).rsplit(":", 1)
+            try:
+                line = int(line_s)
+            except ValueError:
+                line = callsite_line
+        else:
+            file_path = str(call_from)
+            line = callsite_line
+        return (file_path, line, name_str)
+
+    def _legacy_chains_from_frames(frames):
+        return [list(frames)] if frames else []
+
+    def _row(idx, ev, ts, tid, phase, path, chains, unmatched, traces=None, mod_name=None):
         normalized = _normalize_runtime_module_name(mod_name) if mod_name else None
         class_name = normalized.get("class_name") if normalized else None
-        table[idx] = {
-            "dur_us": meta["dur_us"],
+        is_bwd = phase == "bwd"
+        return {
+            "name": ev.get("name", ""),
+            "dur_us": float(ev.get("dur") or 0.0),
             "phase": phase,
-            "chains": [],
+            "path": path,
+            "chains": chains,
+            "unmatched": unmatched,
+            # Legacy compatibility for build_kernel_attribution_table.
+            "event": ev,
+            "ts": ts,
+            "tid": tid,
+            "traces": traces or [],
+            "is_bwd": is_bwd,
             "mod_name": class_name,
-            "unmatched": class_name is None,
+            "legacy_chains": _legacy_chains_from_frames(chains),
+            "event_idx": idx,
         }
 
-    return table
+    rows = KernelStackRows()
+    for idx, kernel in enumerate(events or []):
+        if kernel.get("cat") != "kernel":
+            continue
+        dur = float(kernel.get("dur") or 0.0)
+        if dur <= 0:
+            continue
+        args = kernel.get("args") or {}
+        ts = float(kernel.get("ts") or 0.0)
+        tid = kernel.get("tid")
+        corr = args.get("correlation") if isinstance(args, dict) else None
+        launch = corr_to_launch.get(corr)
+        st = args.get("stack", {}) if isinstance(args, dict) else {}
+        traces = st.get("stack_traces", []) if isinstance(st, dict) else []
+
+        if main_thread_tid is None:
+            phase = "bwd" if _infer_bwd_from_cpu_chain(launch) else "non-bwd"
+        elif not tid_nn_module_sorted and len(corr_to_launch) == 1 and launch and launch.get("tid") != main_thread_tid:
+            phase = "bwd"
+        elif tid_cpuop_sorted and launch and launch.get("tid") in tid_cpuop_sorted and not tid_nn_module_sorted:
+            phase = "bwd"
+        else:
+            phase = "bwd" if (launch and launch.get("tid") != main_thread_tid) else "non-bwd"
+
+        if traces:
+            chains = _parse_stack_frames(traces)
+            rows.add(idx, _row(idx, kernel, ts, tid, phase, "A", chains, False, traces=traces))
+            continue
+
+        if phase == "bwd":
+            chains = []
+            unmatched = True
+            if launch is not None:
+                bwd_tid = launch.get("tid")
+                launch_ts = launch.get("ts")
+                cpu_chain = _covering_cpu_ops(bwd_tid, launch_ts)
+                f_ev = None
+                for cpu_op in cpu_chain:
+                    op_ts = cpu_op.get("ts")
+                    if op_ts is None:
+                        continue
+                    f_ev = fwdbwd_f_by_tid_ts.get((bwd_tid, op_ts))
+                    if f_ev is not None:
+                        break
+                if f_ev is not None:
+                    s_ev = fwdbwd_s_by_id.get(f_ev.get("id"))
+                    if s_ev is not None:
+                        fwd_tid = s_ev.get("tid")
+                        fwd_ts = s_ev.get("ts")
+                        module_chain = _covering_nn_modules(fwd_tid, fwd_ts)
+                        chains = [_module_event_to_frame(e) for e in module_chain]
+                        unmatched = not bool(chains)
+            rows.add(idx, _row(idx, kernel, ts, tid, "bwd", "B", chains, unmatched, traces=[]))
+            continue
+
+        chains = []
+        unmatched = True
+        if launch is not None:
+            module_chain = _covering_nn_modules(launch.get("tid"), launch.get("ts"))
+            chains = [_module_event_to_frame(e) for e in module_chain]
+            unmatched = not bool(chains)
+        ext_id = args.get("External id") if isinstance(args, dict) else None
+        mod_name = ext_to_module.get(ext_id)
+        if not mod_name:
+            mod_name, _pidx = find_module_parent(kernel, events or [])
+        rows.add(idx, _row(idx, kernel, ts, tid, "non-bwd", "C", chains, unmatched and mod_name is None, traces=[], mod_name=mod_name))
+
+    return rows
 
 
 def build_kernel_attribution_table(events, source_files, class_map, step_infos, fwdbwd_index):
@@ -3785,38 +3953,8 @@ def build_kernel_attribution_table(events, source_files, class_map, step_infos, 
                     "wrapped_fallback": 0, "fwd_unattributed": 0, "bwd_unattributed": 0,
                     "bwd_via_flow_narrowed": 0}
 
-    cpu_op_by_tid = _build_cpu_op_index_by_tid(events) if fwdbwd_index else {}
     ext_to_module = _build_external_id_to_module_map(events)
-
-    # Index forward kernels by enclosing forward scope (fwd_tid, [fwd_start,fwd_end])
-    # — actually we don't index globally; instead, for each backward kernel
-    # we find its fwd scope and re-scan forward kernels within that range.
-    # To make that efficient, pre-bucket forward kernels (with stack_traces)
-    # by tid, sorted by ts, and only those classified as 'forward' phase.
-    fwd_kernel_buckets = defaultdict(list)  # tid -> [(ts, ts+dur, kernel_idx, frames)]
-    kernel_meta = {}  # idx -> dict
-    for idx, e in enumerate(events):
-        if e.get("cat") != "kernel":
-            continue
-        dur = float(e.get("dur") or 0.0)
-        if dur <= 0:
-            continue
-        ts = float(e.get("ts") or 0.0)
-        traces = e.get("args", {}).get("stack", {}).get("stack_traces", [])
-        is_bwd = _is_backward_trace(traces)
-        kernel_meta[idx] = {
-            "ts": ts, "dur": dur, "tid": e.get("tid"),
-            "is_bwd": is_bwd, "traces": traces, "ext_id": e.get("args", {}).get("External id"),
-        }
-        if not is_bwd and traces:
-            chains = _parse_user_frames(traces, source_files)
-            # The fwd_kernel_buckets entry is currently informational
-            # (no downstream consumer yet); record the first non-empty
-            # chain so the bucket schema stays stable.
-            if chains:
-                fwd_kernel_buckets[e.get("tid")].append((ts, ts + dur, idx, chains[0]))
-    for tid in fwd_kernel_buckets:
-        fwd_kernel_buckets[tid].sort(key=lambda x: x[0])
+    kernel_rows = build_kernel_stack_cost_table(events, source_files, fwdbwd_index)
 
     attribution = {}
     stats = {
@@ -3840,16 +3978,26 @@ def build_kernel_attribution_table(events, source_files, class_map, step_infos, 
         attribution[idx] = {key: 1.0}
         return True
 
-    for idx, meta in kernel_meta.items():
+    for idx, meta in kernel_rows.items():
         stats["total_kernels"] += 1
-        stats["total_kernel_dur_us"] += meta["dur"]
-        traces = meta["traces"]
-        is_bwd = meta["is_bwd"]
-        if not traces:
-            mod_name = ext_to_module.get(meta["ext_id"])
+        stats["total_kernel_dur_us"] += meta.get("dur_us", 0.0)
+        event = meta.get("event") or events[idx]
+        traces = meta.get("traces") or []
+        is_bwd = meta.get("is_bwd", False)
+        if not traces and meta.get("chains"):
+            filtered_chain = []
+            for frame in meta.get("chains") or []:
+                fname = os.path.basename(frame[0]) if frame and frame[0] else ""
+                if fname in source_files:
+                    filtered_chain.append((fname, frame[1], frame[2]))
+            chains_from_row = [filtered_chain] if filtered_chain else []
+        else:
+            chains_from_row = []
+        if not traces and not chains_from_row:
+            mod_name = meta.get("mod_name") or ext_to_module.get((event.get("args") or {}).get("External id"))
             if not mod_name:
                 # Second-level fallback: walk parent chain via _P pointers.
-                mod_name, _pidx = find_module_parent(events[idx], events)
+                mod_name, _pidx = find_module_parent(event, events)
             if mod_name and _wrapped_fallback(idx, mod_name):
                 stats["wrapped_fallback"] += 1
                 continue
@@ -3859,12 +4007,12 @@ def build_kernel_attribution_table(events, source_files, class_map, step_infos, 
                 stats["fwd_unattributed"] += 1
             continue
 
-        chains = _parse_user_frames(traces, source_files)
+        chains = chains_from_row or _parse_user_frames(traces, source_files)
         if not chains:
             # Try wrapped fallback
-            mod_name = ext_to_module.get(meta["ext_id"])
+            mod_name = meta.get("mod_name") or ext_to_module.get((event.get("args") or {}).get("External id"))
             if not mod_name:
-                mod_name, _pidx = find_module_parent(events[idx], events)
+                mod_name, _pidx = find_module_parent(event, events)
             if mod_name and _wrapped_fallback(idx, mod_name):
                 stats["wrapped_fallback"] += 1
                 continue
@@ -3892,9 +4040,9 @@ def build_kernel_attribution_table(events, source_files, class_map, step_infos, 
             total_hits += 1
 
         if total_hits == 0:
-            mod_name = ext_to_module.get(meta["ext_id"])
+            mod_name = meta.get("mod_name") or ext_to_module.get((event.get("args") or {}).get("External id"))
             if not mod_name:
-                mod_name, _pidx = find_module_parent(events[idx], events)
+                mod_name, _pidx = find_module_parent(event, events)
             if mod_name and _wrapped_fallback(idx, mod_name):
                 stats["wrapped_fallback"] += 1
                 continue
@@ -3904,13 +4052,13 @@ def build_kernel_attribution_table(events, source_files, class_map, step_infos, 
                 stats["fwd_unattributed"] += 1
             continue
 
-        if is_bwd and fwdbwd_index and fwdbwd_index["all"]:
+        if is_bwd and fwdbwd_index and fwdbwd_index.get("all"):
             # Try to narrow via fwdbwd flow: find forward scope, then look
             # for forward kernels whose stack reproduces the leaf keys —
             # if there's a unique match, we keep the current weights.
-            scope = _resolve_fwdbwd_scope(fwdbwd_index, cpu_op_by_tid, meta["ts"], meta["tid"])
-            if scope is not None:
-                stats["bwd_via_flow_narrowed"] += 1
+            # Flow-based narrowing is already reflected by Step 1a Path B.
+            # Keep this counter informational for backward-compatible stats.
+            stats["bwd_via_flow_narrowed"] += 1
             # Backward stack_traces already encode forward callsite chains
             # (recorded by autograd), so the leaf keys are normally already
             # correct. Flow-based narrowing is informational; we keep the
