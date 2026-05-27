@@ -46,8 +46,6 @@ from analyze_trace import (  # noqa: E402  (sys.path tweak above is intentional)
     _build_source_dependency_order,
     _strip_inline_comment,
     _validate_timeline_modules,
-    aggregate_runtime_instance_phase_times,
-    aggregate_source_module_phase_times,
     build_instance_timing_pipeline,
     build_main_thread_hierarchy,
     build_static_module_tree,

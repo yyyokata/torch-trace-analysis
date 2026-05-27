@@ -2951,41 +2951,6 @@ def _normalize_runtime_module_name(mod_name):
     }
 
 
-def aggregate_source_module_phase_times(events, source_files, step_infos):
-    class_map = _build_class_map(source_files)
-    module_like = build_module_like_set(source_files)
-    class_phase_us = defaultdict(lambda: defaultdict(float))
-
-    for e in events:
-        if e.get("cat") != "kernel":
-            continue
-        dur = float(e.get("dur", 0.0) or 0.0)
-        kernel_start = e["ts"]
-        kernel_end = kernel_start + dur
-        phase = classify_kernel_phase(kernel_start, kernel_end, step_infos)
-        traces = e.get("args", {}).get("stack", {}).get("stack_traces", [])
-        if not traces:
-            continue
-        per_trace_dur = dur / max(1, len(traces))
-        for trace in traces:
-            seen_classes = set()
-            for line in trace.split("\n"):
-                m = re.search(r'File "([^"]+)", line (\d+), in (\w+)', line)
-                if not m:
-                    continue
-                fname = os.path.basename(m.group(1))
-                lineno = int(m.group(2))
-                class_name, _method_name = _find_class_for_line(fname, lineno, class_map)
-                if not class_name:
-                    continue
-                key = (fname, class_name)
-                if key not in module_like or key in seen_classes:
-                    continue
-                seen_classes.add(key)
-                class_phase_us[class_name][phase] += per_trace_dur
-    return {k: dict(v) for k, v in class_phase_us.items()}
-
-
 def _build_external_id_to_module_map(events):
     by_tid = defaultdict(list)
     for e in events:
@@ -3016,64 +2981,6 @@ def _build_external_id_to_module_map(events):
     return ext_to_module
 
 
-def aggregate_runtime_instance_phase_times(events, step_infos):
-    runtime_phase_us = defaultdict(lambda: defaultdict(float))
-    ext_to_module = _build_external_id_to_module_map(events)
-    for e in events:
-        if e.get("cat") != "kernel":
-            continue
-        dur = float(e.get("dur", 0.0) or 0.0)
-        if dur <= 0:
-            continue
-        kernel_start = e["ts"]
-        kernel_end = kernel_start + dur
-        phase = classify_kernel_phase(kernel_start, kernel_end, step_infos)
-        ext_id = e.get("args", {}).get("External id")
-        mod_name = ext_to_module.get(ext_id)
-        if not mod_name:
-            mod_name, _pidx = find_module_parent(e, events)
-        if not mod_name:
-            continue
-        info = _normalize_runtime_module_name(mod_name)
-        runtime_phase_us[info["runtime_name"]][phase] += dur
-        runtime_phase_us[info["runtime_name"]]["class_name"] = info["class_name"]
-        runtime_phase_us[info["runtime_name"]]["runtime_index"] = info["runtime_index"]
-        runtime_phase_us[info["runtime_name"]]["callsite"] = info["callsite"]
-
-    by_class = defaultdict(list)
-    for runtime_name, phase_map in runtime_phase_us.items():
-        class_name = phase_map.get("class_name")
-        if not class_name:
-            continue
-        # Timing terminology (kernel-only contract):
-        #   * fwd_kernel_us  = sum of kernel durations classified as forward
-        #   * bwd_kernel_us  = sum of kernel durations classified as backward
-        #   * other_kernel_us = sum of kernel durations classified as 'other'
-        #     (kernels that are neither forward nor backward but still attributed
-        #     to a user nn.Module — e.g. allreduce/comm fallbacks).
-        #   * kernel_us      = fwd_kernel_us + bwd_kernel_us + other_kernel_us
-        #
-        # Optimizer kernels are intentionally NOT attributed to per-instance
-        # nodes. They are summed into the report-level
-        # ``unattributed_kernel_us`` bucket separately.
-        fwd_kernel_us = float(phase_map.get("forward", 0.0))
-        bwd_kernel_us = float(phase_map.get("backward", 0.0))
-        other_kernel_us = float(phase_map.get("other", 0.0))
-        kernel_us = fwd_kernel_us + bwd_kernel_us + other_kernel_us
-        by_class[class_name].append({
-            "runtime_name": runtime_name,
-            "runtime_index": phase_map.get("runtime_index"),
-            "callsite": phase_map.get("callsite"),
-            "fwd_kernel_us": fwd_kernel_us,
-            "bwd_kernel_us": bwd_kernel_us,
-            "other_kernel_us": other_kernel_us,
-            "kernel_us": kernel_us,
-        })
-    for class_name in by_class:
-        by_class[class_name].sort(key=lambda x: (x.get("runtime_index") is None, x.get("runtime_index") if x.get("runtime_index") is not None else 10**9, x.get("runtime_name", "")))
-    return dict(by_class)
-
-
 # ==========================================================================
 # Timing Pipeline Redesign — 4-step instance-level attribution (cherry-picked)
 # Restored from 9a103e3 after accidental deletion in 08cb9e3 (HTML cleanup).
@@ -3092,16 +2999,28 @@ _STACK_FRAME_RE = re.compile(r'File "([^"]+)", line (\d+), in (\w+)')
 
 
 def _parse_user_frames(traces, source_files):
-    """Parse a list of trace strings into ordered user-code frames.
+    """Parse a list of trace strings into per-trace user-code frame chains.
 
-    Returns a list of (fname_basename, lineno, func_name) preserving the
-    original outer-first ordering. Frames whose file is not in source_files
-    (third-party libs, torch internals) are dropped.
+    Returns a list of frame chains, one per input trace, preserving the
+    original outer-first ordering inside each chain. Frames whose file is
+    not in source_files (third-party libs, torch internals) are dropped.
+    Empty chains (traces with no user frames) are filtered out.
+
+    Contract change (P0-A): previously this function returned a single flat
+    list and stopped at the first non-empty trace, which silently dropped
+    every additional trace recorded for a kernel and prevented multi-leaf
+    weight accumulation.  We now return all per-trace chains so downstream
+    can attribute weight across distinct leaf InstanceKeys (and accumulate
+    repeats when multiple traces resolve to the same key).
+
+    Returns:
+        list[list[(fname_basename, lineno, func_name)]]
     """
     if not traces or not source_files:
         return []
-    frames = []
+    chains = []
     for trace in traces:
+        chain = []
         for ln in trace.split("\n"):
             m = _STACK_FRAME_RE.search(ln)
             if not m:
@@ -3110,12 +3029,10 @@ def _parse_user_frames(traces, source_files):
             fname = os.path.basename(fpath)
             if fname not in source_files:
                 continue
-            frames.append((fname, int(lineno_s), func))
-        # Only use the first trace; multiple traces are alternative
-        # gradient-add paths that reference the same callsite.
-        if frames:
-            break
-    return frames
+            chain.append((fname, int(lineno_s), func))
+        if chain:
+            chains.append(chain)
+    return chains
 
 
 def _frame_class(fname, lineno, class_map):
@@ -3336,6 +3253,113 @@ def _is_backward_trace(traces):
     return False
 
 
+def build_kernel_stack_cost_table(events, source_files, fwdbwd_index):
+    """Step 1a: 将所有 kernel 对齐到"堆栈-开销"记录。
+
+    Returns:
+        dict[kernel_idx, {
+            "dur_us":    float,
+            "phase":     "fwd" | "bwd" | "other",
+            "chains":    list[list[(fname, lineno, func_name)]],
+            "mod_name":  str | None,
+            "unmatched": bool,
+        }]
+    """
+    if not events:
+        return {}
+
+    cpu_op_by_tid = _build_cpu_op_index_by_tid(events) if fwdbwd_index else {}
+    ext_to_module = _build_external_id_to_module_map(events)
+    bwd_tids = set((fwdbwd_index or {}).get("by_bwd_tid", {}).keys())
+
+    # Forward kernels with usable user-frame chains; used by Path B to borrow
+    # the nearest forward stack within the matched fwdbwd scope.
+    fwd_kernel_buckets = defaultdict(list)  # tid -> [(ts, idx, chains)]
+    kernel_rows = {}
+
+    for idx, e in enumerate(events):
+        if e.get("cat") != "kernel":
+            continue
+        dur = float(e.get("dur") or 0.0)
+        if dur <= 0:
+            continue
+        ts = float(e.get("ts") or 0.0)
+        tid = e.get("tid")
+        traces = e.get("args", {}).get("stack", {}).get("stack_traces", [])
+        is_bwd = (tid in bwd_tids) or _is_backward_trace(traces)
+        chains = _parse_user_frames(traces, source_files)
+        kernel_rows[idx] = {
+            "event": e,
+            "ts": ts,
+            "tid": tid,
+            "dur_us": dur,
+            "traces": traces,
+            "chains": chains,
+            "is_bwd": is_bwd,
+        }
+        if (not is_bwd) and chains:
+            fwd_kernel_buckets[tid].append((ts, idx, chains))
+
+    for tid in fwd_kernel_buckets:
+        fwd_kernel_buckets[tid].sort(key=lambda x: x[0])
+
+    table = {}
+    for idx, meta in kernel_rows.items():
+        phase = "bwd" if meta["is_bwd"] else "fwd"
+        if meta["traces"]:
+            table[idx] = {
+                "dur_us": meta["dur_us"],
+                "phase": "bwd" if _is_backward_trace(meta["traces"]) else "fwd",
+                "chains": meta["chains"],
+                "mod_name": None,
+                "unmatched": False,
+            }
+            continue
+
+        borrowed_chains = []
+        if meta["is_bwd"] and fwdbwd_index:
+            scope = _resolve_fwdbwd_scope(fwdbwd_index, cpu_op_by_tid, meta["ts"], meta["tid"])
+            if scope is not None:
+                fwd_start, fwd_end, fwd_tid = scope
+                nearest = None
+                nearest_dist = None
+                for cand_ts, cand_idx, cand_chains in fwd_kernel_buckets.get(fwd_tid, []):
+                    if not (fwd_start <= cand_ts <= fwd_end):
+                        continue
+                    dist = abs(cand_ts - meta["ts"])
+                    if nearest is None or dist < nearest_dist:
+                        nearest = cand_chains
+                        nearest_dist = dist
+                if nearest:
+                    borrowed_chains = nearest
+
+        if borrowed_chains:
+            table[idx] = {
+                "dur_us": meta["dur_us"],
+                "phase": "bwd",
+                "chains": borrowed_chains,
+                "mod_name": None,
+                "unmatched": False,
+            }
+            continue
+
+        ext_id = meta["event"].get("args", {}).get("External id")
+        mod_name = ext_to_module.get(ext_id)
+        if not mod_name:
+            mod_name, _pidx = find_module_parent(meta["event"], events)
+        normalized = _normalize_runtime_module_name(mod_name) if mod_name else None
+        class_name = normalized.get("class_name") if normalized else None
+        table[idx] = {
+            "dur_us": meta["dur_us"],
+            "phase": phase,
+            "chains": [],
+            "mod_name": class_name,
+            "unmatched": class_name is None,
+        }
+
+    return table
+
+
 def build_kernel_attribution_table(events, source_files, class_map, step_infos, fwdbwd_index):
     """Step 2: for every kernel, decide which InstanceKey(s) it belongs to
     and with what weight (weights sum to 1 per kernel).
@@ -3373,9 +3397,12 @@ def build_kernel_attribution_table(events, source_files, class_map, step_infos, 
             "is_bwd": is_bwd, "traces": traces, "ext_id": e.get("args", {}).get("External id"),
         }
         if not is_bwd and traces:
-            frames = _parse_user_frames(traces, source_files)
-            if frames:
-                fwd_kernel_buckets[e.get("tid")].append((ts, ts + dur, idx, frames))
+            chains = _parse_user_frames(traces, source_files)
+            # The fwd_kernel_buckets entry is currently informational
+            # (no downstream consumer yet); record the first non-empty
+            # chain so the bucket schema stays stable.
+            if chains:
+                fwd_kernel_buckets[e.get("tid")].append((ts, ts + dur, idx, chains[0]))
     for tid in fwd_kernel_buckets:
         fwd_kernel_buckets[tid].sort(key=lambda x: x[0])
 
@@ -3420,9 +3447,8 @@ def build_kernel_attribution_table(events, source_files, class_map, step_infos, 
                 stats["fwd_unattributed"] += 1
             continue
 
-        frames = _parse_user_frames(traces, source_files)
-        keys = _extract_instance_keys_from_stack(frames, class_map)
-        if not keys:
+        chains = _parse_user_frames(traces, source_files)
+        if not chains:
             # Try wrapped fallback
             mod_name = ext_to_module.get(meta["ext_id"])
             if not mod_name:
@@ -3436,32 +3462,50 @@ def build_kernel_attribution_table(events, source_files, class_map, step_infos, 
                 stats["fwd_unattributed"] += 1
             continue
 
-        # The deepest key represents the leaf instance. We attribute the
-        # full kernel duration there.  If the class chain has multiple
-        # frames mapping to the same deepest class but with different
-        # parents, we can still produce just one deepest key per kernel
-        # because _extract_instance_keys_from_stack tracks ancestors in
-        # order. Multi-candidate scenarios occur when the same kernel
-        # appears in N different stack_traces; we currently use only the
-        # first trace per _parse_user_frames behavior, so N=1.
-        deepest = keys[-1]
-        candidates = [deepest]
+        # Accumulate leaf-InstanceKey hits across ALL traces of this kernel.
+        # Contract (P0-A, no-dedup):
+        #   * Every non-empty trace contributes +1 weight to its leaf key.
+        #   * If two traces resolve to the same leaf key, that key gets +2.
+        #   * Final weight = hit_count / total_hits (sum normalized to 1.0).
+        # This makes 1 kernel × N traces equivalent to N kernels each
+        # attributed once, as required by the timing contract.
+        hit_counts = {}
+        total_hits = 0
+        for chain in chains:
+            chain_keys = _extract_instance_keys_from_stack(chain, class_map)
+            if not chain_keys:
+                continue
+            leaf = chain_keys[-1]
+            hit_counts[leaf] = hit_counts.get(leaf, 0) + 1
+            total_hits += 1
+
+        if total_hits == 0:
+            mod_name = ext_to_module.get(meta["ext_id"])
+            if not mod_name:
+                mod_name, _pidx = find_module_parent(events[idx], events)
+            if mod_name and _wrapped_fallback(idx, mod_name):
+                stats["wrapped_fallback"] += 1
+                continue
+            if is_bwd:
+                stats["bwd_unattributed"] += 1
+            else:
+                stats["fwd_unattributed"] += 1
+            continue
 
         if is_bwd and fwdbwd_index and fwdbwd_index["all"]:
             # Try to narrow via fwdbwd flow: find forward scope, then look
-            # for forward kernels whose stack reproduces the deepest key —
-            # if there's a unique match, we keep `deepest` (already correct).
+            # for forward kernels whose stack reproduces the leaf keys —
+            # if there's a unique match, we keep the current weights.
             scope = _resolve_fwdbwd_scope(fwdbwd_index, cpu_op_by_tid, meta["ts"], meta["tid"])
             if scope is not None:
                 stats["bwd_via_flow_narrowed"] += 1
-            # The stack_traces for backward kernels already encode the
-            # forward callsite chain (autograd records it), so `deepest`
-            # is normally already the right instance. Flow-based narrowing
-            # is informational; we keep candidates=[deepest].
+            # Backward stack_traces already encode forward callsite chains
+            # (recorded by autograd), so the leaf keys are normally already
+            # correct. Flow-based narrowing is informational; we keep the
+            # accumulated weights.
 
-        # Equal-weight attribution across candidates (currently always 1).
-        w = 1.0 / len(candidates)
-        attribution[idx] = {k: w for k in candidates}
+        # Normalize hit counts to weights summing to 1.0.
+        attribution[idx] = {k: cnt / total_hits for k, cnt in hit_counts.items()}
         if is_bwd:
             stats["bwd_attributed"] += 1
         else:
@@ -3620,7 +3664,7 @@ def build_timing_panel_data(instance_timing, class_map, step_dur_us):
                         else cls)
         item = {
             "runtime_name": runtime_name,
-            "runtime_index": None,
+            "runtime_index": rec.get("runtime_index"),
             "callsite": csl if (csl and csl > 0) else None,
             "callsite_file": csf,
             "callsite_line": csl if (csl and csl > 0) else None,
@@ -3693,6 +3737,116 @@ def build_instance_timing_pipeline(events, source_files, class_map, step_infos, 
     )
     panel["unattributed_kernel_us"] = max(0, panel["step_kernel_us"] - total_attributed_us)
     return panel
+
+
+# --------------------------------------------------------------------------
+# Coverage summary — diagnostics over DAG groups
+# --------------------------------------------------------------------------
+
+def compute_timing_coverage_summary(groups):
+    """Compute timing coverage statistics over DAG sub-groups.
+
+    Walks the DAG ``groups`` list (as produced by ``generate_html_flowchart``
+    with ``_return_data_only=True``) and reports how many sub-group instances
+    have non-zero timing attributed to them.
+
+    Statistics rules:
+        * Sub-groups only — top-level / root groups (``depth <= 0``) are
+          excluded so the figure reflects user-facing modules rather than the
+          synthetic RootModule wrapper.
+        * An instance is considered "timed" when ``kernel_us > 0`` OR
+          ``total_us > 0`` (whichever field is present on the group dict).
+        * Each list entry in the ``groups`` argument is treated as one
+          instance — the caller is expected to pass the flat ``dag_groups``
+          list which already contains one entry per instance occurrence.
+
+    Args:
+        groups: Iterable of group dicts. Each dict is expected to expose at
+            least ``depth``; ``label``/``class_name`` and one of
+            ``attr_name``/``id`` are used to populate the missed-instance
+            list. ``kernel_us`` and/or ``total_us`` (in microseconds) are
+            consulted to decide whether an instance is timed. Missing fields
+            are treated as zero.
+
+    Returns:
+        dict with keys::
+
+            {
+              "total_instances": int,
+              "timed_instances": int,
+              "coverage_rate": float,           # in [0.0, 1.0]
+              "no_timing_instances": [
+                  {"class_name": str, "instance_key": str,
+                   "kernel_us": float, "total_us": float},
+                  ...
+              ]
+            }
+
+        ``coverage_rate`` is ``0.0`` when ``total_instances == 0`` to avoid
+        ``ZeroDivisionError``; callers can therefore safely format the value
+        without extra guards.
+    """
+    total = 0
+    timed = 0
+    no_timing = []
+
+    if not groups:
+        return {
+            "total_instances": 0,
+            "timed_instances": 0,
+            "coverage_rate": 0.0,
+            "no_timing_instances": [],
+        }
+
+    for g in groups:
+        if not isinstance(g, dict):
+            continue
+        # Skip the synthetic RootModule wrapper / any depth==0 entries; we only
+        # want user-facing sub-groups in this report.
+        depth = g.get("depth", 0)
+        try:
+            depth_i = int(depth) if depth is not None else 0
+        except (TypeError, ValueError):
+            depth_i = 0
+        if depth_i <= 0:
+            continue
+
+        total += 1
+
+        kernel_us = g.get("kernel_us", 0) or 0
+        total_us = g.get("total_us", 0) or 0
+        try:
+            kernel_us = float(kernel_us)
+        except (TypeError, ValueError):
+            kernel_us = 0.0
+        try:
+            total_us = float(total_us)
+        except (TypeError, ValueError):
+            total_us = 0.0
+
+        if kernel_us > 0 or total_us > 0:
+            timed += 1
+        else:
+            class_name = g.get("class_name") or g.get("label") or ""
+            instance_key = (
+                g.get("attr_name")
+                or g.get("id")
+                or ""
+            )
+            no_timing.append({
+                "class_name": class_name,
+                "instance_key": instance_key,
+                "kernel_us": kernel_us,
+                "total_us": total_us,
+            })
+
+    coverage_rate = (timed / total) if total > 0 else 0.0
+    return {
+        "total_instances": total,
+        "timed_instances": timed,
+        "coverage_rate": coverage_rate,
+        "no_timing_instances": no_timing,
+    }
 
 
 def analyze_source_hotspots(events, source_files):
