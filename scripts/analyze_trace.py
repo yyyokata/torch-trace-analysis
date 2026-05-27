@@ -1398,6 +1398,8 @@ class ConstantTable:
             self._scan_class_init_params(fname, cname, classdef)
             self._scan_self_to_param(fname, cname, fe)
             self._scan_local_aliases(fname, cname, classdef)
+            self._scan_self_dict_literals(fname, cname, classdef)
+            self._scan_local_dataclass_instances(fname, cname, classdef)
             self._scan_ctor_call_sites(fname, cname, classdef)
 
     def _scan_class_init_params(self, fname: str, cname: str,
@@ -1457,6 +1459,65 @@ class ConstantTable:
                     method_aliases[sub.target.id] = sub.value
             if method_aliases:
                 self.local_aliases[scope_key] = method_aliases
+
+    def _scan_self_dict_literals(self, fname: str, cname: str,
+                                 classdef: ast.ClassDef) -> None:
+        """Record ``self.attr = {<str>: <expr>}`` literals inside methods."""
+        for stmt in classdef.body:
+            if not isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            mname = stmt.name
+            scope_key = (fname, cname, mname)
+            dicts: Dict[str, Dict[str, ast.expr]] = {}
+            for sub in ast.walk(stmt):
+                if not isinstance(sub, ast.Assign) or len(sub.targets) != 1:
+                    continue
+                tgt = sub.targets[0]
+                if not (isinstance(tgt, ast.Attribute)
+                        and isinstance(tgt.value, ast.Name)
+                        and tgt.value.id == "self"):
+                    continue
+                if not isinstance(sub.value, ast.Dict):
+                    continue
+                entries: Dict[str, ast.expr] = {}
+                ok = True
+                for k_node, v_node in zip(sub.value.keys, sub.value.values):
+                    if not (isinstance(k_node, ast.Constant) and isinstance(k_node.value, str)):
+                        ok = False
+                        break
+                    entries[k_node.value] = v_node
+                if ok and entries:
+                    dicts[tgt.attr] = entries
+            if dicts:
+                self.local_self_dict_literals[scope_key] = dicts
+
+    def _scan_local_dataclass_instances(self, fname: str, cname: str,
+                                        classdef: ast.ClassDef) -> None:
+        """Materialize local ``var = DataclassCtor(...)`` bindings per method."""
+        resolver = ConstantResolver(self)
+        for stmt in classdef.body:
+            if not isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            mname = stmt.name
+            scope = Scope(file=fname, cls=cname, method=mname)
+            scope_key = (fname, cname, mname)
+            out: Dict[str, Dict[str, IntValue]] = {}
+            for sub in ast.walk(stmt):
+                target = None
+                value = None
+                if isinstance(sub, ast.Assign) and len(sub.targets) == 1 and isinstance(sub.targets[0], ast.Name):
+                    target = sub.targets[0]
+                    value = sub.value
+                elif isinstance(sub, ast.AnnAssign) and isinstance(sub.target, ast.Name) and sub.value is not None:
+                    target = sub.target
+                    value = sub.value
+                if target is None or value is None:
+                    continue
+                fields = resolver.eval_dataclass_fields(value, scope)
+                if fields:
+                    out[target.id] = fields
+            if out:
+                self.local_dataclass_inst[scope_key] = out
 
     def _scan_ctor_call_sites(self, fname: str, cname: str,
                               classdef: ast.ClassDef) -> None:
@@ -1553,7 +1614,8 @@ class ConstantTable:
                         self.instance_kw_int.setdefault((class_name, attr_name), {})[kw.arg] = IntValue(-kw_val.operand.value, "kw_arg")
                     elif isinstance(kw_val, ast.List):
                         self.instance_kw_list_len.setdefault((class_name, attr_name), {})[kw.arg] = len(kw_val.elts)
-                # --- Step 1-4 (Phase E1.2): dataclass propagation ---------
+                # --- Step 1-4 (Phase E1.2): positional/keyword binding +
+                # dataclass propagation.
                 # Locate ``SubClass.__init__`` formal parameter list across
                 # any defining file (the dataclass / subclass may live in a
                 # different file than the parent class).
@@ -1562,8 +1624,6 @@ class ConstantTable:
                     continue
                 # Skip ``self`` slot for binding.
                 bind_params = params[1:] if params and params[0] == "self" else params
-
-                # Build a (param → ast.expr) map from positional args + kwargs.
                 bound: Dict[str, ast.expr] = {}
                 for i, arg_node in enumerate(value.args):
                     if i < len(bind_params):
@@ -1587,146 +1647,61 @@ class ConstantTable:
                                 for sk, sv in spread.items():
                                     bound.setdefault(sk, sv)
 
-                # Resolve bound values into a dataclass field dict.
+                if not bound:
+                    continue
+                scope_key = (fname, class_name, "__init__")
                 for param, expr_node in bound.items():
-                    fields = self._resolve_dataclass_call_fields(
-                        expr_node, fname, class_name, sub_cls)
-                    if fields:
-                        # Write per-instance dataclass field chain.
-                        chain_key = (class_name, attr_name)
-                        slot = self.instance_const_chain.setdefault(chain_key, {})
-                        # If multiple call sites populate same param, prefer
-                        # earlier writes (don't overwrite); call sites are
-                        # iterated in source order via ast.walk.
-                        existing = slot.get(param)
-                        if existing is None:
-                            slot[param] = fields
-                        else:
-                            merged = dict(existing)
-                            for fk, fv in fields.items():
-                                merged.setdefault(fk, fv)
-                            slot[param] = merged
-    # ------------------------------------------------------------------
-    # Phase E1.2 helpers
-    # ------------------------------------------------------------------
-    def _lookup_init_params(self, sub_cls: str) -> List[str]:
-        """Return the formal-parameter list of ``sub_cls.__init__`` if known.
-
-        Searches ``class_init_params`` keyed by ``(any_file, sub_cls)``.  In
-        the rare case a class is defined in multiple files we return the
-        first hit (good enough for AST-driven int resolution).
-        """
-        for (_f, _c), params in self.class_init_params.items():
-            if _c == sub_cls:
-                return params
-        return []
-
-    def _scan_self_dict_literals(self, classdef: Optional[ast.ClassDef]) -> Dict[str, Dict[str, ast.expr]]:
-        """Collect ``self.<attr> = {<str_key>: <expr>, ...}`` assignments
-        inside ``__init__``.  Returns ``{attr: {key: expr}}``.
-
-        This lets us resolve ``SubClass(**self.<attr>)`` into named kwargs
-        by looking up the dict literal stored on ``self``.
-        """
-        out: Dict[str, Dict[str, ast.expr]] = {}
-        if classdef is None:
-            return out
-        for stmt in classdef.body:
-            if not isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) or stmt.name != "__init__":
-                continue
-            for sub in ast.walk(stmt):
-                if not isinstance(sub, ast.Assign):
-                    continue
-                if len(sub.targets) != 1:
-                    continue
-                tgt = sub.targets[0]
-                if not (isinstance(tgt, ast.Attribute)
-                        and isinstance(tgt.value, ast.Name)
-                        and tgt.value.id == "self"):
-                    continue
-                if not isinstance(sub.value, ast.Dict):
-                    continue
-                d: Dict[str, ast.expr] = {}
-                ok = True
-                for k_node, v_node in zip(sub.value.keys, sub.value.values):
-                    if not (isinstance(k_node, ast.Constant) and isinstance(k_node.value, str)):
-                        ok = False
-                        break
-                    d[k_node.value] = v_node
-                if ok and d:
-                    out[tgt.attr] = d
-            break
-        return out
-
-    def _resolve_dataclass_call_fields(self,
-                                       expr_node: ast.expr,
-                                       fname: str,
-                                       parent_cls: str,
-                                       sub_cls: str) -> Optional[Dict[str, IntValue]]:
-        """Try to interpret *expr_node* as a dataclass instance and return
-        its ``{field: IntValue}`` mapping.  Falls back to dataclass
-        defaults whenever a field is not explicitly overridden.
-
-        Handled forms:
-          * ``DCClass(field1=X, field2=Y)``   — explicit kwargs + defaults
-          * ``DCClass(**self.<attr>)``        — dict-literal spread on self
-          * ``DCClass(**local_var)``          — local dict alias (best-effort)
-          * ``DCClass()``                     — pure defaults
-        Returns ``None`` when *expr_node* is not a recognisable dataclass
-        constructor call.
-        """
-        if not isinstance(expr_node, ast.Call):
-            return None
-        dc_cls = self._call_class_name(expr_node.func)
-        if dc_cls is None:
-            return None
-        # Locate dataclass defaults (regardless of which file defines it).
-        defaults: Optional[Dict[str, IntValue]] = None
-        for (_f, _c), d in self.dataclass_defaults.items():
-            if _c == dc_cls:
-                defaults = d
-                break
-        if defaults is None:
-            return None
-        # Start from defaults.
-        fields: Dict[str, IntValue] = dict(defaults)
-        # Override with explicit kwargs.
-        for kw in expr_node.keywords:
-            if kw.arg is None:
-                # ``**x`` — best-effort spread.
-                kv = kw.value
-                spread_dict: Optional[Dict[str, ast.expr]] = None
-                if (isinstance(kv, ast.Attribute)
-                        and isinstance(kv.value, ast.Name)
-                        and kv.value.id == "self"):
-                    self_dict_fields = self._scan_self_dict_literals(
-                        self._lookup_classdef(parent_cls))
-                    spread_dict = self_dict_fields.get(kv.attr)
-                if spread_dict:
-                    for sk, sv in spread_dict.items():
-                        if isinstance(sv, ast.Constant) and isinstance(sv.value, int) and not isinstance(sv.value, bool):
-                            fields[sk] = IntValue(sv.value, "dataclass_spread")
-                continue
-            kw_val = kw.value
-            if isinstance(kw_val, ast.Constant) and isinstance(kw_val.value, int) and not isinstance(kw_val.value, bool):
-                fields[kw.arg] = IntValue(kw_val.value, "dataclass_kw")
-            elif (isinstance(kw_val, ast.UnaryOp) and isinstance(kw_val.op, ast.USub)
-                  and isinstance(kw_val.operand, ast.Constant)
-                  and isinstance(kw_val.operand.value, int)
-                  and not isinstance(kw_val.operand.value, bool)):
-                fields[kw.arg] = IntValue(-kw_val.operand.value, "dataclass_kw")
-        return fields
-
-    def _lookup_classdef(self, cname: str) -> Optional[ast.ClassDef]:
-        """Best-effort: return the *first* known ClassDef AST node for *cname*."""
-        for (_f, _c), node in self.class_defs.items():
-            if _c == cname:
-                return node
-        return None
-
+                    fields = self._resolve_bound_dataclass_fields(expr_node, scope_key)
+                    if not fields:
+                        continue
+                    chain_key = (class_name, attr_name)
+                    slot = self.instance_const_chain.setdefault(chain_key, {})
+                    existing = slot.get(param)
+                    if existing is None:
+                        slot[param] = fields
+                    else:
+                        merged = dict(existing)
+                        for fk, fv in fields.items():
+                            merged.setdefault(fk, fv)
+                        slot[param] = merged
     # ------------------------------------------------------------------
     # Helpers (used by Pass 3 & 4)
     # ------------------------------------------------------------------
+    def _lookup_init_params(self, sub_cls: str) -> List[str]:
+        for (_fname, _cname), params in self.class_init_params.items():
+            if _cname == sub_cls:
+                return params
+        return []
+
+    def _resolve_bound_dataclass_fields(self,
+                                        expr_node: ast.expr,
+                                        scope_key: Tuple[str, str, str]) -> Optional[Dict[str, IntValue]]:
+        fields = self._resolve_dataclass_call_fields(expr_node, scope_key)
+        if fields:
+            return fields
+        if not isinstance(expr_node, ast.Name):
+            return None
+        local_inst = self.local_dataclass_inst.get(scope_key, {})
+        if expr_node.id in local_inst:
+            return dict(local_inst[expr_node.id])
+        method_aliases = self.local_aliases.get(scope_key, {})
+        alias_node = method_aliases.get(expr_node.id)
+        if isinstance(alias_node, ast.Name) and alias_node.id in local_inst:
+            return dict(local_inst[alias_node.id])
+        return None
+
+    def _resolve_dataclass_call_fields(self,
+                                       expr_node: ast.expr,
+                                       scope_key: Tuple[str, str, str]) -> Optional[Dict[str, IntValue]]:
+        if not isinstance(expr_node, ast.Call):
+            return None
+        fname, cname, mname = scope_key
+        resolver = ConstantResolver(self)
+        return resolver.eval_dataclass_fields(
+            expr_node,
+            Scope(file=fname, cls=cname, method=mname),
+        )
+
     @staticmethod
     def _call_class_name(func_node: ast.expr) -> Optional[str]:
         """Best-effort extract of the called class name from ``Call.func``.
@@ -2094,11 +2069,17 @@ class ConstantResolver:
             v = self.eval_int(arg, scope)
             if v is not None:
                 fields[field_order[i]] = v
-        # Keyword args.
+        # Keyword args / **dict spreads.
         for kw in node.keywords:
             if kw.arg is None:
-                # **kwargs unpack — PR1 conservative fail.
-                return None
+                spread_items = self._resolve_to_dict_items(kw.value, scope)
+                if spread_items is None:
+                    return None
+                for sk, sv in spread_items.items():
+                    v = self.eval_int(sv, scope)
+                    if v is not None:
+                        fields[sk] = v
+                continue
             v = self.eval_int(kw.value, scope)
             if v is not None:
                 fields[kw.arg] = v
@@ -2170,6 +2151,28 @@ class ConstantResolver:
             return cur
         if isinstance(cur, int):
             return IntValue(cur, "dataclass_field")
+        return None
+
+    def _resolve_to_dict_items(self, node: ast.expr, scope: Scope) -> Optional[Dict[str, ast.expr]]:
+        if isinstance(node, ast.Dict):
+            out: Dict[str, ast.expr] = {}
+            for k_node, v_node in zip(node.keys, node.values):
+                if not (isinstance(k_node, ast.Constant) and isinstance(k_node.value, str)):
+                    return None
+                out[k_node.value] = v_node
+            return out
+        if isinstance(node, ast.Name):
+            method_aliases = self.table.local_aliases.get(scope.method_key)
+            if method_aliases and node.id in method_aliases:
+                return self._resolve_to_dict_items(method_aliases[node.id], scope)
+            file_dicts = self.table.file_dict_literals.get(scope.file, {})
+            if node.id in file_dicts:
+                return dict(file_dicts[node.id])
+            return None
+        if (isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "self"):
+            return dict(self.table.local_self_dict_literals.get(scope.method_key, {}).get(node.attr, {})) or None
         return None
 
     def _resolve_to_list_literal(self, node: ast.expr, scope: Scope) -> Optional[ast.List]:
