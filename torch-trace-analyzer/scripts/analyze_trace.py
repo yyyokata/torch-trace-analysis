@@ -3408,6 +3408,7 @@ def _build_external_id_to_module_map(events):
 
 
 _STACK_FRAME_RE = re.compile(r'File "([^"]+)", line (\d+), in (\w+)')
+_DYNAMO_RESUME_RE = re.compile(r'torch_dynamo_resume_in_')
 
 
 def _parse_user_frames(traces, source_files):
@@ -3845,6 +3846,43 @@ def build_kernel_stack_cost_table(events, source_files, fwdbwd_index):
             line = callsite_line
         return (file_path, line, name_str)
 
+    def _is_dynamo_resume_top_frame(traces):
+        if not traces:
+            return False
+        first_trace = str(traces[0])
+        first_line = first_trace.splitlines()[0] if first_trace else ""
+        return bool(_DYNAMO_RESUME_RE.search(first_line))
+
+    def _find_innermost_nn_module_on_main_thread(launch_ts):
+        if main_thread_tid is None or launch_ts is None:
+            return None
+        covering = _find_covering(tid_nn_module_sorted.get(main_thread_tid, []), launch_ts)
+        return covering[0][1] if covering else None
+
+    def _nn_module_event_to_outermost_frame(ev):
+        name_str = str(ev.get("name", ""))
+        m_name = re.match(r"nn\.Module:\s*(.+?)(?:,\s*callsite:.+)?$", name_str)
+        func = m_name.group(1).strip() if m_name else name_str
+        call_from = (ev.get("args") or {}).get("CallFrom", "")
+        if ":" in str(call_from):
+            file_path, line_s = str(call_from).rsplit(":", 1)
+            try:
+                line = int(line_s.strip())
+            except ValueError:
+                line = 0
+        else:
+            file_path = str(call_from)
+            line = 0
+        return (file_path.strip(), line, func)
+
+    def _build_path_a_prime_row(idx, kernel, ts, tid, traces, launch):
+        chains = _parse_stack_frames(traces)
+        nn_ev = _find_innermost_nn_module_on_main_thread(launch.get("ts") if launch else None)
+        if nn_ev is None:
+            return _row(idx, kernel, ts, tid, "non-bwd", "A'", [], True, traces=traces)
+        chains.append(_nn_module_event_to_outermost_frame(nn_ev))
+        return _row(idx, kernel, ts, tid, "non-bwd", "A'", chains, False, traces=traces)
+
     def _legacy_chains_from_frames(frames):
         return [list(frames)] if frames else []
 
@@ -3895,8 +3933,16 @@ def build_kernel_stack_cost_table(events, source_files, fwdbwd_index):
             phase = "bwd" if (launch and launch.get("tid") != main_thread_tid) else "non-bwd"
 
         if traces:
-            chains = _parse_stack_frames(traces)
-            rows.add(idx, _row(idx, kernel, ts, tid, phase, "A", chains, False, traces=traces))
+            if (
+                launch is not None
+                and main_thread_tid is not None
+                and launch.get("tid") == main_thread_tid
+                and _is_dynamo_resume_top_frame(traces)
+            ):
+                rows.add(idx, _build_path_a_prime_row(idx, kernel, ts, tid, traces, launch))
+            else:
+                chains = _parse_stack_frames(traces)
+                rows.add(idx, _row(idx, kernel, ts, tid, phase, "A", chains, False, traces=traces))
             continue
 
         if phase == "bwd":
