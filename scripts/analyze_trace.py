@@ -621,6 +621,8 @@ class ASTFrontend:
         if method_node is None:
             return []
         records = []
+        const_table = self.get_constant_table(self.path or "<memory>")
+        const_resolver = ConstantResolver(const_table)
 
         def _parse_loop_spec(for_node):
             iter_node = for_node.iter
@@ -647,8 +649,9 @@ class ASTFrontend:
                 "class_leaf": class_name.split(".")[-1] if class_name else "",
             })
 
-        def _walk_body(body, inherited_spec=None):
-            local_ctor_vars = {}
+        def _walk_body(body, inherited_spec=None, local_ctor_vars=None):
+            if local_ctor_vars is None:
+                local_ctor_vars = {}
             for stmt in body or []:
                 if isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Call):
                     if len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
@@ -670,22 +673,29 @@ class ASTFrontend:
                                 records[-1].update(rec)
                     continue
                 if isinstance(stmt, ast.For):
-                    _walk_body(stmt.body, _parse_loop_spec(stmt))
-                    _walk_body(stmt.orelse, inherited_spec)
+                    _walk_body(stmt.body, _parse_loop_spec(stmt), local_ctor_vars)
+                    _walk_body(stmt.orelse, inherited_spec, local_ctor_vars)
                     continue
                 if isinstance(stmt, ast.If):
-                    _walk_body(stmt.body, inherited_spec)
-                    _walk_body(stmt.orelse, inherited_spec)
+                    scope = Scope(file=self.path or "<memory>", cls=class_name, method="__init__")
+                    bool_val = const_resolver.eval_bool(stmt.test, scope)
+                    if bool_val is True:
+                        _walk_body(stmt.body, inherited_spec, local_ctor_vars)
+                    elif bool_val is False:
+                        _walk_body(stmt.orelse, inherited_spec, local_ctor_vars)
+                    else:
+                        _walk_body(stmt.body, inherited_spec, local_ctor_vars)
+                        _walk_body(stmt.orelse, inherited_spec, local_ctor_vars)
                     continue
                 if isinstance(stmt, ast.With):
-                    _walk_body(stmt.body, inherited_spec)
+                    _walk_body(stmt.body, inherited_spec, local_ctor_vars)
                     continue
                 if isinstance(stmt, ast.Try):
-                    _walk_body(stmt.body, inherited_spec)
+                    _walk_body(stmt.body, inherited_spec, local_ctor_vars)
                     for h in stmt.handlers:
-                        _walk_body(h.body, inherited_spec)
-                    _walk_body(stmt.orelse, inherited_spec)
-                    _walk_body(stmt.finalbody, inherited_spec)
+                        _walk_body(h.body, inherited_spec, local_ctor_vars)
+                    _walk_body(stmt.orelse, inherited_spec, local_ctor_vars)
+                    _walk_body(stmt.finalbody, inherited_spec, local_ctor_vars)
 
         _walk_body(method_node.body)
         records = [
@@ -1240,6 +1250,7 @@ class ConstantTable:
             Names of classes derived (transitively) from ``nn.Module``.
         """
         table = cls()
+        table._ast_frontends = dict(ast_frontends)
         # Pass 1 — purely file-level scans.
         for fname, fe in ast_frontends.items():
             table._pass1_file_consts(fname, fe)
@@ -1787,8 +1798,63 @@ class ConstantResolver:
     def eval_list_len(self, node: ast.expr, scope: Scope) -> Optional[int]:
         return self._cached(node, scope, "list_len", self._eval_list_len_uncached)
 
+    def eval_bool(self, node: ast.expr, scope: Scope) -> Optional[bool]:
+        return self._cached(node, scope, "bool", self._eval_bool_uncached)
+
     def eval_dataclass_fields(self, node: ast.expr, scope: Scope) -> Optional[Dict[str, IntValue]]:
         return self._cached(node, scope, "fields", self._eval_fields_uncached)
+
+    def _eval_bool_uncached(self, node: ast.expr, scope: Scope) -> Optional[bool]:
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, bool):
+                return node.value
+            return None
+        if isinstance(node, ast.Name):
+            method_aliases = self.table.local_aliases.get(scope.method_key)
+            if method_aliases and node.id in method_aliases:
+                rhs = method_aliases[node.id]
+                return self._eval_bool_uncached(rhs, scope)
+            default_val = self._lookup_param_default(node.id, scope)
+            if default_val is not None:
+                return self._eval_bool_uncached(default_val, scope)
+            return None
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+            sub = self.eval_bool(node.operand, scope)
+            return (not sub) if sub is not None else None
+        if isinstance(node, ast.BoolOp):
+            vals = [self.eval_bool(v, scope) for v in node.values]
+            if any(v is None for v in vals):
+                return None
+            if isinstance(node.op, ast.And):
+                return all(vals)
+            if isinstance(node.op, ast.Or):
+                return any(vals)
+        return None
+
+    def _lookup_param_default(self, param_name: str, scope: Scope) -> Optional[ast.expr]:
+        method_node = self._get_method_node_for_scope(scope)
+        if method_node is None:
+            return None
+        args = method_node.args
+        n_defaults = len(args.defaults)
+        n_args = len(args.args)
+        for i, arg in enumerate(args.args):
+            if arg.arg != param_name:
+                continue
+            default_offset = i - (n_args - n_defaults)
+            if default_offset >= 0:
+                return args.defaults[default_offset]
+            return None
+        return None
+
+    def _get_method_node_for_scope(self, scope: Scope):
+        if scope.file is None or scope.cls is None or scope.method is None:
+            return None
+        frontends = getattr(self.table, "_ast_frontends", {}) or {}
+        fe = frontends.get(scope.file)
+        if fe is None:
+            return None
+        return fe._get_method_node(scope.cls, scope.method)
 
     # ------------------------------------------------------------------
     # Cache + recursion guard
