@@ -8065,6 +8065,7 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
     # to a literal attr name, so we synthesise one from the class to keep the child
     # connected (group_<ClassName>).
     class_attrs = {}  # {class_name: {attr_name: class_ref}}
+    torch_native_module_classes = set()  # {"nn.LayerNorm", "nn.Linear", ...}
     # Per-(class, attr) source location: {(cname, attr_name): (fname, lineno)}
     attr_def_loc = {}
     # Track attrs that are LG input sources (LG.feature_column/dense_feature/get_sample_rate/get_bias)
@@ -8441,6 +8442,15 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                     return ast.unparse(_node)
                 except Exception:
                     return ""
+
+            def _detect_torch_native_module_call(_call_node):
+                if not isinstance(_call_node, ast.Call):
+                    return None
+                _func = _call_node.func
+                if isinstance(_func, ast.Attribute) and isinstance(_func.value, ast.Name):
+                    if _func.value.id == "nn" and _func.attr:
+                        return f"nn.{_func.attr}"
+                return None
 
             def _parse_local_ctor_assign(_stmt):
                 if not isinstance(_stmt, ast.Assign) or not isinstance(_stmt.value, ast.Call):
@@ -8868,6 +8878,11 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                         attr_name = _ast_init_item.get("attr")
                         cls_ref_full = _ast_init_item.get("class") or ""
                     cls_ref = cls_ref_full.split('.')[-1]
+                    native_cls_ref = None
+                    if _ast_ctor_assign:
+                        native_cls_ref = _detect_torch_native_module_call(getattr(_local_stmt, "value", None))
+                    elif cls_ref_full.startswith("nn."):
+                        native_cls_ref = cls_ref_full
                     if cls_ref in nn_module_classes:
                         # Iter13 Step1: track conditional attrs regardless of mode.
                         if _active_branch is not None:
@@ -8890,6 +8905,10 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                         if not _skip:
                             attrs[attr_name] = cls_ref
                             attr_def_loc.setdefault((cname, attr_name), (fname, phys_lineno))
+                    elif native_cls_ref:
+                        attrs[attr_name] = native_cls_ref
+                        attr_def_loc.setdefault((cname, attr_name), (fname, phys_lineno))
+                        torch_native_module_classes.add(native_cls_ref)
                     else:
                         # Detect LG input source modules:
                         # LG.feature_column(...), LG.dense_feature(...),
@@ -9673,7 +9692,8 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
     # Build tree using forward() call order + __init__ attrs
     tree = {}
     all_child_classes = set()
-    for cname in nn_module_classes:
+    all_tree_classes = set(nn_module_classes) | set(torch_native_module_classes)
+    for cname in all_tree_classes:
         if cname not in class_attrs:
             class_attrs[cname] = {}
         attrs = class_attrs[cname]
@@ -9697,6 +9717,8 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
         tree[cname] = {"children": children_ordered, "attrs": attrs,
                        "dep_edges": dep_edges.get(cname, []),
                        "dep_edge_locs": dep_edge_locs.get(cname, {}),
+                       "containers": {},
+                       "is_torch_native": cname in torch_native_module_classes,
                        # Iter16: expose dynamic setattr-registered attrs so
                        # downstream scanners (e.g. _scan_root_result_edges)
                        # can fall back to wildcard producers when seeing

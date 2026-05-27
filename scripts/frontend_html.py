@@ -2567,6 +2567,8 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
                 continue
             if c == "__LG_InputSource":
                 continue
+            if isinstance(c, str) and c.startswith("nn."):
+                return True
             return True
         return False
 
