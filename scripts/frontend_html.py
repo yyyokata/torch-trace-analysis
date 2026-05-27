@@ -2708,8 +2708,17 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
                     attr_id_map[attr_name] = ("node", nid)
 
         # Add remaining attrs not called in forward
+        _dep_attrs = {fa for (fa, _) in dep_edge_list} | {ta for (_, ta) in dep_edge_list}
+        _input_consumer_attrs = {ta for (_fa, ta) in _input_consumer_edges}
         for attr_name, child_cls in attrs_filtered.items():
             if attr_name not in seen_attrs:
+                _has_runtime_use = (
+                    attr_name in info.get("first_call_loc", {})
+                    or attr_name in _dep_attrs
+                    or attr_name in _input_consumer_attrs
+                )
+                if not _has_runtime_use:
+                    continue
                 seen_attrs.add(attr_name)
                 child_path = f"{parent_path}.{attr_name}"
                 has_children = _has_real_children(child_cls)
@@ -5202,6 +5211,7 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
                     continue
                 _ev_data = None
                 _loc = None
+                _self_call_hint = _g_self_call_step(attr) if attr else None
                 if attr in g_first_call_loc or attr in g_attr_def_loc:
                     # Iter12-fix2: Rule1b — never point exit-edge evidence at
                     # a constructor (`self.attr = ClassName(`).  Prefer
@@ -5248,6 +5258,8 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
                                 break
                         if _loc is not None:
                             break
+                if _loc is None and _self_call_hint is None:
+                    continue
                 if _loc is not None:
                     _ev_lines_r = source_files.get(_loc[0], [])
                     _ev_data = {"file": _loc[0], "var": f"{attr} → {g_label} output",

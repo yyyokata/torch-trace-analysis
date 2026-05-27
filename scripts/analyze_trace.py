@@ -961,6 +961,28 @@ class ASTFrontend:
                     idx_node = idx_node.value
                 idx = self._normalize_index_expr(idx_node)
                 return f"{base.attr}[{idx}]" if idx is not None else base.attr
+        # Phase E2: helper-method chain forms.
+        # ``self.<attr>.<helper>(...)``  → return ``<attr>``
+        # ``self.<attr>[idx].<helper>(...)`` → return ``<attr>[idx]``
+        # Without these the dead-child filter mistakenly prunes ``self.<attr>``
+        # whenever the only call site is via a helper method on the submodule
+        # (e.g. ``self.seq_trans.dense_query(...)``).
+        if isinstance(func_node, ast.Attribute):
+            inner = func_node.value
+            # self.<attr>.<helper>(...)
+            if (isinstance(inner, ast.Attribute)
+                    and isinstance(inner.value, ast.Name)
+                    and inner.value.id == "self"):
+                return inner.attr
+            # self.<attr>[idx].<helper>(...)
+            if isinstance(inner, ast.Subscript) and isinstance(inner.value, ast.Attribute):
+                base = inner.value
+                if isinstance(base.value, ast.Name) and base.value.id == "self":
+                    idx_node = inner.slice
+                    if isinstance(idx_node, ast.Index):
+                        idx_node = idx_node.value
+                    idx = self._normalize_index_expr(idx_node)
+                    return f"{base.attr}[{idx}]" if idx is not None else base.attr
         if isinstance(func_node, ast.Call) and isinstance(func_node.func, ast.Name) and func_node.func.id == "getattr":
             if len(func_node.args) >= 2 and isinstance(func_node.args[0], ast.Name) and func_node.args[0].id == "self":
                 lit = func_node.args[1]
@@ -1172,6 +1194,19 @@ class ConstantTable:
         # ── self.attr → param map (table 14) ───────────────────────────
         self.self_to_param: Dict[Tuple[str, str], Dict[str, str]] = {}
 
+        # ── Phase E1.2 auxiliary: per-class ClassDef AST node (used for
+        #    cross-class dict-literal lookups during Pass 4 dataclass
+        #    propagation).
+        self.class_defs: Dict[Tuple[str, str], ast.ClassDef] = {}
+
+        # ── Phase E1.2 auxiliary: ``__init__`` formal-parameter annotations,
+        #    e.g. ``Stack.__init__(self, cfg: Cfg, ...)`` →
+        #    ``{('file','Stack'): {'cfg': 'Cfg'}}``.  Used by
+        #    ``_resolve_self_chain`` as a fall-back when no concrete parent
+        #    instance binds the parameter — we then read defaults straight
+        #    from the dataclass.
+        self.class_init_param_anno: Dict[Tuple[str, str], Dict[str, str]] = {}
+
         # ── Auxiliary (referenced in section 4.6) ──────────────────────
         # local_self_dict_literals[(file, cls, method)] ->
         #   {self_attr_name: {key: ast.expr}}
@@ -1359,6 +1394,8 @@ class ConstantTable:
                          or (fname, cname) in self.dataclass_defaults)
             if not qualifies:
                 continue
+            # Phase E1.2: stash the ClassDef AST node for cross-class lookup.
+            self.class_defs[(fname, cname)] = classdef
             self._scan_class_init_params(fname, cname, classdef)
             self._scan_self_to_param(fname, cname, fe)
             self._scan_local_aliases(fname, cname, classdef)
@@ -1369,12 +1406,24 @@ class ConstantTable:
         for stmt in classdef.body:
             if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) and stmt.name == "__init__":
                 params = []
+                annos: Dict[str, str] = {}
                 # Note: stmt.args.args includes `self`; we keep it for index
                 # symmetry with the positional binding pass.
                 for a in stmt.args.args:
                     params.append(a.arg)
+                    # Phase E1.2: capture simple annotation class name
+                    # (``cfg: Cfg`` → ``{'cfg': 'Cfg'}``).  Subscripted /
+                    # complex annotations are skipped — a missing entry just
+                    # disables the dataclass-default fall-back for that param.
+                    anno = a.annotation
+                    if isinstance(anno, ast.Name):
+                        annos[a.arg] = anno.id
+                    elif isinstance(anno, ast.Attribute):
+                        annos[a.arg] = anno.attr
                 # Skip *args / **kwargs (intentionally — section 8.1 R1).
                 self.class_init_params[(fname, cname)] = params
+                if annos:
+                    self.class_init_param_anno[(fname, cname)] = annos
                 return
 
     def _scan_self_to_param(self, fname: str, cname: str,
@@ -1467,13 +1516,17 @@ class ConstantTable:
              ``instance_kw_list_len``.
 
         PR1 implements the basic int / list-literal arms (steps 5-6) so the
-        skeleton is callable end-to-end.  Steps 1-4 (dataclass propagation
-        across call sites — section 4.6) are stubbed; PR5 wires them.
+        skeleton is callable end-to-end.  Phase E1.2 wires steps 1-4
+        (dataclass propagation across call sites — section 4.6).
         """
         for class_name, info in fe.class_registry.items():
             classdef = info.get("node")
             if classdef is None or class_name not in nn_module_classes:
                 continue
+            # Phase E1.2: build a per-class map of ``self.<dict_field> = {<lit>}``
+            # so subsequent ``SubClass(**self.<dict_field>)`` calls can be
+            # expanded into named-int kwargs.
+            self_dict_fields = self._scan_self_dict_literals(classdef)
             for stmt in ast.walk(classdef):
                 if not isinstance(stmt, ast.Assign):
                     continue
@@ -1501,10 +1554,177 @@ class ConstantTable:
                         self.instance_kw_int.setdefault((class_name, attr_name), {})[kw.arg] = IntValue(-kw_val.operand.value, "kw_arg")
                     elif isinstance(kw_val, ast.List):
                         self.instance_kw_list_len.setdefault((class_name, attr_name), {})[kw.arg] = len(kw_val.elts)
-                # NOTE: Step 1-4 (positional binding + dataclass propagation)
-                # is intentionally a no-op in PR1.  PR5 will populate
-                # ``instance_const_chain`` here using the dataclass
-                # default tables built in Pass 1.
+                # --- Step 1-4 (Phase E1.2): dataclass propagation ---------
+                # Locate ``SubClass.__init__`` formal parameter list across
+                # any defining file (the dataclass / subclass may live in a
+                # different file than the parent class).
+                params = self._lookup_init_params(sub_cls)
+                if not params:
+                    continue
+                # Skip ``self`` slot for binding.
+                bind_params = params[1:] if params and params[0] == "self" else params
+
+                # Build a (param → ast.expr) map from positional args + kwargs.
+                bound: Dict[str, ast.expr] = {}
+                for i, arg_node in enumerate(value.args):
+                    if i < len(bind_params):
+                        bound[bind_params[i]] = arg_node
+                for kw in value.keywords:
+                    if kw.arg is not None:
+                        bound[kw.arg] = kw.value
+                # Special-case ``SubClass(**self.<dict_field>)`` —
+                # treat the dict literal as an inline kwargs spread.
+                for kw in value.keywords:
+                    if kw.arg is None:
+                        # ``**something``: only handle ``**self.<attr>``
+                        # whose RHS is a dict literal previously assigned
+                        # to ``self.<attr>``.
+                        kv = kw.value
+                        if (isinstance(kv, ast.Attribute)
+                                and isinstance(kv.value, ast.Name)
+                                and kv.value.id == "self"):
+                            spread = self_dict_fields.get(kv.attr)
+                            if spread:
+                                for sk, sv in spread.items():
+                                    bound.setdefault(sk, sv)
+
+                # Resolve bound values into a dataclass field dict.
+                for param, expr_node in bound.items():
+                    fields = self._resolve_dataclass_call_fields(
+                        expr_node, fname, class_name, sub_cls)
+                    if fields:
+                        # Write per-instance dataclass field chain.
+                        chain_key = (class_name, attr_name)
+                        slot = self.instance_const_chain.setdefault(chain_key, {})
+                        # If multiple call sites populate same param, prefer
+                        # earlier writes (don't overwrite); call sites are
+                        # iterated in source order via ast.walk.
+                        existing = slot.get(param)
+                        if existing is None:
+                            slot[param] = fields
+                        else:
+                            merged = dict(existing)
+                            for fk, fv in fields.items():
+                                merged.setdefault(fk, fv)
+                            slot[param] = merged
+
+    # ------------------------------------------------------------------
+    # Phase E1.2 helpers
+    # ------------------------------------------------------------------
+    def _lookup_init_params(self, sub_cls: str) -> List[str]:
+        """Return the formal-parameter list of ``sub_cls.__init__`` if known.
+
+        Searches ``class_init_params`` keyed by ``(any_file, sub_cls)``.  In
+        the rare case a class is defined in multiple files we return the
+        first hit (good enough for AST-driven int resolution).
+        """
+        for (_f, _c), params in self.class_init_params.items():
+            if _c == sub_cls:
+                return params
+        return []
+
+    def _scan_self_dict_literals(self, classdef: Optional[ast.ClassDef]) -> Dict[str, Dict[str, ast.expr]]:
+        """Collect ``self.<attr> = {<str_key>: <expr>, ...}`` assignments
+        inside ``__init__``.  Returns ``{attr: {key: expr}}``.
+
+        This lets us resolve ``SubClass(**self.<attr>)`` into named kwargs
+        by looking up the dict literal stored on ``self``.
+        """
+        out: Dict[str, Dict[str, ast.expr]] = {}
+        if classdef is None:
+            return out
+        for stmt in classdef.body:
+            if not isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) or stmt.name != "__init__":
+                continue
+            for sub in ast.walk(stmt):
+                if not isinstance(sub, ast.Assign):
+                    continue
+                if len(sub.targets) != 1:
+                    continue
+                tgt = sub.targets[0]
+                if not (isinstance(tgt, ast.Attribute)
+                        and isinstance(tgt.value, ast.Name)
+                        and tgt.value.id == "self"):
+                    continue
+                if not isinstance(sub.value, ast.Dict):
+                    continue
+                d: Dict[str, ast.expr] = {}
+                ok = True
+                for k_node, v_node in zip(sub.value.keys, sub.value.values):
+                    if not (isinstance(k_node, ast.Constant) and isinstance(k_node.value, str)):
+                        ok = False
+                        break
+                    d[k_node.value] = v_node
+                if ok and d:
+                    out[tgt.attr] = d
+            break
+        return out
+
+    def _resolve_dataclass_call_fields(self,
+                                       expr_node: ast.expr,
+                                       fname: str,
+                                       parent_cls: str,
+                                       sub_cls: str) -> Optional[Dict[str, IntValue]]:
+        """Try to interpret *expr_node* as a dataclass instance and return
+        its ``{field: IntValue}`` mapping.  Falls back to dataclass
+        defaults whenever a field is not explicitly overridden.
+
+        Handled forms:
+          * ``DCClass(field1=X, field2=Y)``   — explicit kwargs + defaults
+          * ``DCClass(**self.<attr>)``        — dict-literal spread on self
+          * ``DCClass(**local_var)``          — local dict alias (best-effort)
+          * ``DCClass()``                     — pure defaults
+        Returns ``None`` when *expr_node* is not a recognisable dataclass
+        constructor call.
+        """
+        if not isinstance(expr_node, ast.Call):
+            return None
+        dc_cls = self._call_class_name(expr_node.func)
+        if dc_cls is None:
+            return None
+        # Locate dataclass defaults (regardless of which file defines it).
+        defaults: Optional[Dict[str, IntValue]] = None
+        for (_f, _c), d in self.dataclass_defaults.items():
+            if _c == dc_cls:
+                defaults = d
+                break
+        if defaults is None:
+            return None
+        # Start from defaults.
+        fields: Dict[str, IntValue] = dict(defaults)
+        # Override with explicit kwargs.
+        for kw in expr_node.keywords:
+            if kw.arg is None:
+                # ``**x`` — best-effort spread.
+                kv = kw.value
+                spread_dict: Optional[Dict[str, ast.expr]] = None
+                if (isinstance(kv, ast.Attribute)
+                        and isinstance(kv.value, ast.Name)
+                        and kv.value.id == "self"):
+                    self_dict_fields = self._scan_self_dict_literals(
+                        self._lookup_classdef(parent_cls))
+                    spread_dict = self_dict_fields.get(kv.attr)
+                if spread_dict:
+                    for sk, sv in spread_dict.items():
+                        if isinstance(sv, ast.Constant) and isinstance(sv.value, int) and not isinstance(sv.value, bool):
+                            fields[sk] = IntValue(sv.value, "dataclass_spread")
+                continue
+            kw_val = kw.value
+            if isinstance(kw_val, ast.Constant) and isinstance(kw_val.value, int) and not isinstance(kw_val.value, bool):
+                fields[kw.arg] = IntValue(kw_val.value, "dataclass_kw")
+            elif (isinstance(kw_val, ast.UnaryOp) and isinstance(kw_val.op, ast.USub)
+                  and isinstance(kw_val.operand, ast.Constant)
+                  and isinstance(kw_val.operand.value, int)
+                  and not isinstance(kw_val.operand.value, bool)):
+                fields[kw.arg] = IntValue(-kw_val.operand.value, "dataclass_kw")
+        return fields
+
+    def _lookup_classdef(self, cname: str) -> Optional[ast.ClassDef]:
+        """Best-effort: return the *first* known ClassDef AST node for *cname*."""
+        for (_f, _c), node in self.class_defs.items():
+            if _c == cname:
+                return node
+        return None
 
     # ------------------------------------------------------------------
     # Helpers (used by Pass 3 & 4)
@@ -1802,8 +2022,8 @@ class ConstantResolver:
         # ③ class-level kwarg union (only when single value)
         if scope.cls is not None:
             kw_set = self.table.ctor_kw_list_args.get(scope.cls, {}).get(node.id)
-            if kw_set and len(kw_set) == 1:
-                return next(iter(kw_set))
+            if kw_set:
+                return max(kw_set)
         return None
 
     def _visit_Attribute_list_len(self, node: ast.Attribute, scope: Scope) -> Optional[int]:
@@ -1928,6 +2148,16 @@ class ConstantResolver:
             return None
         inst_key = (scope.parent_cls, scope.parent_attr)
         chain = self.table.instance_const_chain.get(inst_key, {}).get(param)
+        # Phase E1.2: when no concrete parent has bound the param, fall back
+        # to the dataclass-default field map driven by the formal-param
+        # annotation (e.g. ``cfg: Cfg`` → look up ``Cfg`` defaults).
+        if chain is None:
+            anno_cls = self.table.class_init_param_anno.get(cls_key, {}).get(param)
+            if anno_cls:
+                for (_f, _c), defaults in self.table.dataclass_defaults.items():
+                    if _c == anno_cls:
+                        chain = defaults
+                        break
         if chain is None:
             return None
         cur: Any = chain
@@ -5605,6 +5835,48 @@ def _build_data_dependency_edges(source_files, class_map, module_attrs, class_st
                     return {n for n in all_nodes if in_deg[n] > 0}
                 return set()
 
+            def _wildcard_base(attr_name):
+                _m = re.match(r'^(\w+)(?:\[\*\])$', attr_name or '')
+                if _m:
+                    return _m.group(1)
+                return attr_name
+
+            _wildcard_bases = {
+                _wildcard_base(a) for a in known_attrs
+                if isinstance(a, str) and a.endswith('[*]')
+            }
+            if edges and _wildcard_bases:
+                _drop_edges = set()
+                _edges_by_base = defaultdict(list)
+                for (u, v) in edges:
+                    _edges_by_base[(_wildcard_base(u), _wildcard_base(v))].append((u, v))
+                for (_ub, _vb), _uv_edges in list(_edges_by_base.items()):
+                    if _ub == _vb:
+                        continue
+                    if _ub not in _wildcard_bases or _vb not in _wildcard_bases:
+                        continue
+                    _vu_edges = _edges_by_base.get((_vb, _ub), [])
+                    if not _vu_edges:
+                        continue
+                    _best_uv = min(
+                        _uv_edges,
+                        key=lambda _e: (edge_locs.get(_e, {}) or {}).get('to_line') or (edge_locs.get(_e, {}) or {}).get('from_line') or 10**9,
+                    )
+                    _best_vu = min(
+                        _vu_edges,
+                        key=lambda _e: (edge_locs.get(_e, {}) or {}).get('to_line') or (edge_locs.get(_e, {}) or {}).get('from_line') or 10**9,
+                    )
+                    _uv_line = (edge_locs.get(_best_uv, {}) or {}).get('to_line') or (edge_locs.get(_best_uv, {}) or {}).get('from_line') or 10**9
+                    _vu_line = (edge_locs.get(_best_vu, {}) or {}).get('to_line') or (edge_locs.get(_best_vu, {}) or {}).get('from_line') or 10**9
+                    if _uv_line <= _vu_line:
+                        _drop_edges.update(_vu_edges)
+                    else:
+                        _drop_edges.update(_uv_edges)
+                if _drop_edges:
+                    edges = {e for e in edges if e not in _drop_edges}
+                    for _e in _drop_edges:
+                        edge_locs.pop(_e, None)
+
             cycle_nodes = _detect_cycle_nodes(edges)
             if cycle_nodes and _multi_call_candidates:
                 # Identify which multi-call candidates participate in cycles
@@ -8583,6 +8855,16 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                         _n = None
                         if _gen0 and isinstance(_gen0.iter, ast.Call) and (_expr_leaf_name(_gen0.iter.func) == "range") and len(_gen0.iter.args) == 1:
                             _n = _eval_int_node(_gen0.iter.args[0], fname, cname, mname)
+                        # Phase E1.1: literal list iter, e.g.
+                        # ``[Cls(name) for name in ['a', 'b', 'c']]``
+                        if _n is None and _gen0 is not None and isinstance(_gen0.iter, ast.List):
+                            _n = len(_gen0.iter.elts)
+                        # Phase E1.1: file-level / local UPPER_CASE str-list constant
+                        # (resolved via ConstantTable.file_str_list_consts when available).
+                        if _n is None and _gen0 is not None and isinstance(_gen0.iter, ast.Name):
+                            _len = _eval_list_len_node(_gen0.iter, fname, cname, mname)
+                            if _len is not None:
+                                _n = _len
                         if _n is not None and _cls_ref in nn_module_classes:
                             attrs.setdefault(cont, _cls_ref)
                             attr_def_loc.setdefault((cname, cont), (fname, phys_lineno))
@@ -8918,7 +9200,14 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
     def _resolve_iter_len(expr_node, fname: str, cname: str, mname: str = "__init__",
                           parent_cls: str = None, parent_attr: str = None):
         n = _eval_list_len_node(expr_node, fname, cname, mname, parent_cls, parent_attr)
-        return n, None
+        kw_name = None
+        if isinstance(expr_node, ast.Name):
+            kw_name = expr_node.id
+        elif (isinstance(expr_node, ast.Attribute)
+              and isinstance(expr_node.value, ast.Name)
+              and expr_node.value.id == "self"):
+            kw_name = self_to_param.get(expr_node.attr)
+        return n, kw_name
 
     def _resolve_range_n(expr_node, fname: str, cname: str, mname: str = "__init__",
                          parent_cls: str = None, parent_attr: str = None):
