@@ -105,10 +105,27 @@ USE_NEW_EVAL: bool = True
 # explicit entries.
 _AB_EVAL_DIFFS: list = []
 
+import torch.nn as _torch_nn
 
-def _ab_summary():
-    """Return an empty A/B summary placeholder kept for CLI compatibility."""
-    return 0, 0, []
+# PyTorch 内置容器类（无独立 forward 数据流，不作为 leaf stub）
+_NATIVE_CONTAINER_NAMES: frozenset = frozenset({
+    'ModuleDict', 'ModuleList', 'Sequential',
+    'ParameterDict', 'ParameterList',
+})
+
+def _is_nn_leaf_stub(class_name: str) -> bool:
+    """True iff nn.<class_name> 是叶子计算 Module（非容器、且是 nn.Module 子类）。
+    用于动态判断 native stub 是否应加入 torch_native_module_classes。
+    """
+    if class_name in _NATIVE_CONTAINER_NAMES:
+        return False
+    cls = getattr(_torch_nn, class_name, None)
+    if cls is None:
+        return False
+    try:
+        return issubclass(cls, _torch_nn.Module)
+    except TypeError:
+        return False
 
 
 class ASTFrontend:
@@ -1594,10 +1611,15 @@ class ConstantTable:
             classdef = info.get("node")
             if classdef is None or class_name not in nn_module_classes:
                 continue
-            # Phase E1.2: build a per-class map of ``self.<dict_field> = {<lit>}``
-            # so subsequent ``SubClass(**self.<dict_field>)`` calls can be
-            # expanded into named-int kwargs.
-            self_dict_fields = self._scan_self_dict_literals(classdef)
+            # Phase E1.2: collect per-class map of ``self.<dict_field> = {<lit>}``
+            # from the already-populated ``local_self_dict_literals`` cache
+            # (populated by _scan_self_dict_literals during _pass3_class_chains).
+            # Merge all methods of this class into a flat {attr_name: {str: expr}} map.
+            self_dict_fields: Dict[str, Dict[str, ast.expr]] = {}
+            for (sf, sc, _sm), method_dicts in self.local_self_dict_literals.items():
+                if sf == fname and sc == class_name:
+                    for attr, entries in method_dicts.items():
+                        self_dict_fields.setdefault(attr, {}).update(entries)
             for stmt in ast.walk(classdef):
                 if not isinstance(stmt, ast.Assign):
                     continue
@@ -8443,15 +8465,6 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                 except Exception:
                     return ""
 
-            def _detect_torch_native_module_call(_call_node):
-                if not isinstance(_call_node, ast.Call):
-                    return None
-                _func = _call_node.func
-                if isinstance(_func, ast.Attribute) and isinstance(_func.value, ast.Name):
-                    if _func.value.id == "nn" and _func.attr:
-                        return f"nn.{_func.attr}"
-                return None
-
             def _parse_local_ctor_assign(_stmt):
                 if not isinstance(_stmt, ast.Assign) or not isinstance(_stmt.value, ast.Call):
                     return None
@@ -8879,10 +8892,10 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                         cls_ref_full = _ast_init_item.get("class") or ""
                     cls_ref = cls_ref_full.split('.')[-1]
                     native_cls_ref = None
-                    if _ast_ctor_assign:
-                        native_cls_ref = _detect_torch_native_module_call(getattr(_local_stmt, "value", None))
-                    elif cls_ref_full.startswith("nn."):
-                        native_cls_ref = cls_ref_full
+                    if cls_ref_full.startswith("nn."):
+                        _nn_short = cls_ref_full.split(".", 1)[1]  # e.g. "Linear", "ModuleDict"
+                        if _is_nn_leaf_stub(_nn_short):
+                            native_cls_ref = cls_ref_full
                     if cls_ref in nn_module_classes:
                         # Iter13 Step1: track conditional attrs regardless of mode.
                         if _active_branch is not None:
