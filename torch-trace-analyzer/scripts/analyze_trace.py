@@ -12,7 +12,7 @@ import argparse
 import subprocess
 import textwrap
 import tokenize
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 # ---------------------------------------------------------------------------
 # Module identity registration.
@@ -1849,6 +1849,32 @@ class ConstantResolver:
         # cost while remaining stable for the lifetime of the table (section
         # 3.3, R2).
         self._eval_cache: Dict[Tuple[Any, ...], Any] = {}
+        self.fail_reasons: Counter[str] = Counter()
+        self.fail_samples: Dict[str, List[str]] = defaultdict(list)
+
+    def _fail(self, reason: str, node: Optional[ast.AST] = None, scope: Optional[Scope] = None) -> None:
+        allowed = {
+            "name_unresolved",
+            "param_unbound",
+            "call_not_constant",
+            "list_len_unsupported_expr",
+            "alias_unresolved",
+            "annotation_not_value",
+        }
+        if reason not in allowed:
+            reason = "list_len_unsupported_expr"
+        self.fail_reasons[reason] += 1
+        samples = self.fail_samples[reason]
+        if len(samples) < 5:
+            node_desc = type(node).__name__ if node is not None else "<none>"
+            scope_desc = ""
+            if scope is not None:
+                scope_desc = f"{scope.file}:{scope.cls}.{scope.method}:{scope.parent_cls}.{scope.parent_attr}"
+            samples.append(f"{node_desc}@{scope_desc}")
+        return None
+
+    def get_fail_reason_counts(self) -> Dict[str, int]:
+        return dict(self.fail_reasons)
 
     # ------------------------------------------------------------------
     # Public API
@@ -1978,20 +2004,32 @@ class ConstantResolver:
             return self._visit_UnaryOp_int(node, scope)
         if isinstance(node, ast.Call):
             return self._visit_Call_int(node, scope)
-        return None
+        return self._fail("list_len_unsupported_expr", node, scope)
 
     def _visit_Constant_int(self, node: ast.Constant, scope: Scope) -> Optional[IntValue]:
         if isinstance(node.value, int) and not isinstance(node.value, bool):
             return IntValue(node.value, "literal")
-        return None
+        return self._fail("list_len_unsupported_expr", node, scope)
+
+    def _method_param_has_annotation(self, param_name: str, scope: Scope) -> bool:
+        method_node = self._get_method_node_for_scope(scope)
+        if method_node is None:
+            return False
+        for arg in method_node.args.args:
+            if arg.arg == param_name:
+                return arg.annotation is not None
+        return False
 
     def _visit_Name_int(self, node: ast.Name, scope: Scope) -> Optional[IntValue]:
         # ① Method-local alias chain.
         resolved_alias = self._resolve_alias_chain(node, scope.method_key)
-        if resolved_alias is not None and resolved_alias is not node:
+        if resolved_alias is None:
+            return self._fail("alias_unresolved", node, scope)
+        if resolved_alias is not node:
             sub = self.eval_int(resolved_alias, scope)
             if sub is not None:
                 return IntValue(sub.value, "alias")
+            return self._fail("alias_unresolved", node, scope)
         # ② File-level constant.
         file_consts = self.table.file_int_consts.get(scope.file, {})
         if node.id in file_consts:
@@ -2014,7 +2052,10 @@ class ConstantResolver:
                 kw_set = self.table.ctor_kw_args.get(scope.cls, {}).get(node.id)
                 if kw_set and len(kw_set) == 1:
                     return next(iter(kw_set))
-        return None
+                if self._method_param_has_annotation(node.id, scope):
+                    return self._fail("annotation_not_value", node, scope)
+                return self._fail("param_unbound", node, scope)
+        return self._fail("name_unresolved", node, scope)
 
     def _visit_Attribute_int(self, node: ast.Attribute, scope: Scope) -> Optional[IntValue]:
         chain = self._flatten_attr_chain(node)
@@ -2099,7 +2140,7 @@ class ConstantResolver:
             return self.eval_int(arg, scope)
         # Dataclass(...) — section 4.2 says return None for int kind (the
         # caller should use eval_dataclass_fields instead).
-        return None
+        return self._fail("call_not_constant", node, scope)
 
     # ------------------------------------------------------------------
     # list_len dispatcher
@@ -2118,8 +2159,8 @@ class ConstantResolver:
         if isinstance(node, ast.Starred):
             return self._visit_Starred_list_len(node, scope)
         if isinstance(node, ast.Call):
-            return None  # only int-returning calls are handled
-        return None
+            return self._fail("call_not_constant", node, scope)  # only int-returning calls are handled
+        return self._fail("list_len_unsupported_expr", node, scope)
 
     def _visit_List_list_len(self, node: ast.List, scope: Scope) -> Optional[int]:
         total = 0
@@ -2158,8 +2199,13 @@ class ConstantResolver:
     def _visit_Name_list_len(self, node: ast.Name, scope: Scope) -> Optional[int]:
         # ① local alias → recurse on its final RHS
         resolved_alias = self._resolve_alias_chain(node, scope.method_key)
-        if resolved_alias is not None and resolved_alias is not node:
-            return self.eval_list_len(resolved_alias, scope)
+        if resolved_alias is None:
+            return self._fail("alias_unresolved", node, scope)
+        if resolved_alias is not node:
+            n = self.eval_list_len(resolved_alias, scope)
+            if n is not None:
+                return n
+            return self._fail("alias_unresolved", node, scope)
         # ② file-level str-list literal
         file_lists = self.table.file_str_list_consts.get(scope.file, {})
         if node.id in file_lists:
@@ -2176,12 +2222,15 @@ class ConstantResolver:
                     inst_lens = self.table.instance_kw_list_len.get(inst_key, {})
                     if node.id in inst_lens:
                         return inst_lens[node.id]
-            kw_set = self.table.ctor_kw_list_args.get(scope.cls, {}).get(node.id)
-            if kw_set:
-                # Phase E1.2: when multiple list lengths exist across instances,
-                # pick the maximum as a conservative upper bound (section 4.4).
-                return max(kw_set)
-        return None
+                kw_set = self.table.ctor_kw_list_args.get(scope.cls, {}).get(node.id)
+                if kw_set:
+                    # Phase E1.2: when multiple list lengths exist across instances,
+                    # pick the maximum as a conservative upper bound (section 4.4).
+                    return max(kw_set)
+                if self._method_param_has_annotation(node.id, scope):
+                    return self._fail("annotation_not_value", node, scope)
+                return self._fail("param_unbound", node, scope)
+        return self._fail("name_unresolved", node, scope)
 
     def _visit_Attribute_list_len(self, node: ast.Attribute, scope: Scope) -> Optional[int]:
         chain = self._flatten_attr_chain(node)
@@ -2196,11 +2245,11 @@ class ConstantResolver:
             if n is not None:
                 return n
         if len(attrs) != 1:
-            return None
+            return self._fail("list_len_unsupported_expr", node, scope)
         cls_key = (scope.file, scope.cls)
         param = self.table.self_to_param.get(cls_key, {}).get(attrs[0])
         if param is None:
-            return None
+            return self._fail("name_unresolved", node, scope)
         # Per-instance overrides class-level.
         inst_key = (scope.parent_cls, scope.parent_attr)
         inst_lens = self.table.instance_kw_list_len.get(inst_key, {})
@@ -2209,7 +2258,7 @@ class ConstantResolver:
         kw_set = self.table.ctor_kw_list_args.get(scope.cls, {}).get(param)
         if kw_set and len(kw_set) == 1:
             return next(iter(kw_set))
-        return None
+        return self._fail("param_unbound", node, scope)
 
     def _visit_BinOp_list_len(self, node: ast.BinOp, scope: Scope) -> Optional[int]:
         if isinstance(node.op, ast.Add):
