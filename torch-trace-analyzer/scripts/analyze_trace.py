@@ -1066,6 +1066,168 @@ class ASTFrontend:
         self._constant_table_cache[key] = table
         return table
 
+    def parse_local_stmt(self, line: str):
+        text = (line or "").strip()
+        if not text:
+            return None
+        try:
+            mod = ast.parse(text)
+        except Exception:
+            return None
+        if len(mod.body) != 1:
+            return None
+        return mod.body[0]
+
+    def _expr_leaf_name(self, node):
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            base = self._expr_leaf_name(node.value)
+            return (base + "." if base else "") + node.attr
+        return None
+
+    def _local_node_to_text(self, node):
+        # Local snippet nodes are parsed from standalone logical lines, so their
+        # coordinates point into the snippet rather than the full source file.
+        # Use ast.unparse instead of _node_to_text to avoid source-slice drift.
+        try:
+            return ast.unparse(node)
+        except Exception:
+            return ""
+
+    def parse_local_ctor_assign(self, stmt):
+        if not isinstance(stmt, ast.Assign) or not isinstance(stmt.value, ast.Call):
+            return None
+        target = stmt.targets[0] if len(stmt.targets) == 1 else None
+        if target is None:
+            return None
+        attr = self._extract_self_attr_name(target)
+        if not attr:
+            return None
+        return {
+            "attr": attr,
+            "class_full": self._local_node_to_text(stmt.value.func),
+            "kwargs": {kw.arg: self._local_node_to_text(kw.value) for kw in stmt.value.keywords if kw.arg is not None},
+        }
+
+    def parse_local_lg_assign(self, stmt):
+        if not isinstance(stmt, ast.Assign) or not isinstance(stmt.value, ast.Call):
+            return None
+        target = stmt.targets[0] if len(stmt.targets) == 1 else None
+        if target is None:
+            return None
+        attr = self._extract_self_attr_name(target)
+        if not attr:
+            return None
+        func_text = self._local_node_to_text(stmt.value.func)
+        if func_text in {
+            "LG.feature_column", "LG.dense_feature", "LG.get_sample_rate", "LG.get_bias"
+        }:
+            return {"attr": attr}
+        return None
+
+    def parse_local_fc_get_vector_assign(self, stmt):
+        if not isinstance(stmt, ast.Assign) or not isinstance(stmt.value, ast.Call):
+            return None
+        target = stmt.targets[0] if len(stmt.targets) == 1 else None
+        if target is None:
+            return None
+        attr = self._extract_self_attr_name(target)
+        if not attr:
+            return None
+        func = stmt.value.func
+        if not (isinstance(func, ast.Attribute) and func.attr == "get_vector"):
+            return None
+        owner = func.value
+        if not isinstance(owner, ast.Subscript):
+            return None
+        owner_text = self._local_node_to_text(owner.value).strip()
+        if not re.search(r'(?:^|_)(?:dict|fc)\w*$', owner_text) and not re.search(r'(?:dict|fc)', owner_text):
+            return None
+        return {"attr": attr}
+
+    def parse_local_container_ctor(self, stmt):
+        if not isinstance(stmt, ast.Assign) or not isinstance(stmt.value, ast.Call):
+            return None
+        target = stmt.targets[0] if len(stmt.targets) == 1 else None
+        if target is None:
+            return None
+        attr = self._extract_self_attr_name(target)
+        if not attr:
+            return None
+        func_leaf = (self._expr_leaf_name(stmt.value.func) or "").split(".")[-1]
+        if func_leaf not in {"ModuleList", "ModuleDict"}:
+            return None
+        return {"attr": attr, "kind": func_leaf, "call": stmt.value}
+
+    def parse_local_append_ctor(self, stmt):
+        if not isinstance(stmt, ast.Expr) or not isinstance(stmt.value, ast.Call):
+            return None
+        call = stmt.value
+        if not isinstance(call.func, ast.Attribute) or call.func.attr != "append":
+            return None
+        owner = call.func.value
+        if not (isinstance(owner, ast.Attribute) and isinstance(owner.value, ast.Name) and owner.value.id == "self"):
+            return None
+        if len(call.args) != 1 or not isinstance(call.args[0], ast.Call):
+            return None
+        return {
+            "attr": owner.attr,
+            "class_full": self._local_node_to_text(call.args[0].func),
+        }
+
+    def parse_local_subscript_ctor(self, stmt):
+        if not isinstance(stmt, ast.Assign) or not isinstance(stmt.value, ast.Call):
+            return None
+        target = stmt.targets[0] if len(stmt.targets) == 1 else None
+        if not isinstance(target, ast.Subscript):
+            return None
+        owner = target.value
+        if not (isinstance(owner, ast.Attribute) and isinstance(owner.value, ast.Name) and owner.value.id == "self"):
+            return None
+        return {
+            "attr": owner.attr,
+            "key_expr": self._local_node_to_text(target.slice),
+            "class_full": self._local_node_to_text(stmt.value.func),
+        }
+
+    def parse_local_var_ctor(self, stmt):
+        if not isinstance(stmt, ast.Assign) or not isinstance(stmt.value, ast.Call):
+            return None
+        target = stmt.targets[0] if len(stmt.targets) == 1 else None
+        if not isinstance(target, ast.Name):
+            return None
+        return {
+            "name": target.id,
+            "class_full": self._local_node_to_text(stmt.value.func),
+        }
+
+    def parse_local_setattr_ctor(self, stmt):
+        if not isinstance(stmt, ast.Expr) or not isinstance(stmt.value, ast.Call):
+            return None
+        call = stmt.value
+        func_name = self._expr_leaf_name(call.func)
+        if func_name != "setattr" or len(call.args) != 3:
+            return None
+        owner = call.args[0]
+        if not (isinstance(owner, ast.Name) and owner.id == "self"):
+            return None
+        name_expr = self._local_node_to_text(call.args[1]).strip()
+        value = call.args[2]
+        if isinstance(value, ast.Call):
+            return {
+                "name_expr": name_expr,
+                "class_full": self._local_node_to_text(value.func),
+                "two_step": False,
+            }
+        if isinstance(value, ast.Name):
+            return {
+                "name_expr": name_expr,
+                "local_var": value.id,
+                "two_step": True,
+            }
+        return None
+
 
 
 
@@ -8846,173 +9008,11 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
             # {var_name: list[str]}
             _local_var_str_list: dict = {}
 
-            def _parse_local_stmt(_line: str):
-                _text = (_line or "").strip()
-                if not _text:
-                    return None
-                try:
-                    _mod = ast.parse(_text)
-                except Exception:
-                    return None
-                if len(_mod.body) != 1:
-                    return None
-                return _mod.body[0]
-
-            def _expr_leaf_name(_node):
-                if isinstance(_node, ast.Name):
-                    return _node.id
-                if isinstance(_node, ast.Attribute):
-                    return (_expr_leaf_name(_node.value) + "." if _expr_leaf_name(_node.value) else "") + _node.attr
-                return None
-
             def _self_attr_from_target(_target):
                 return _fe._extract_self_attr_name(_target) if _fe else None
 
             def _node_to_text(_node):
-                # IMPORTANT: nodes here come from `_parse_local_stmt(line)` which
-                # parses the joined logical line as a *standalone* tiny source
-                # snippet. Their (lineno, col_offset) point into that snippet,
-                # NOT into the file. If we delegated to `_fe._node_to_text` it
-                # would use the file's `_line_starts` and slice wildly wrong
-                # bytes (e.g. returning `'ogging\\nimpo'` for `DenseTower`).
-                # Always use ast.unparse here — it is position-independent.
-                try:
-                    return ast.unparse(_node)
-                except Exception:
-                    return ""
-
-            def _parse_local_ctor_assign(_stmt):
-                if not isinstance(_stmt, ast.Assign) or not isinstance(_stmt.value, ast.Call):
-                    return None
-                _target = _stmt.targets[0] if len(_stmt.targets) == 1 else None
-                if _target is None:
-                    return None
-                _attr = _self_attr_from_target(_target)
-                if not _attr:
-                    return None
-                return {
-                    "attr": _attr,
-                    "class_full": _node_to_text(_stmt.value.func),
-                    "kwargs": {kw.arg: _node_to_text(kw.value) for kw in _stmt.value.keywords if kw.arg is not None},
-                }
-
-            def _parse_local_lg_assign(_stmt):
-                if not isinstance(_stmt, ast.Assign) or not isinstance(_stmt.value, ast.Call):
-                    return None
-                _target = _stmt.targets[0] if len(_stmt.targets) == 1 else None
-                if _target is None:
-                    return None
-                _attr = _self_attr_from_target(_target)
-                if not _attr:
-                    return None
-                _func_text = _node_to_text(_stmt.value.func)
-                if _func_text in {
-                    "LG.feature_column", "LG.dense_feature", "LG.get_sample_rate", "LG.get_bias"
-                }:
-                    return {"attr": _attr}
-                return None
-
-            def _parse_local_fc_get_vector_assign(_stmt):
-                if not isinstance(_stmt, ast.Assign) or not isinstance(_stmt.value, ast.Call):
-                    return None
-                _target = _stmt.targets[0] if len(_stmt.targets) == 1 else None
-                if _target is None:
-                    return None
-                _attr = _self_attr_from_target(_target)
-                if not _attr:
-                    return None
-                _func = _stmt.value.func
-                if not (isinstance(_func, ast.Attribute) and _func.attr == "get_vector"):
-                    return None
-                _owner = _func.value
-                if not isinstance(_owner, ast.Subscript):
-                    return None
-                _owner_text = _node_to_text(_owner.value).strip()
-                if not re.search(r'(?:^|_)(?:dict|fc)\w*$', _owner_text) and not re.search(r'(?:dict|fc)', _owner_text):
-                    return None
-                return {"attr": _attr}
-
-            def _parse_local_container_ctor(_stmt):
-                if not isinstance(_stmt, ast.Assign) or not isinstance(_stmt.value, ast.Call):
-                    return None
-                _target = _stmt.targets[0] if len(_stmt.targets) == 1 else None
-                if _target is None:
-                    return None
-                _attr = _self_attr_from_target(_target)
-                if not _attr:
-                    return None
-                _func_leaf = (_expr_leaf_name(_stmt.value.func) or "").split(".")[-1]
-                if _func_leaf not in {"ModuleList", "ModuleDict"}:
-                    return None
-                return {"attr": _attr, "kind": _func_leaf, "call": _stmt.value}
-
-            def _parse_local_append_ctor(_stmt):
-                if not isinstance(_stmt, ast.Expr) or not isinstance(_stmt.value, ast.Call):
-                    return None
-                _call = _stmt.value
-                if not isinstance(_call.func, ast.Attribute) or _call.func.attr != "append":
-                    return None
-                _owner = _call.func.value
-                if not (isinstance(_owner, ast.Attribute) and isinstance(_owner.value, ast.Name) and _owner.value.id == "self"):
-                    return None
-                if len(_call.args) != 1 or not isinstance(_call.args[0], ast.Call):
-                    return None
-                return {
-                    "attr": _owner.attr,
-                    "class_full": _node_to_text(_call.args[0].func),
-                }
-
-            def _parse_local_subscript_ctor(_stmt):
-                if not isinstance(_stmt, ast.Assign) or not isinstance(_stmt.value, ast.Call):
-                    return None
-                _target = _stmt.targets[0] if len(_stmt.targets) == 1 else None
-                if not isinstance(_target, ast.Subscript):
-                    return None
-                _owner = _target.value
-                if not (isinstance(_owner, ast.Attribute) and isinstance(_owner.value, ast.Name) and _owner.value.id == "self"):
-                    return None
-                return {
-                    "attr": _owner.attr,
-                    "key_expr": _node_to_text(_target.slice),
-                    "class_full": _node_to_text(_stmt.value.func),
-                }
-
-            def _parse_local_var_ctor(_stmt):
-                if not isinstance(_stmt, ast.Assign) or not isinstance(_stmt.value, ast.Call):
-                    return None
-                _target = _stmt.targets[0] if len(_stmt.targets) == 1 else None
-                if not isinstance(_target, ast.Name):
-                    return None
-                return {
-                    "name": _target.id,
-                    "class_full": _node_to_text(_stmt.value.func),
-                }
-
-            def _parse_local_setattr_ctor(_stmt):
-                if not isinstance(_stmt, ast.Expr) or not isinstance(_stmt.value, ast.Call):
-                    return None
-                _call = _stmt.value
-                _func_name = _expr_leaf_name(_call.func)
-                if _func_name != "setattr" or len(_call.args) != 3:
-                    return None
-                _owner = _call.args[0]
-                if not (isinstance(_owner, ast.Name) and _owner.id == "self"):
-                    return None
-                _name_expr = _node_to_text(_call.args[1]).strip()
-                _value = _call.args[2]
-                if isinstance(_value, ast.Call):
-                    return {
-                        "name_expr": _name_expr,
-                        "class_full": _node_to_text(_value.func),
-                        "two_step": False,
-                    }
-                if isinstance(_value, ast.Name):
-                    return {
-                        "name_expr": _name_expr,
-                        "local_var": _value.id,
-                        "two_step": True,
-                    }
-                return None
+                return _fe._local_node_to_text(_node) if _fe else ""
 
             for phys_lineno, line in logical_lines:
                 # Iter11: track indent of this logical line (use raw source line)
@@ -9027,7 +9027,7 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                 # call site.
                 if line.lstrip().startswith('#'):
                     continue
-                _local_stmt = _parse_local_stmt(line)
+                _local_stmt = _fe.parse_local_stmt(line) if _fe else None
                 # Pop loops whose indent is >= current indent (we left their body)
                 while _loop_indent_stack and _cur_indent <= _loop_indent_stack[-1][0]:
                     _, _popped_var = _loop_indent_stack.pop()
@@ -9262,7 +9262,7 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
 
                 _ast_init_item = _ast_init_assignments_by_line.get(phys_lineno)
 
-                _ast_ctor_assign = _parse_local_ctor_assign(_local_stmt)
+                _ast_ctor_assign = _fe.parse_local_ctor_assign(_local_stmt) if _fe else None
                 if _ast_ctor_assign:
                     _ctor_attr = _ast_ctor_assign.get("attr")
                     _cls_full = _ast_ctor_assign.get("class_full") or ""
@@ -9342,7 +9342,7 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                         # Detect LG input source modules:
                         # LG.feature_column(...), LG.dense_feature(...),
                         # LG.get_sample_rate(...), LG.get_bias(...)
-                        _ast_lg = _parse_local_lg_assign(_local_stmt)
+                        _ast_lg = _fe.parse_local_lg_assign(_local_stmt) if _fe else None
                         if _ast_lg:
                             attr_name = _ast_lg.get("attr")
                             attrs[attr_name] = "__LG_InputSource"
@@ -9351,7 +9351,7 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
 
                 # Detect fc_dict[...].get_vector(...) assigned to self.xxx
                 # Pattern: self.xxx = fc_dict[slot].get_vector(...) or similar
-                _ast_fc_gv = _parse_local_fc_get_vector_assign(_local_stmt)
+                _ast_fc_gv = _fe.parse_local_fc_get_vector_assign(_local_stmt) if _fe else None
                 if _ast_fc_gv:
                     attr_name = _ast_fc_gv.get("attr")
                     if attr_name not in attrs:
@@ -9359,7 +9359,7 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                         attr_def_loc.setdefault((cname, attr_name), (fname, phys_lineno))
                         input_source_attrs[cname].add(attr_name)
 
-                _ast_container_ctor = _parse_local_container_ctor(_local_stmt)
+                _ast_container_ctor = _fe.parse_local_container_ctor(_local_stmt) if _fe else None
                 if _ast_container_ctor and _ast_container_ctor.get("kind") == "ModuleList":
                     cont = _ast_container_ctor.get("attr")
                     _record_container_kind(cname, cont, "ModuleList")
@@ -9370,7 +9370,7 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                         _gen0 = _generators[0] if len(_generators) == 1 else None
                         _cls_ref = _node_to_text(_arg0.elt.func).split('.')[-1]
                         _n = None
-                        if _gen0 and isinstance(_gen0.iter, ast.Call) and (_expr_leaf_name(_gen0.iter.func) == "range") and len(_gen0.iter.args) == 1:
+                        if _gen0 and isinstance(_gen0.iter, ast.Call) and (_fe._expr_leaf_name(_gen0.iter.func) == "range") and len(_gen0.iter.args) == 1:
                             _n = _eval_int_node(_gen0.iter.args[0], fname, cname, mname, parent_cls=preferred_root, parent_attr='stack')
                         # Phase E1.1: literal list iter, e.g.
                         # ``[Cls(name) for name in ['a', 'b', 'c']]``
@@ -9413,7 +9413,7 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                                 attr_def_loc.setdefault((cname, cont), (fname, phys_lineno))
                                 _ensure_elem(cont, cname, _elem_attr_dict(cont, k), cls_ref, fname, phys_lineno, attrs)
                 # ModuleList append: self.xxx.append(ClassName(...))
-                _ast_append_ctor = _parse_local_append_ctor(_local_stmt)
+                _ast_append_ctor = _fe.parse_local_append_ctor(_local_stmt) if _fe else None
                 if _ast_append_ctor:
                     attr_name = _ast_append_ctor.get("attr")
                     cls_ref_full = _ast_append_ctor.get("class_full") or ""
@@ -9429,7 +9429,7 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                         # this attr, fall back to ``list`` (could be plain list of Modules).
                         _record_container_kind(cname, attr_name, "list")
                 # ModuleDict / list assignment: self.xxx[key] = ClassName(...)
-                _ast_subscript_ctor = _parse_local_subscript_ctor(_local_stmt)
+                _ast_subscript_ctor = _fe.parse_local_subscript_ctor(_local_stmt) if _fe else None
                 if _ast_subscript_ctor:
                     attr_name = _ast_subscript_ctor.get("attr")
                     key_expr = _ast_subscript_ctor.get("key_expr") or ""
@@ -9488,7 +9488,7 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                 #     combine_tower = DenseTower(...)
                 #     setattr(self, f"combine_tower_mha_{name}", combine_tower)
                 # is treated as a direct setattr-with-ctor.
-                _ast_local_ctor = _parse_local_var_ctor(_local_stmt)
+                _ast_local_ctor = _fe.parse_local_var_ctor(_local_stmt) if _fe else None
                 if _ast_local_ctor:
                     _lv_name = _ast_local_ctor.get("name")
                     _lv_cls = (_ast_local_ctor.get("class_full") or "").split('.')[-1]
@@ -9510,7 +9510,7 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                 # Iter16: also support the two-step pattern where the third
                 # argument is a bare local variable previously assigned via
                 # `<var> = ClassName(...)` (see _local_var_ctor above).
-                _ast_setattr_ctor = _parse_local_setattr_ctor(_local_stmt)
+                _ast_setattr_ctor = _fe.parse_local_setattr_ctor(_local_stmt) if _fe else None
                 _is_two_step = False
                 if _ast_setattr_ctor:
                     name_expr = (_ast_setattr_ctor.get("name_expr") or "").strip()
