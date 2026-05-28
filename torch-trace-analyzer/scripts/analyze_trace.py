@@ -1228,8 +1228,8 @@ class ConstantTable:
 
         # ── Annotation fallback is forbidden: when a parameter cannot be
         #    resolved from concrete caller/default semantics, resolvers must
-        #    conservatively return ``None`` instead of guessing from type
-        #    annotations.
+        #    conservatively return ``None``. Type annotations are metadata only;
+        #    they must never be used to infer runtime values.
         # ── Auxiliary (referenced in section 4.6) ──────────────────────
         # local_self_dict_literals[(file, cls, method)] ->
         #   {self_attr_name: {key: ast.expr}}
