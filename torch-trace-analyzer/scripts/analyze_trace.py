@@ -1226,13 +1226,10 @@ class ConstantTable:
         #    propagation).
         self.class_defs: Dict[Tuple[str, str], ast.ClassDef] = {}
 
-        # ── Phase E1.2 auxiliary: ``__init__`` formal-parameter annotations,
-        #    e.g. ``Stack.__init__(self, cfg: Cfg, ...)`` →
-        #    ``{('file','Stack'): {'cfg': 'Cfg'}}``.  Used by
-        #    ``_resolve_self_chain`` as a fall-back when no concrete parent
-        #    instance binds the parameter — we then read defaults straight
-        #    from the dataclass.
-        self.class_init_param_anno: Dict[Tuple[str, str], Dict[str, str]] = {}
+        # ── Annotation fallback is forbidden: when a parameter cannot be
+        #    resolved from concrete caller/default semantics, resolvers must
+        #    conservatively return ``None`` instead of guessing from type
+        #    annotations.
         # ── Auxiliary (referenced in section 4.6) ──────────────────────
         # local_self_dict_literals[(file, cls, method)] ->
         #   {self_attr_name: {key: ast.expr}}
@@ -1435,24 +1432,12 @@ class ConstantTable:
         for stmt in classdef.body:
             if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) and stmt.name == "__init__":
                 params = []
-                annos: Dict[str, str] = {}
                 # Note: stmt.args.args includes `self`; we keep it for index
                 # symmetry with the positional binding pass.
                 for a in stmt.args.args:
                     params.append(a.arg)
-                    # Phase E1.2: capture simple annotation class name
-                    # (``cfg: Cfg`` → ``{'cfg': 'Cfg'}``).  Subscripted /
-                    # complex annotations are skipped — a missing entry just
-                    # disables the dataclass-default fall-back for that param.
-                    anno = a.annotation
-                    if isinstance(anno, ast.Name):
-                        annos[a.arg] = anno.id
-                    elif isinstance(anno, ast.Attribute):
-                        annos[a.arg] = anno.attr
                 # Skip *args / **kwargs (intentionally — section 8.1 R1).
                 self.class_init_params[(fname, cname)] = params
-                if annos:
-                    self.class_init_param_anno[(fname, cname)] = annos
                 return
 
     def _scan_self_to_param(self, fname: str, cname: str,
