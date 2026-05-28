@@ -8726,6 +8726,8 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
         if len(_lists) == 1:
             _global_str_lists_unique[_name] = list(next(iter(_lists)))
 
+    _str_list_resolve_cache = {}
+
     def _resolve_str_list(expr: str, fname: str, cname: str,
                           loop_var_to_str_items: dict):
         """Iter13 Step2 + Phase B: iterative multi-step string-list resolver.
@@ -8736,7 +8738,14 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
           4. file-level / global UPPER_CASE str-list constant
           5. bare Name / dotted attribute → None (unresolvable)
         """
-        return _resolve_str_list_iterative(
+        _loop_key = tuple(
+            sorted((str(k), tuple(v or ())) for k, v in (loop_var_to_str_items or {}).items())
+        )
+        _cache_key = (expr, fname, cname, _loop_key, conditional_mode)
+        if _cache_key in _str_list_resolve_cache:
+            _cached_keys = _str_list_resolve_cache[_cache_key]
+            return list(_cached_keys) if _cached_keys is not None else None
+        _resolved = _resolve_str_list_iterative(
             expr=expr,
             fname=fname,
             cname=cname,
@@ -8748,6 +8757,8 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
             conditional_mode=conditional_mode,
             _global_str_lists_unique=_global_str_lists_unique,
         )
+        _str_list_resolve_cache[_cache_key] = tuple(_resolved) if _resolved is not None else None
+        return list(_resolved) if _resolved is not None else None
 
     for (fname, cname), info in class_map.items():
         if cname not in nn_module_classes:
