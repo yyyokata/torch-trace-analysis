@@ -1141,8 +1141,14 @@ class ASTFrontend:
         owner = func.value
         if not isinstance(owner, ast.Subscript):
             return None
-        owner_text = self._local_node_to_text(owner.value).strip()
-        if not re.search(r'(?:^|_)(?:dict|fc)\w*$', owner_text) and not re.search(r'(?:dict|fc)', owner_text):
+        owner_value = owner.value
+        if isinstance(owner_value, ast.Name):
+            owner_attr = owner_value.id
+        else:
+            owner_attr = self._extract_self_attr_name(owner_value)
+        if not owner_attr:
+            return None
+        if not ("dict" in owner_attr or "fc" in owner_attr):
             return None
         return {"attr": attr}
 
@@ -1235,10 +1241,8 @@ class ASTFrontend:
 # PR1: ConstantTable + ConstantResolver skeleton
 # ===========================================================================
 # Reference: ast_refactor_workdir/output/ast_evaluator_redesign.md (sections
-# 3-4).  These two classes form the "facts table + pure evaluator" pair that
-# will eventually replace the legacy regex+AST mixed evaluator (`_eval_int_atom`
-# / `_eval_list_len` / `_extract_kw_int_args` / `_extract_kw_list_lens` /
-# `_resolve_range_n` / `_resolve_iter_len`) per the 5-stage PR plan.
+# 3-4).  These two classes form the "facts table + pure evaluator" pair for
+# AST-only constant extraction in the static DAG builder.
 #
 # Scope of PR1 (this commit):
 #   * Class skeletons exist and are *callable* (not just `pass` placeholders).
