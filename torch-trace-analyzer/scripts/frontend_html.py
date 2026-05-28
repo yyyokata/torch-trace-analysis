@@ -27,6 +27,7 @@ import sys
 import json as _json
 import re
 import ast
+import textwrap
 from collections import defaultdict
 from pathlib import Path
 
@@ -2326,6 +2327,12 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
                                 prod, prod_line, prod_var = _collect_expr_output_producers(expr, var_producers, phys_lineno)
                                 for p in prod:
                                     _remember(p, phys_lineno, prod_var or expr, prod_line)
+                            for _kw_name, expr in kwargs.items():
+                                if _kw_name in ("prediction", "loss") or not expr:
+                                    continue
+                                prod, prod_line, prod_var = _collect_expr_output_producers(expr, var_producers, phys_lineno)
+                                for p in prod:
+                                    _remember(p, phys_lineno, prod_var or expr, prod_line)
 
                 ret_m = re.match(r'^return\s+(.+)$', line)
                 if ret_m and result_vars:
@@ -3575,69 +3582,102 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
             return _steps
         _line_text = _slines[_ln - 1]
 
-        def _extract_all_names_from_node(node):
-            """AST walk all Name.id values, deduped in order, excluding self/cls."""
-            seen, result = set(), []
-            if node is None:
-                return result
-            for n in ast.walk(node):
-                if isinstance(n, ast.Name) and n.id not in seen and n.id not in ("self", "cls"):
-                    seen.add(n.id)
-                    result.append(n.id)
-            return result
+        def _append_unique(dst, values):
+            for value in values or []:
+                if value and value != "_" and value not in dst:
+                    dst.append(value)
 
-        def _extract_lhs_targets_from_call_line(line_text):
+        def _name_base_from_expr(node):
+            if isinstance(node, ast.Name):
+                return node.id if node.id not in ("self", "cls") else None
+            if isinstance(node, ast.Subscript):
+                return _name_base_from_expr(node.value)
+            if isinstance(node, ast.Attribute):
+                return None
+            return None
+
+        def _extract_lhs_targets_from_node(node):
+            names = []
+            if isinstance(node, ast.Name):
+                _append_unique(names, [node.id])
+            elif isinstance(node, (ast.Tuple, ast.List)):
+                for elt in node.elts:
+                    _append_unique(names, _extract_lhs_targets_from_node(elt))
+            elif isinstance(node, ast.Subscript):
+                base = _name_base_from_expr(node)
+                _append_unique(names, [base])
+            return names
+
+        def _extract_arg_carriers_from_node(node):
+            names = []
+            for n in ast.walk(node):
+                base = _name_base_from_expr(n)
+                _append_unique(names, [base])
+            return names
+
+        def _logical_statement_from_call_line():
+            collected = []
+            paren_depth = bracket_depth = brace_depth = 0
+            in_str = None
+            triple = False
+            esc = False
+            for raw in _slines[_ln - 1:]:
+                collected.append(raw)
+                for ch in raw:
+                    if in_str:
+                        if esc:
+                            esc = False
+                        elif ch == "\\":
+                            esc = True
+                        elif not triple and ch == in_str:
+                            in_str = None
+                        continue
+                    if ch in ("'", '"'):
+                        in_str = ch
+                        triple = False
+                        continue
+                    if ch == "(":
+                        paren_depth += 1
+                    elif ch == ")":
+                        paren_depth = max(0, paren_depth - 1)
+                    elif ch == "[":
+                        bracket_depth += 1
+                    elif ch == "]":
+                        bracket_depth = max(0, bracket_depth - 1)
+                    elif ch == "{":
+                        brace_depth += 1
+                    elif ch == "}":
+                        brace_depth = max(0, brace_depth - 1)
+                if collected and paren_depth == 0 and bracket_depth == 0 and brace_depth == 0 and in_str is None:
+                    break
+            return "\n".join(collected)
+
+        def _extract_statement_carriers(statement_text):
             try:
-                _tree = ast.parse(line_text)
+                _tree = ast.parse(textwrap.dedent(statement_text))
             except SyntaxError:
-                return []
-            for _node in ast.walk(_tree):
+                return [], []
+            _producer_names = []
+            _consumer_names = []
+            for _node in _tree.body:
                 if isinstance(_node, ast.Assign):
                     for _target in _node.targets:
-                        _names = _extract_all_names_from_node(_target)
-                        if _names:
-                            return [v for v in _names if v != "_"]
-            return []
-
-        def _extract_call_arg_names_from_call_line(line_text):
-            try:
-                _tree = ast.parse(line_text)
-            except SyntaxError:
-                return []
-            _base = re.sub(r'#\d+$', '', child_attr or '')
-            _container = re.match(r'^(\w+)\[(.+)\]$', _base)
-            _scan = _container.group(1) if _container else _base
-            for _node in ast.walk(_tree):
-                if not isinstance(_node, ast.Call):
+                        _append_unique(_producer_names, _extract_lhs_targets_from_node(_target))
+                    _value = _node.value
+                    if isinstance(_value, ast.Call):
+                        for _arg in list(_value.args) + [kw.value for kw in _value.keywords if kw.value is not None]:
+                            _append_unique(_producer_names, _extract_arg_carriers_from_node(_arg))
+                elif isinstance(_node, ast.Expr):
+                    _value = _node.value
+                else:
                     continue
-                _func = _node.func
-                _is_match = (
-                    isinstance(_func, ast.Attribute)
-                    and isinstance(_func.value, ast.Name)
-                    and _func.value.id == "self"
-                    and _func.attr == _scan
-                ) or (
-                    isinstance(_func, ast.Subscript)
-                    and isinstance(_func.value, ast.Attribute)
-                    and isinstance(_func.value.value, ast.Name)
-                    and _func.value.value.id == "self"
-                    and _func.value.attr == _scan
-                ) or (
-                    isinstance(_func, ast.Name)
-                )
-                if _is_match:
-                    _names = []
-                    for _arg in list(_node.args) + [kw.value for kw in _node.keywords if kw.value is not None]:
-                        for _name in _extract_all_names_from_node(_arg):
-                            if _name not in _names:
-                                _names.append(_name)
-                    if _names:
-                        return _names
-            return []
+                for _call in [n for n in ast.walk(_value) if isinstance(n, ast.Call)]:
+                    for _arg in list(_call.args) + [kw.value for kw in _call.keywords if kw.value is not None]:
+                        _append_unique(_consumer_names, _extract_arg_carriers_from_node(_arg))
+            return _producer_names, _consumer_names
 
-        # Determine carry variable on the call_site line.
-        _producer_carriers = _extract_lhs_targets_from_call_line(_line_text)
-        _consumer_carriers = _extract_call_arg_names_from_call_line(_line_text)
+        # Determine carry variables from the complete logical call statement.
+        _producer_carriers, _consumer_carriers = _extract_statement_carriers(_logical_statement_from_call_line())
         _base_attr = re.sub(r'#\d+$', '', child_attr or '')
         _container_match = re.match(r'^(\w+)\[(.+)\]$', _base_attr)
         _scan_attr = _container_match.group(1) if _container_match else _base_attr
@@ -3734,15 +3774,103 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
 
         _input_connected_ids = set()
 
+        def _infer_input_edges_from_call_args():
+            inferred = []
+            if not _root_cname:
+                return inferred
+            try:
+                for (_fname, _cname), _info in class_map.items():
+                    if _cname != _root_cname:
+                        continue
+                    _fwd_range = (_info.get("methods") or {}).get("forward")
+                    if not _fwd_range:
+                        continue
+                    _lines = source_files.get(_fname, [])
+                    _class_start = None
+                    _class_end = None
+                    for (_cfname, _ccname), _cinfo in class_map.items():
+                        if _cfname == _fname and _ccname == _root_cname:
+                            _class_start = _cinfo.get("start") or 1
+                            _class_end = _cinfo.get("end") or len(_lines)
+                            break
+                    if _class_start is None:
+                        _class_start, _class_end = 1, len(_lines)
+                    _src = "\n".join(_lines)
+                    _mod = ast.parse(textwrap.dedent(_src))
+                    _root_func = None
+                    for _class_node in [n for n in _mod.body if isinstance(n, ast.ClassDef)]:
+                        for _stmt in _class_node.body:
+                            if isinstance(_stmt, ast.FunctionDef) and _stmt.name == "forward":
+                                _root_func = _stmt
+                                break
+                        if _root_func is not None:
+                            break
+                    if _root_func is None:
+                        for _top in _mod.body:
+                            if isinstance(_top, ast.FunctionDef) and _top.name == "forward":
+                                _root_func = _top
+                                break
+                    _walk_root = _root_func if _root_func is not None else _mod
+                    _name_producers = {}
+                    for _node in ast.walk(_walk_root):
+                        if not isinstance(_node, ast.Assign):
+                            continue
+                        _rhs = _node.value
+                        if not isinstance(_rhs, ast.Call):
+                            continue
+                        _func = _rhs.func
+                        if not (isinstance(_func, ast.Attribute) and isinstance(_func.value, ast.Name) and _func.value.id == "self"):
+                            continue
+                        _attr = _func.attr
+                        if _attr not in _root_attr_id_map:
+                            continue
+                        _lhs_names = []
+                        for _target in _node.targets:
+                            _lhs_names.extend(_extract_lhs_targets_from_node(_target))
+                        for _lhs in _lhs_names:
+                            _name_producers[_lhs] = _attr
+                    for _node in ast.walk(_walk_root):
+                        if not isinstance(_node, ast.Call):
+                            continue
+                        _func = _node.func
+                        if not (isinstance(_func, ast.Attribute) and isinstance(_func.value, ast.Name) and _func.value.id == "self"):
+                            continue
+                        _consumer = _func.attr
+                        if _consumer not in _root_attr_id_map:
+                            continue
+                        _input_names = set()
+                        for _arg in _node.args:
+                            if isinstance(_arg, ast.Name):
+                                _src = _arg.id
+                                if _src in _name_producers:
+                                    _src = _name_producers[_src]
+                                _input_names.add(_src)
+                        if len(_input_names) >= 2:
+                            inferred.append(("__inferred_input", _consumer))
+                return inferred
+            except Exception:
+                return inferred
+
         # (a) Direct LG → real_module edges in root group
-        for (lg_attr, consumer_attr) in _root_group.get("input_consumer_edges", []):
+        for (lg_attr, consumer_attr) in list(_root_group.get("input_consumer_edges", [])) + _infer_input_edges_from_call_args():
             if consumer_attr not in _root_attr_id_map:
                 continue
             _, consumer_id = _root_attr_id_map[consumer_attr]
+            ev = _root_edge_locs.get((lg_attr, consumer_attr))
             if consumer_id in _input_connected_ids:
+                if ev:
+                    _existing = next((e for e in dag_edges if e.get("from") == input_node_id and e.get("to") == consumer_id), None)
+                    _existing_hist = (((_existing or {}).get("evidence") or {}).get("var_history") or [])
+                    _extra_line = ev.get("to_line") or ev.get("from_line")
+                    _extra_hist = _input_edge_var_history(_root_cname, consumer_attr, (ev.get("file"), _extra_line))
+                    for _idx, _extra_step in enumerate(_extra_hist):
+                        if _idx < len(_existing_hist):
+                            for _carrier in _extra_step.get("carriers") or []:
+                                _dst = _existing_hist[_idx].setdefault("carriers", [])
+                                if _carrier not in _dst:
+                                    _dst.append(_carrier)
                 continue
             _ev_data = None
-            ev = _root_edge_locs.get((lg_attr, consumer_attr))
             if ev:
                 _ev_lines = source_files.get(ev["file"], [])
                 # Iter12-final Rule1b guard: if the ev points to a
@@ -3906,6 +4034,40 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
                 _input_connected_ids.add(gid)
 
         # (c) Fallback: modules with no inbound from siblings also receive Input
+        for _lg_attr, _consumer_attr in _infer_input_edges_from_call_args():
+            if _consumer_attr not in _root_attr_id_map:
+                continue
+            _, _consumer_id = _root_attr_id_map[_consumer_attr]
+            _already = any(e.get("from") == input_node_id and e.get("to") == _consumer_id for e in dag_edges)
+            if _already:
+                continue
+            _call_loc = tree.get(_root_cname, {}).get("first_call_loc", {}).get(_consumer_attr) if _root_cname else None
+            _vh = _input_edge_var_history(_root_cname, _consumer_attr, _call_loc)
+            _ev_data = None
+            if _call_loc:
+                _ev_file, _ev_line = _call_loc
+                _ev_lines = source_files.get(_ev_file, [])
+                _ev_data = {
+                    "file": _ev_file,
+                    "var": f"input → {_consumer_attr}",
+                    "from_line": _ev_line,
+                    "to_line": _ev_line,
+                    "to_excerpt": {
+                        "start": max(1, _ev_line - 1),
+                        "end": min(len(_ev_lines), _ev_line + 1),
+                        "text": "\n".join(_ev_lines[max(0, _ev_line - 2): min(len(_ev_lines), _ev_line + 1)]),
+                        "highlight": _ev_line,
+                    } if _ev_lines else None,
+                }
+                if _vh:
+                    _ev_data["var_history"] = _vh
+            _edge_entry = {"from": input_node_id, "to": _consumer_id, "type": "dep",
+                           "from_attr": "Input", "to_attr": _consumer_attr}
+            if _ev_data:
+                _edge_entry["evidence"] = _ev_data
+            dag_edges.append(_edge_entry)
+            _input_connected_ids.add(_consumer_id)
+
         _root_internal_targets = set()
         for e in _root_group.get("internal_edges", []):
             _root_internal_targets.add(e["to_child"])
@@ -4004,6 +4166,91 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
                 dag_edges.append(edge_entry)
                 _input_connected_ids.add(child_id)
 
+            if _input_connected_ids:
+                # Post-merge carrier enrichment: scan all already-built Input→consumer
+                # edges from their resolved call sites.  This keeps multiple LG
+                # input-source paths merged on the same consumer edge and handles
+                # multi-line calls using the AST logical-statement parser above.
+                for _edge in dag_edges:
+                    if _edge.get("from") != input_node_id:
+                        continue
+                    _to_attr = _edge.get("to_attr")
+                    if not _to_attr or _to_attr == "Input":
+                        continue
+                    _hist = (((_edge.get("evidence") or {}).get("var_history")) or [])
+                    _call_loc = tree.get(_root_cname, {}).get("first_call_loc", {}).get(_to_attr) if _root_cname else None
+                    if not _call_loc:
+                        _te = ((_edge.get("evidence") or {}).get("to_excerpt") or {})
+                        if _te.get("highlight") and (_edge.get("evidence") or {}).get("file"):
+                            _call_loc = ((_edge.get("evidence") or {}).get("file"), _te.get("highlight"))
+                    _new_hist = _input_edge_var_history(_root_cname, _to_attr, _call_loc)
+                    if not _new_hist:
+                        continue
+                    if not _hist:
+                        (_edge.setdefault("evidence", {}))["var_history"] = _new_hist
+                        continue
+                    for _idx, _new_step in enumerate(_new_hist):
+                        if _idx >= len(_hist):
+                            _hist.append(_new_step)
+                            continue
+                        _dst = _hist[_idx].setdefault("carriers", [])
+                        for _carrier in _new_step.get("carriers") or []:
+                            if _carrier not in _dst:
+                                _dst.append(_carrier)
+
+        if _root_cname and _root_attr_id_map:
+            for _consumer_attr, (_kind, _consumer_id) in list(_root_attr_id_map.items()):
+                _call_loc = tree.get(_root_cname, {}).get("first_call_loc", {}).get(_consumer_attr)
+                _vh_probe = _input_edge_var_history(_root_cname, _consumer_attr, _call_loc)
+                _consumer_carriers = set((_vh_probe[1].get("carriers") if len(_vh_probe) > 1 else []) or [])
+                if len(_consumer_carriers) < 2:
+                    continue
+                if any(e.get("from") == input_node_id and e.get("to") == _consumer_id and e.get("type") == "dep" and e.get("from_attr") == "Input" and e.get("to_attr") == _consumer_attr for e in dag_edges):
+                    continue
+                _ev_data = None
+                if _call_loc:
+                    _ev_file, _ev_line = _call_loc
+                    _ev_lines = source_files.get(_ev_file, [])
+                    _ev_data = {"file": _ev_file, "var": f"input → {_consumer_attr}", "from_line": _ev_line, "to_line": _ev_line,
+                                "to_excerpt": {"start": max(1, _ev_line - 1), "end": min(len(_ev_lines), _ev_line + 1),
+                                               "text": "\n".join(_ev_lines[max(0, _ev_line - 2): min(len(_ev_lines), _ev_line + 1)]),
+                                               "highlight": _ev_line} if _ev_lines else None}
+                    if _vh_probe:
+                        _ev_data["var_history"] = _vh_probe
+                _entry = {"from": input_node_id, "to": _consumer_id, "type": "dep", "from_attr": "Input", "to_attr": _consumer_attr}
+                if _ev_data:
+                    _entry["evidence"] = _ev_data
+                dag_edges.append(_entry)
+                _input_connected_ids.add(_consumer_id)
+
+        if _input_connected_ids:
+            for _consumer_id in list(_input_connected_ids):
+                _consumer_attr = None
+                for _attr, (_kind, _nid) in _root_attr_id_map.items():
+                    if _nid == _consumer_id:
+                        _consumer_attr = _attr
+                        break
+                if not _consumer_attr:
+                    continue
+                if any(e.get("from") == input_node_id and e.get("to") == _consumer_id and e.get("type") == "dep" and e.get("from_attr") == "Input" and e.get("to_attr") == _consumer_attr for e in dag_edges):
+                    continue
+                _call_loc = tree.get(_root_cname, {}).get("first_call_loc", {}).get(_consumer_attr) if _root_cname else None
+                _vh = _input_edge_var_history(_root_cname, _consumer_attr, _call_loc)
+                _ev_data = None
+                if _call_loc:
+                    _ev_file, _ev_line = _call_loc
+                    _ev_lines = source_files.get(_ev_file, [])
+                    _ev_data = {"file": _ev_file, "var": f"input → {_consumer_attr}", "from_line": _ev_line, "to_line": _ev_line,
+                                "to_excerpt": {"start": max(1, _ev_line - 1), "end": min(len(_ev_lines), _ev_line + 1),
+                                               "text": "\n".join(_ev_lines[max(0, _ev_line - 2): min(len(_ev_lines), _ev_line + 1)]),
+                                               "highlight": _ev_line} if _ev_lines else None}
+                    if _vh:
+                        _ev_data["var_history"] = _vh
+                _entry = {"from": input_node_id, "to": _consumer_id, "type": "dep", "from_attr": "Input", "to_attr": _consumer_attr}
+                if _ev_data:
+                    _entry["evidence"] = _ev_data
+                dag_edges.append(_entry)
+
         if not _input_connected_ids:
             dag_edges.append({"from": input_node_id, "to": f"{top_root_id}__in", "type": "dep"})
 
@@ -4046,22 +4293,35 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
             if _ev_data and "var_history" not in _ev_data:
                 _vh_steps = []
                 _from_ex = _ev_data.get("from_excerpt") or {}
+                _var_carriers = []
+                _var_name = _ev_data.get("var")
+                if _var_name and isinstance(_var_name, str) and re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', _var_name):
+                    _var_carriers = [_var_name]
+                if not _var_carriers and _from_ex.get("text"):
+                    for _line in (_from_ex.get("text") or "").split("\n"):
+                        _line = _line.strip()
+                        _m = re.search(r'\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*self\.' + re.escape(producer_attr) + r'\s*\(', _line)
+                        if _m:
+                            _var_carriers = [_m.group(1)]
+                            break
                 if _from_ex.get("highlight"):
                     _vh_steps.append({
                         "var": _ev_data.get("var") or producer_attr,
                         "file": _ev_data.get("file"),
                         "line": _from_ex.get("highlight"),
                         "excerpt": _from_ex,
-                        "role": "step",
+                        "role": "producer",
+                        "carriers": _var_carriers,
                     })
                 _to_ex = _ev_data.get("to_excerpt") or {}
                 if _to_ex.get("highlight") and _to_ex.get("highlight") != _from_ex.get("highlight"):
                     _vh_steps.append({
-                        "var": "result",
+                        "var": _ev_data.get("var") or "result",
                         "file": _ev_data.get("file"),
                         "line": _to_ex.get("highlight"),
                         "excerpt": _to_ex,
                         "role": "consumer",
+                        "carriers": _var_carriers,
                     })
                 if _vh_steps:
                     _ev_data["var_history"] = _vh_steps
