@@ -1224,6 +1224,13 @@ class ConstantTable:
 
         # ── self.attr → param map (table 14) ───────────────────────────
         self.self_to_param: Dict[Tuple[str, str], Dict[str, str]] = {}
+        # local_self_attr_exprs[(file, cls, method)] -> {attr: [(line, expr), ...]}
+        # Used by P2 to resolve list_len through ``self.attr`` indirection, e.g.
+        # ``self.layers = [..]`` / ``self.layers = [.. for _ in range(n)]`` /
+        # ``self.names = names``.
+        self.local_self_attr_exprs: Dict[
+            Tuple[str, str, str], Dict[str, List[Tuple[int, ast.expr]]]
+        ] = {}
 
         # ── Phase E1.2 auxiliary: per-class ClassDef AST node (used for
         #    cross-class dict-literal lookups during Pass 4 dataclass
@@ -1426,6 +1433,7 @@ class ConstantTable:
             self.class_defs[(fname, cname)] = classdef
             self._scan_class_init_params(fname, cname, classdef)
             self._scan_self_to_param(fname, cname, fe)
+            self._scan_self_attr_exprs(fname, cname, classdef)
             self._scan_local_aliases(fname, cname, classdef)
             self._scan_self_dict_literals(fname, cname, classdef)
             self._scan_local_dataclass_instances(fname, cname, classdef)
@@ -1453,6 +1461,34 @@ class ConstantTable:
             aliases = {}
         if aliases:
             self.self_to_param[(fname, cname)] = dict(aliases)
+
+    def _scan_self_attr_exprs(self, fname: str, cname: str,
+                              classdef: ast.ClassDef) -> None:
+        """Record ``self.attr = <expr>`` bindings with source-order information.
+
+        P2 needs list_len resolution through ``self.attr`` indirection.  We keep
+        the original RHS AST node so ``ConstantResolver`` can recurse into it
+        later (for example ``self.layers = [.. for _ in range(n)]`` or
+        ``self.names = names``).
+        """
+        for stmt in classdef.body:
+            if not isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            scope_key = (fname, cname, stmt.name)
+            attr_exprs: Dict[str, List[Tuple[int, ast.expr]]] = {}
+            for sub in ast.walk(stmt):
+                if not isinstance(sub, ast.Assign):
+                    continue
+                if len(sub.targets) != 1:
+                    continue
+                attr_name = self._extract_self_attr_name(sub.targets[0])
+                if attr_name is None:
+                    continue
+                attr_exprs.setdefault(attr_name, []).append((getattr(sub, "lineno", -1), sub.value))
+            if attr_exprs:
+                for entries in attr_exprs.values():
+                    entries.sort(key=lambda item: item[0])
+                self.local_self_attr_exprs[scope_key] = attr_exprs
 
     def _scan_local_aliases(self, fname: str, cname: str,
                             classdef: ast.ClassDef) -> None:
@@ -2071,6 +2107,8 @@ class ConstantResolver:
     def _eval_list_len_uncached(self, node: ast.expr, scope: Scope) -> Optional[int]:
         if isinstance(node, ast.List):
             return self._visit_List_list_len(node, scope)
+        if isinstance(node, ast.ListComp):
+            return self._visit_ListComp_list_len(node, scope)
         if isinstance(node, ast.Name):
             return self._visit_Name_list_len(node, scope)
         if isinstance(node, ast.Attribute):
@@ -2093,6 +2131,28 @@ class ConstantResolver:
                 total += n
             else:
                 total += 1
+        return total
+
+    def _visit_ListComp_list_len(self, node: ast.ListComp, scope: Scope) -> Optional[int]:
+        if node.generators is None or not node.generators:
+            return 0
+        total = 1
+        for gen in node.generators:
+            if gen.ifs:
+                return None
+            n = self.eval_list_len(gen.iter, scope)
+            if n is None:
+                if (isinstance(gen.iter, ast.Call)
+                        and isinstance(gen.iter.func, ast.Name)
+                        and gen.iter.func.id == "range"
+                        and len(gen.iter.args) == 1):
+                    iv = self.eval_int(gen.iter.args[0], scope)
+                    if iv is None or iv.value < 0:
+                        return None
+                    n = iv.value
+                else:
+                    return None
+            total *= n
         return total
 
     def _visit_Name_list_len(self, node: ast.Name, scope: Scope) -> Optional[int]:
@@ -2130,8 +2190,13 @@ class ConstantResolver:
         base, attrs = chain
         if not (isinstance(base, ast.Name) and base.id == "self"):
             return None
+        direct = self._lookup_self_attr_expr(attrs, scope, getattr(node, "lineno", None))
+        if direct is not None:
+            n = self.eval_list_len(direct, scope)
+            if n is not None:
+                return n
         if len(attrs) != 1:
-            return None  # multi-level list_len not supported in PR1
+            return None
         cls_key = (scope.file, scope.cls)
         param = self.table.self_to_param.get(cls_key, {}).get(attrs[0])
         if param is None:
@@ -2301,6 +2366,21 @@ class ConstantResolver:
             return IntValue(cur, "dataclass_field")
         return None
 
+    def _lookup_self_attr_expr(self,
+                               attrs: List[str],
+                               scope: Scope,
+                               before_line: Optional[int] = None) -> Optional[ast.expr]:
+        if scope.cls is None or scope.method is None or len(attrs) != 1:
+            return None
+        entries = self.table.local_self_attr_exprs.get(scope.method_key, {}).get(attrs[0], [])
+        if not entries:
+            return None
+        if before_line is not None:
+            for lineno, expr in reversed(entries):
+                if lineno <= before_line:
+                    return expr
+        return entries[-1][1]
+
     def _runtime_override_candidates(self, attrs: List[str], scope: Scope) -> List[str]:
         joined = ".".join(attrs)
         leaf = attrs[-1] if attrs else ""
@@ -2387,6 +2467,14 @@ class ConstantResolver:
                     # Re-wrap into an ast.List for uniform handling.
                     fake = ast.List(elts=list(items), ctx=ast.Load())
                     return fake
+        if isinstance(node, ast.Attribute):
+            chain = self._flatten_attr_chain(node)
+            if chain is not None:
+                base, attrs = chain
+                if isinstance(base, ast.Name) and base.id == "self":
+                    direct = self._lookup_self_attr_expr(attrs, scope, getattr(node, "lineno", None))
+                    if direct is not None:
+                        return self._resolve_to_list_literal(direct, scope)
         return None
 
 
