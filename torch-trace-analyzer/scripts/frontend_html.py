@@ -194,6 +194,8 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 
 <script>
 const DATA = __FLOWCHART_DATA_PLACEHOLDER__;
+const HAS_TIMING_DATA = !!DATA.has_timing_data || !!DATA.has_timing;
+const HAS_TRACE_STEP  = !!DATA.has_trace_step || Number(DATA.meta?.step_dur_us || 0) > 0;
 
 const groupMap = {};
 const nodeMap = {};
@@ -492,7 +494,7 @@ function formatDur(us) {
 }
 
 function getNodeColor(n) {
-    if (!DATA.has_timing || !n.has_timing) {
+    if (!HAS_TIMING_DATA || !n.has_timing) {
         const depthColors = ['#4a6fa5', '#5b8c5a', '#8e6fad', '#c77a3c', '#4aa5a0', '#a05c7b'];
         return depthColors[(n.depth || 0) % depthColors.length];
     }
@@ -508,7 +510,7 @@ function getNodeColor(n) {
 }
 
 function getGroupBorderColor(g) {
-    if (!DATA.has_timing || !g.has_timing) {
+    if (!HAS_TIMING_DATA || !g.has_timing) {
         const depthColors = ['rgba(74,111,165,0.5)', 'rgba(91,140,90,0.5)', 'rgba(142,111,173,0.5)', 'rgba(199,122,60,0.5)'];
         return depthColors[(g.depth || 0) % depthColors.length];
     }
@@ -878,7 +880,7 @@ function render() {
                 tl.setAttribute('text-anchor', 'middle');
                 tl.setAttribute('class', 'group-timing');
                 const disp = computeGroupDisplayTiming(g);
-                tl.textContent = `Kernel ${disp.pct.toFixed(1)}% · ${formatDur(disp.kernelUs)}`;
+                tl.textContent = `Subtree ${disp.pct.toFixed(1)}% · ${formatDur(disp.kernelUs)}`;
                 bindGroupHover(tl, gid);
                 svg.appendChild(tl);
             }
@@ -943,7 +945,7 @@ function render() {
             tl.setAttribute('text-anchor', 'end');
             tl.setAttribute('class', 'group-timing');
             const disp = computeGroupDisplayTiming(g);
-            tl.textContent = `Kernel ${disp.pct.toFixed(1)}% · ${formatDur(disp.kernelUs)}`;
+            tl.textContent = `Subtree ${disp.pct.toFixed(1)}% · ${formatDur(disp.kernelUs)}`;
             bindGroupHover(tl, gid);
             svg.appendChild(tl);
         }
@@ -1295,9 +1297,9 @@ function render() {
 
     // Header info
     const meta = DATA.meta;
-    if (DATA.has_timing) {
+    if (HAS_TIMING_DATA) {
         document.getElementById('mode-badge').innerHTML = '<span class="mode-badge mode-timing">📊 Structure + Timing</span>';
-        const stepDisplay = meta.step_phase_str || meta.step_dur_str;
+        const stepDisplay = HAS_TRACE_STEP ? (meta.step_phase_str || meta.step_dur_str) : meta.step_dur_str;
         document.getElementById('meta-info').textContent = `Device: ${meta.device} | Step: ${stepDisplay} | Modules: ${meta.num_modules}`;
     } else {
         document.getElementById('mode-badge').innerHTML = '<span class="mode-badge mode-structure">🏗️ Static Structure (source code)</span>';
@@ -1306,7 +1308,7 @@ function render() {
 
     // Legend
     const legendDiv = document.getElementById('legend');
-    if (DATA.has_timing) {
+    if (HAS_TIMING_DATA) {
         legendDiv.innerHTML = `
             <div class="legend-item"><div class="legend-dot" style="background:#2980b9"></div>&gt;20%</div>
             <div class="legend-item"><div class="legend-dot" style="background:#27ae60"></div>10-20%</div>
@@ -1329,7 +1331,7 @@ function render() {
     const summaryDiv = document.getElementById('summary');
     const allNodes = DATA.nodes;
     const allGroups = DATA.groups;
-    if (DATA.has_timing) {
+    if (HAS_TRACE_STEP) {
         const topN = [...allNodes, ...allGroups].filter(x => x.has_timing).sort((a,b) => b.pct - a.pct).slice(0,5);
         summaryDiv.innerHTML = `<h3>📊 Top Modules by Time</h3><p>${
             topN.map(x => `<b>${x.label || x.class_name}</b> ${x.pct.toFixed(1)}%`).join(' → ')
@@ -1354,8 +1356,8 @@ function computeGroupDisplayTiming(group) {
     const kernelUs = Number(
         group && group.subtree_inclusive_us != null
             ? group.subtree_inclusive_us
-            : (group && group.subtree_kernel_us != null
-                ? group.subtree_kernel_us
+            : (group && group.inclusive_us != null
+                ? group.inclusive_us
                 : (group && group.kernel_us != null ? group.kernel_us : (group && group.dur_us || 0)))
     );
     const pct = Number(group && group.subtree_pct != null ? group.subtree_pct : (group && group.pct || 0));
@@ -3432,7 +3434,9 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
                 "fwd_kernel_us": _cont_fwd_kernel_us,
                 "bwd_kernel_us": _cont_bwd_kernel_us,
                 "other_kernel_us": _cont_other_kernel_us,
+                "self_kernel_us": _cont_kernel_us,
                 "inclusive_us": _cont_inclusive_us,
+                "subtree_inclusive_us": _cont_inclusive_us,
                 "inclusive_forward_us": _cont_inclusive_forward_us,
                 "inclusive_backward_us": _cont_inclusive_backward_us,
                 "inclusive_optimize_us": _cont_inclusive_optimize_us,
@@ -3521,7 +3525,9 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
             "fwd_kernel_us": fwd_kernel_us,
             "bwd_kernel_us": bwd_kernel_us,
             "other_kernel_us": other_kernel_us,
+            "self_kernel_us": kernel_us,
             "inclusive_us": inclusive_us,
+            "subtree_inclusive_us": inclusive_us,
             "inclusive_forward_us": inclusive_forward_us,
             "inclusive_backward_us": inclusive_backward_us,
             "inclusive_optimize_us": inclusive_optimize_us,
@@ -6248,11 +6254,17 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
         "loss_node_id": loss_node_id,
         "result_node_id": loss_node_id,
         "has_timing": has_timing,
+        "has_timing_data": has_timing,
+        "has_trace_step": has_timing and step_dur_us > 0,
         "meta": {
             "device": meta.get("device_name", "N/A") if meta else "N/A",
             "step_dur_us": step_dur_us,
             "step_kernel_us": timing_data.get("step_kernel_us", 0) if timing_data else 0,
             "unattributed_kernel_us": timing_data.get("unattributed_kernel_us", 0) if timing_data else 0,
+            "inclusive_forward_us": timing_data.get("inclusive_forward_us") if timing_data else None,
+            "inclusive_backward_us": timing_data.get("inclusive_backward_us") if timing_data else None,
+            "inclusive_optimize_us": timing_data.get("inclusive_optimize_us") if timing_data else None,
+            "inclusive_other_us": timing_data.get("inclusive_other_us") if timing_data else None,
             "step_dur_str": format_duration(step_dur_us) if step_dur_us > 0 else "N/A",
             "step_phase_str": timing_data.get("step_phase_str") if timing_data else None,
             "num_modules": len(dag_nodes) + len(dag_groups),
@@ -6457,7 +6469,7 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
     return render_flowchart_to_file(flowchart_data, output_path)
 
 
-def build_timing_data_from_trace(events, source_files, mod_info, step_dur_us, profiler_steps, src_info=None, roots=None):
+def build_timing_data_from_trace(events, source_files, mod_info, step_dur_us, profiler_steps, src_info=None, roots=None, static_module_tree=None):
     """Extract per-class and per-instance timing data for the static flowchart."""
     class_map = _build_class_map(source_files)
     timing_data = {
@@ -6514,11 +6526,15 @@ def build_timing_data_from_trace(events, source_files, mod_info, step_dur_us, pr
         # Design doc: timing_fix_workdir/output/timing_redesign.md
         # ------------------------------------------------------------------
         panel = build_instance_timing_pipeline(
-            events, source_files, class_map, step_infos, step_dur_us, roots=roots
+            events, source_files, class_map, step_infos, step_dur_us, roots=roots, static_module_tree=static_module_tree
         )
         timing_data["step_kernel_us"] = panel.get("step_kernel_us", 0)
         timing_data["unattributed_kernel_us"] = panel.get("unattributed_kernel_us", 0)
         timing_data["step_phase_str"] = panel.get("step_phase_str")
+        timing_data["inclusive_forward_us"] = panel.get("inclusive_forward_us")
+        timing_data["inclusive_backward_us"] = panel.get("inclusive_backward_us")
+        timing_data["inclusive_optimize_us"] = panel.get("inclusive_optimize_us")
+        timing_data["inclusive_other_us"] = panel.get("inclusive_other_us")
         # Class-level totals from instance inclusive (overwrite wrapped-event
         # estimates; new pipeline is authoritative).
         for cls, total_us in panel["class_durations"].items():
@@ -6548,13 +6564,13 @@ def build_timing_data_from_trace(events, source_files, mod_info, step_dur_us, pr
                 it = dict(item)
                 inclusive_optimize_us = float(item.get("inclusive_optimize_us", item.get("optimize_us", 0.0)) or 0.0)
                 inclusive_other_us = float(item.get("inclusive_other_us", item.get("other_us", 0.0)) or 0.0)
-                it.setdefault("kernel_us", float(item.get("inclusive_us", item.get("total_us", 0.0))))
-                it.setdefault("fwd_kernel_us", float(item.get("inclusive_forward_us", item.get("forward_us", 0.0))))
-                it.setdefault("bwd_kernel_us", float(item.get("inclusive_backward_us", item.get("backward_us", 0.0))))
-                it.setdefault("other_kernel_us", inclusive_optimize_us + inclusive_other_us)
+                it.setdefault("kernel_us", float(item.get("total_us", item.get("self_us", 0.0)) or 0.0))
+                it.setdefault("fwd_kernel_us", float(item.get("forward_us", 0.0) or 0.0))
+                it.setdefault("bwd_kernel_us", float(item.get("backward_us", 0.0) or 0.0))
+                it.setdefault("other_kernel_us", float(item.get("other_us", 0.0) or 0.0))
                 it.setdefault("inclusive_us", float(item.get("inclusive_us", it.get("kernel_us", 0.0)) or 0.0))
-                it.setdefault("inclusive_forward_us", float(item.get("inclusive_forward_us", it.get("fwd_kernel_us", 0.0)) or 0.0))
-                it.setdefault("inclusive_backward_us", float(item.get("inclusive_backward_us", it.get("bwd_kernel_us", 0.0)) or 0.0))
+                it.setdefault("inclusive_forward_us", float(item.get("inclusive_forward_us", item.get("forward_us", 0.0)) or 0.0))
+                it.setdefault("inclusive_backward_us", float(item.get("inclusive_backward_us", item.get("backward_us", 0.0)) or 0.0))
                 it.setdefault("inclusive_optimize_us", inclusive_optimize_us)
                 it.setdefault("inclusive_other_us", inclusive_other_us)
                 shimmed.append(it)

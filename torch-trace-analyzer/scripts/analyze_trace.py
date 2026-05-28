@@ -14,7 +14,7 @@ import textwrap
 import tokenize
 import logging
 from dataclasses import dataclass
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 
 LOG = logging.getLogger(__name__)
 
@@ -3319,10 +3319,20 @@ def extract_step_phase_intervals(main_events, children):
                     phase = phase_name_from_label(level3.get("name", ""))
                     if phase in ("forward", "backward"):
                         info[phase].append((level3["ts"], level3["ts"] + level3["dur"], level3.get("name", "")))
-            else:
-                phase = phase_name_from_label(level2_name)
-                if phase == "optimize":
-                    info["optimize"].append((level2["ts"], level2["ts"] + level2["dur"], level2.get("name", "")))
+        optimize_intervals = []
+        seen_opt = set()
+        for desc in _iter_descendants_within_step(step_event, children):
+            phase = phase_name_from_label(desc.get("name", ""))
+            if phase != "optimize":
+                continue
+            ts = float(desc.get("ts") or 0.0)
+            end = ts + float(desc.get("dur") or 0.0)
+            opt_key = (ts, end, str(desc.get("name", "")))
+            if opt_key in seen_opt:
+                continue
+            seen_opt.add(opt_key)
+            optimize_intervals.append((ts, end, desc.get("name", "")))
+        info["optimize"] = _merge_phase_intervals(optimize_intervals)
         step_infos.append(info)
     return step_infos
 
@@ -3346,8 +3356,10 @@ def classify_kernel_phase(kernel_start, kernel_end, step_infos):
         for start, end, _label in matched_step[phase]:
             phase_overlap[phase] += overlap(kernel_start, kernel_end, start, end)
 
-    best_phase = max(phase_overlap, key=phase_overlap.get)
-    return best_phase if phase_overlap[best_phase] > 0 else "other"
+    phase_priority = {"forward": 0, "backward": 1, "optimize": 2}
+    ranked = sorted(phase_overlap.items(), key=lambda item: (item[1], phase_priority[item[0]]), reverse=True)
+    best_phase, best_overlap = ranked[0]
+    return best_phase if best_overlap > 0 else "other"
 
 
 def _normalize_runtime_module_name(mod_name):
@@ -3413,6 +3425,7 @@ def _build_external_id_to_module_map(events):
 
 _STACK_FRAME_RE = re.compile(r'File "([^"]+)", line (\d+), in (\w+)')
 _INSTANCE_SUFFIX_RE = re.compile(r'_(\d+)$')
+_LOC_INDEX_SELF_FALLBACK_WARNED_CLASSES = set()
 
 
 @dataclass(frozen=True)
@@ -3550,6 +3563,132 @@ def _parse_instance_suffix(instance_suffix):
     return int(m.group(1)) if m else None
 
 
+def _warn_loc_index_self_fallback_once(class_name):
+    class_name = str(class_name or "")
+    if not class_name or class_name in _LOC_INDEX_SELF_FALLBACK_WARNED_CLASSES:
+        return
+    _LOC_INDEX_SELF_FALLBACK_WARNED_CLASSES.add(class_name)
+    LOG.warning(
+        "[build_loc_index] class=%s triggered <self> fallback — no structural attrs found; verify caller passed static_module_tree not class_map",
+        class_name,
+    )
+
+
+def _normalize_tree_class_name(class_key):
+    if isinstance(class_key, tuple) and len(class_key) >= 2:
+        return class_key[1]
+    return class_key
+
+
+def _iter_static_tree_items(dag):
+    if not isinstance(dag, dict):
+        return []
+    items = []
+    for class_key, info in dag.items():
+        if not isinstance(info, dict):
+            continue
+        class_name = _normalize_tree_class_name(class_key)
+        items.append((class_key, class_name, info))
+    return items
+
+
+def _find_static_tree_info(dag, class_name):
+    class_name = str(class_name or "")
+    if not class_name or not isinstance(dag, dict):
+        return None
+    for _class_key, normalized_name, info in _iter_static_tree_items(dag):
+        if str(normalized_name or "") == class_name:
+            return info
+    return None
+
+
+def _lookup_child_class_from_static_tree(dag, class_name, attr_name):
+    info = _find_static_tree_info(dag, class_name)
+    if not info:
+        return None
+    attrs = info.get("attrs", {}) or {}
+    child_class = attrs.get(attr_name)
+    if child_class:
+        return child_class
+    attr_text = str(attr_name or "")
+    base_attr = attr_text.split("[", 1)[0]
+    if base_attr and base_attr != attr_text:
+        child_class = attrs.get(base_attr)
+        if child_class:
+            return child_class
+    return None
+
+
+def _normalize_ancestor_entry(entry):
+    if isinstance(entry, (tuple, list)) and len(entry) >= 2:
+        return (os.path.basename(str(entry[0] or "")), int(entry[1]))
+    return None
+
+
+def _build_ancestors_from_matched_frames(frames, matched_depth):
+    ancestors = []
+    for frame in (frames or [])[:matched_depth]:
+        file_path, line = _frame_file_line(frame)
+        if line is None:
+            continue
+        ancestors.append((os.path.basename(str(file_path or "")), int(line)))
+    return tuple(ancestors)
+
+
+def _resolve_attr_instance_key(dag, class_name, attr_name, frame, chain, matched_depth):
+    file_path, line = _frame_file_line(frame)
+    callsite_file = os.path.basename(str(file_path or ""))
+    callsite_line = int(line or 0)
+    ancestors = _build_ancestors_from_matched_frames(getattr(chain, "frames", []) or [], matched_depth)
+    child_class = _lookup_child_class_from_static_tree(dag, class_name, attr_name)
+    resolved_class = child_class or class_name
+    return (resolved_class, callsite_file, callsite_line, ancestors)
+
+
+def _iter_descendants_within_step(step_event, children_map):
+    if not step_event or not children_map:
+        return []
+    step_start = float(step_event.get("ts") or 0.0)
+    step_end = step_start + float(step_event.get("dur") or 0.0)
+    out = []
+    queue = deque(children_map.get(id(step_event), []) or [])
+    while queue:
+        ev = queue.popleft()
+        ts = float(ev.get("ts") or 0.0)
+        dur = float(ev.get("dur") or 0.0)
+        end = ts + dur
+        if ts < step_start or end > step_end:
+            continue
+        out.append(ev)
+        for child in children_map.get(id(ev), []) or []:
+            queue.append(child)
+    return out
+
+
+def _merge_phase_intervals(intervals):
+    normalized = []
+    for item in intervals or []:
+        if not item or len(item) < 2:
+            continue
+        start = float(item[0])
+        end = float(item[1])
+        label = item[2] if len(item) >= 3 else ""
+        if end < start:
+            start, end = end, start
+        normalized.append((start, end, label))
+    if not normalized:
+        return []
+    normalized.sort(key=lambda x: (x[0], x[1]))
+    merged = [normalized[0]]
+    for start, end, label in normalized[1:]:
+        last_start, last_end, last_label = merged[-1]
+        if start <= last_end:
+            merged[-1] = (last_start, max(last_end, end), last_label)
+        else:
+            merged.append((start, end, label))
+    return merged
+
+
 def build_loc_index(dag):
     """Build source-location inverted index for Step 2 matching.
 
@@ -3582,6 +3721,7 @@ def build_loc_index(dag):
                 if attr_name not in first_call:
                     add(attr_def.get(attr_name), class_name, attr_name)
             if not attrs and not first_call and not attr_def and not dep_locs:
+                _warn_loc_index_self_fallback_once(class_name)
                 file_path = class_key[0] if isinstance(class_key, tuple) and len(class_key) >= 2 else info.get("file")
                 for method_name, (start, end) in (info.get("methods") or {}).items():
                     if method_name == "forward":
@@ -3636,18 +3776,17 @@ def match_kernel_to_instance(chain, loc_index, dag) -> MatchResult:
         if attr_name == "<self>":
             file_path, line = _frame_file_line(frame)
             return MatchResult((class_name, "<self>", line or 0, ()), "matched_self_forward_frame", frame, candidates)
-        parent_key = _lookup_parent_instance_key(dag, class_name, attr_name)
+        parent_key = _resolve_attr_instance_key(dag, class_name, attr_name, frame, chain, depth)
         instance_suffix = getattr(chain, "instance_suffix", "") or ""
         if instance_suffix == "":
-            instance_key = _lookup_instance_key(dag, class_name, attr_name) or parent_key
-            return MatchResult(instance_key, "matched_without_instance_suffix", frame, candidates)
+            return MatchResult(parent_key, "matched_without_instance_suffix", frame, candidates)
 
         index = _parse_instance_suffix(instance_suffix)
         if index is None:
             return MatchResult(parent_key, "instance_suffix_index_missing_fallback_to_parent_group", frame, candidates)
         child_attr_name = _make_indexed_attr_name(attr_name, index)
-        child_key = _lookup_instance_key(dag, class_name, child_attr_name)
-        if child_key is not None:
+        child_key = _resolve_attr_instance_key(dag, class_name, child_attr_name, frame, chain, depth)
+        if child_key[0] != class_name or _lookup_child_class_from_static_tree(dag, class_name, child_attr_name):
             return MatchResult(child_key, "matched_with_instance_suffix", frame, candidates)
 
         file_path, line = _frame_file_line(frame)
@@ -4405,7 +4544,7 @@ def build_kernel_stack_cost_table(events, source_files, fwdbwd_index):
     return rows
 
 
-def build_kernel_attribution_table(events, source_files, class_map, step_infos, fwdbwd_index):
+def build_kernel_attribution_table(events, source_files, class_map, step_infos, fwdbwd_index, static_module_tree=None):
     """Step 2: for every kernel, decide which InstanceKey(s) it belongs to
     and with what weight (weights sum to 1 per kernel).
 
@@ -4419,7 +4558,7 @@ def build_kernel_attribution_table(events, source_files, class_map, step_infos, 
                     "bwd_via_flow_narrowed": 0}
 
     ext_to_module = _build_external_id_to_module_map(events)
-    loc_index = build_loc_index(class_map)
+    loc_index = build_loc_index(static_module_tree or class_map)
     kernel_rows = build_kernel_stack_cost_table(events, source_files, fwdbwd_index)
     kernel_rows = filter_kernel_stack_chains(kernel_rows, source_files, step_infos)
 
@@ -4505,7 +4644,7 @@ def build_kernel_attribution_table(events, source_files, class_map, step_infos, 
                 frames=chain,
                 instance_suffix=meta.get("instance_suffix", ""),
             )
-            result = match_kernel_to_instance(kernel_chain, loc_index, class_map)
+            result = match_kernel_to_instance(kernel_chain, loc_index, static_module_tree or class_map)
             if result.instance_key == "__unattributed__":
                 continue
             hit_counts[result.instance_key] = hit_counts.get(result.instance_key, 0) + 1
@@ -4640,7 +4779,7 @@ def rollup_instance_timing(kernel_attribution, events, step_infos, class_map, ro
         # Find a primary root instance to receive orphans
         primary_root_key = None
         for k in timings:
-            if k[0] in roots and k[1] == "<root>":
+            if k[0] in roots and k[1] == "<wrapped>":
                 primary_root_key = k
                 break
         if not primary_root_key:
@@ -4669,7 +4808,24 @@ def rollup_instance_timing(kernel_attribution, events, step_infos, class_map, ro
 # Step 4: instance + class panel data
 # --------------------------------------------------------------------------
 
-def build_timing_panel_data(instance_timing, class_map, step_dur_us):
+def _compute_step_phase_totals(events, step_infos):
+    totals = {"forward": 0.0, "backward": 0.0, "optimize": 0.0, "other": 0.0}
+    num_steps = max(1, len(step_infos or []))
+    for event in events or []:
+        if event.get("cat") != "kernel":
+            continue
+        ts = float(event.get("ts") or 0.0)
+        dur = float(event.get("dur") or 0.0)
+        phase = classify_kernel_phase(ts, ts + dur, step_infos or [])
+        if phase not in totals:
+            phase = "other"
+        totals[phase] += dur
+    for phase in totals:
+        totals[phase] /= num_steps
+    return totals
+
+
+def build_timing_panel_data(instance_timing, class_map, step_dur_us, phase_totals=None):
     """Step 4: convert instance_timing → timing_data fields:
       - runtime_instance_timings_by_class (instance level)
       - class_durations / class_durations_fwd / class_durations_bwd
@@ -4678,6 +4834,29 @@ def build_timing_panel_data(instance_timing, class_map, step_dur_us):
     by_class = defaultdict(list)
     root_step_phase_str = None
     root_step_phase_total = -1.0
+    root_inclusive_forward_us = 0.0
+    root_inclusive_backward_us = 0.0
+    root_inclusive_optimize_us = 0.0
+    root_inclusive_other_us = 0.0
+    if phase_totals:
+        root_inclusive_forward_us = float(phase_totals.get("forward", 0.0) or 0.0)
+        root_inclusive_backward_us = float(phase_totals.get("backward", 0.0) or 0.0)
+        root_inclusive_optimize_us = float(phase_totals.get("optimize", 0.0) or 0.0)
+        root_inclusive_other_us = float(phase_totals.get("other", 0.0) or 0.0)
+        host_us = max(
+            0.0,
+            float(step_dur_us or 0.0)
+            - root_inclusive_forward_us
+            - root_inclusive_backward_us
+            - root_inclusive_optimize_us
+            - root_inclusive_other_us,
+        )
+        root_step_phase_str = (
+            f"fwd={root_inclusive_forward_us / 1000.0:.3f} + "
+            f"bwd={root_inclusive_backward_us / 1000.0:.3f} + "
+            f"opt={root_inclusive_optimize_us / 1000.0:.3f} + "
+            f"host={host_us / 1000.0:.3f} = {float(step_dur_us or 0.0) / 1000.0:.3f} ms"
+        )
     for key, rec in instance_timing.items():
         cls = rec["class_name"]
         csf = rec["callsite_file"]
@@ -4718,12 +4897,18 @@ def build_timing_panel_data(instance_timing, class_map, step_dur_us):
             "inclusive_optimize_us": inc_opt,
             "inclusive_other_us": inc_oth,
         }
-        if not anc and inc_total > root_step_phase_total:
+        if (not phase_totals) and (not anc) and inc_total > root_step_phase_total:
             root_step_phase_total = inc_total
+            root_inclusive_forward_us = inc_fwd
+            root_inclusive_backward_us = inc_bwd
+            root_inclusive_optimize_us = inc_opt
+            root_inclusive_other_us = inc_oth
+            host_us = max(0.0, float(step_dur_us or 0.0) - inc_fwd - inc_bwd - inc_opt)
             root_step_phase_str = (
-                f"fwd={inc_fwd / 1000.0:.3f} "
-                f"bwd={inc_bwd / 1000.0:.3f} "
-                f"opt={inc_opt / 1000.0:.3f} ms"
+                f"fwd={inc_fwd / 1000.0:.3f} + "
+                f"bwd={inc_bwd / 1000.0:.3f} + "
+                f"opt={inc_opt / 1000.0:.3f} + "
+                f"host={host_us / 1000.0:.3f} = {float(step_dur_us or 0.0) / 1000.0:.3f} ms"
             )
         by_class[cls].append(item)
 
@@ -4753,10 +4938,14 @@ def build_timing_panel_data(instance_timing, class_map, step_dur_us):
         "class_durations_fwd": class_durations_fwd,
         "class_durations_bwd": class_durations_bwd,
         "step_phase_str": root_step_phase_str,
+        "inclusive_forward_us": root_inclusive_forward_us,
+        "inclusive_backward_us": root_inclusive_backward_us,
+        "inclusive_optimize_us": root_inclusive_optimize_us,
+        "inclusive_other_us": root_inclusive_other_us,
     }
 
 
-def build_instance_timing_pipeline(events, source_files, class_map, step_infos, step_dur_us, roots=None):
+def build_instance_timing_pipeline(events, source_files, class_map, step_infos, step_dur_us, roots=None, static_module_tree=None):
     """Top-level entry: runs Step 1→4 and returns timing_data fragment.
 
     Output keys:
@@ -4766,10 +4955,11 @@ def build_instance_timing_pipeline(events, source_files, class_map, step_infos, 
     """
     fwdbwd_index = build_fwdbwd_flow_index(events)
     attribution, stats = build_kernel_attribution_table(
-        events, source_files, class_map, step_infos, fwdbwd_index,
+        events, source_files, class_map, step_infos, fwdbwd_index, static_module_tree=static_module_tree,
     )
     instance_timing = rollup_instance_timing(attribution, events, step_infos, class_map, roots=roots)
-    panel = build_timing_panel_data(instance_timing, class_map, step_dur_us)
+    phase_totals = _compute_step_phase_totals(events, step_infos)
+    panel = build_timing_panel_data(instance_timing, class_map, step_dur_us, phase_totals=phase_totals)
     panel["_timing_pipeline_stats"] = stats
     num_steps = max(1, len(step_infos))
     panel["step_kernel_us"] = stats.get("total_kernel_dur_us", 0) / num_steps
@@ -11616,9 +11806,9 @@ def main():
             print("  流程图基于源码静态结构生成，无源码时无法确定模块层级关系")
         else:
             # Extract roots for timing rollup (Step 3 orphan aggregation)
-            _, roots, _ = build_static_module_tree(source_files, conditional_mode="train")
+            static_module_tree, roots, _ = build_static_module_tree(source_files, conditional_mode="train")
             # Build timing data from trace to overlay on static structure
-            timing_data = build_timing_data_from_trace(events, source_files, mod_info, step_dur_us, profiler_steps, src_info=src_info, roots=roots)
+            timing_data = build_timing_data_from_trace(events, source_files, mod_info, step_dur_us, profiler_steps, src_info=src_info, roots=roots, static_module_tree=static_module_tree)
             print("  正在生成 HTML 模块流程图 (源码结构 + 运行时层级 + 时间填充, 双 Tab: 训练/推理)...")
             result = generate_html_flowchart_dual(source_files, timing_data=timing_data, meta=meta, output_path=args.html_flowchart, trace_events=events)
             if result:
