@@ -4480,6 +4480,17 @@ def _build_data_dependency_edges(source_files, class_map, module_attrs, class_st
     if class_str_list_attrs is None:
         class_str_list_attrs = {}
 
+    def _extract_all_names(node: ast.AST) -> list[str]:
+        """从 AST node walk 出所有 Name.id（去重，保序，过滤 self/cls）"""
+        seen, result = set(), []
+        if node is None:
+            return result
+        for n in ast.walk(node):
+            if isinstance(n, ast.Name) and n.id not in seen and n.id not in ("self", "cls"):
+                seen.add(n.id)
+                result.append(n.id)
+        return result
+
     # -------------------------------------------------------------------
     # dict 数据流追踪（v7 根因修复核心）：
     # - dict 槽位写入：d['k'] = v
@@ -4797,8 +4808,12 @@ def _build_data_dependency_edges(source_files, class_map, module_attrs, class_st
                 step_text = _line_text(lineno)
                 key = (target_var, lineno)
                 if key not in seen and step_text:
+                    _carriers = []
+                    if isinstance(target_var, str) and target_var.isidentifier():
+                        _carriers = [target_var]
                     base.append({"var": target_var, "file": fname,
-                                 "line": lineno, "text": step_text})
+                                 "line": lineno, "text": step_text,
+                                 "carriers": _carriers})
                 if base:
                     var_lineage[target_var] = base
 
@@ -6303,11 +6318,13 @@ def _build_data_dependency_edges(source_files, class_map, module_attrs, class_st
                                 _chain = _filter_chain_by_producer(_chain, producer, var_producers)
                             _consumer_text = _line_text(phys_lineno)
                             if _consumer_text:
+                                _consumer_carriers = _extract_all_names(call_node)
                                 _consumer_step = {"var": _carrier if isinstance(_carrier, str) else "",
                                                   "file": fname,
                                                   "line": phys_lineno,
                                                   "text": _consumer_text,
-                                                  "role": "consumer"}
+                                                  "role": "consumer",
+                                                  "carriers": _consumer_carriers}
                                 # Avoid duplicating if last chain entry is the
                                 # consumer line already.
                                 if not _chain or _chain[-1].get("line") != phys_lineno:

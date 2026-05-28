@@ -26,6 +26,7 @@ import os
 import sys
 import json as _json
 import re
+import ast
 from collections import defaultdict
 from pathlib import Path
 
@@ -1573,7 +1574,7 @@ function showEdgePanel(edge) {
                         bodyHtml += '<div class="lineage-step">' +
                             '<div class="lineage-head">' + tag + ' ' + vlabel +
                             ' <span class="lineage-loc">@' + escapeHtml(step.file || ev.file) + ':' + step.line + '</span></div>' +
-                            renderCodeBlock(step.excerpt && step.excerpt.text, step.excerpt && step.excerpt.start, step.excerpt && step.excerpt.highlight, step.var ? [step.var] : [], stepMarkClass) +
+                            renderCodeBlock(step.excerpt && step.excerpt.text, step.excerpt && step.excerpt.start, step.excerpt && step.excerpt.highlight, (step.carriers && step.carriers.length > 0) ? step.carriers : (step.var ? [step.var] : []), stepMarkClass) +
                             '</div>';
                     });
                     bodyHtml += '</div>';
@@ -2811,6 +2812,7 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
                                         "highlight": _ln,
                                     },
                                     "role": s.get("role", "step"),
+                                    "carriers": s.get("carriers", []),
                                 })
                             return out
                         edge["evidence"] = {
@@ -3572,7 +3574,69 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
             return _steps
         _line_text = _slines[_ln - 1]
 
+        def _extract_all_names_from_node(node):
+            """AST walk all Name.id values, deduped in order, excluding self/cls."""
+            seen, result = set(), []
+            if node is None:
+                return result
+            for n in ast.walk(node):
+                if isinstance(n, ast.Name) and n.id not in seen and n.id not in ("self", "cls"):
+                    seen.add(n.id)
+                    result.append(n.id)
+            return result
+
+        def _extract_lhs_targets_from_call_line(line_text):
+            try:
+                _tree = ast.parse(line_text)
+            except SyntaxError:
+                return []
+            for _node in ast.walk(_tree):
+                if isinstance(_node, ast.Assign):
+                    for _target in _node.targets:
+                        _names = _extract_all_names_from_node(_target)
+                        if _names:
+                            return [v for v in _names if v != "_"]
+            return []
+
+        def _extract_call_arg_names_from_call_line(line_text):
+            try:
+                _tree = ast.parse(line_text)
+            except SyntaxError:
+                return []
+            _base = re.sub(r'#\d+$', '', child_attr or '')
+            _container = re.match(r'^(\w+)\[(.+)\]$', _base)
+            _scan = _container.group(1) if _container else _base
+            for _node in ast.walk(_tree):
+                if not isinstance(_node, ast.Call):
+                    continue
+                _func = _node.func
+                _is_match = (
+                    isinstance(_func, ast.Attribute)
+                    and isinstance(_func.value, ast.Name)
+                    and _func.value.id == "self"
+                    and _func.attr == _scan
+                ) or (
+                    isinstance(_func, ast.Subscript)
+                    and isinstance(_func.value, ast.Attribute)
+                    and isinstance(_func.value.value, ast.Name)
+                    and _func.value.value.id == "self"
+                    and _func.value.attr == _scan
+                ) or (
+                    isinstance(_func, ast.Name)
+                )
+                if _is_match:
+                    _names = []
+                    for _arg in list(_node.args) + [kw.value for kw in _node.keywords if kw.value is not None]:
+                        for _name in _extract_all_names_from_node(_arg):
+                            if _name not in _names:
+                                _names.append(_name)
+                    if _names:
+                        return _names
+            return []
+
         # Determine carry variable on the call_site line.
+        _producer_carriers = _extract_lhs_targets_from_call_line(_line_text)
+        _consumer_carriers = _extract_call_arg_names_from_call_line(_line_text)
         _base_attr = re.sub(r'#\d+$', '', child_attr or '')
         _container_match = re.match(r'^(\w+)\[(.+)\]$', _base_attr)
         _scan_attr = _container_match.group(1) if _container_match else _base_attr
@@ -3629,6 +3693,7 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
             "line": _ln,
             "excerpt": _excerpt,
             "role": "producer",
+            "carriers": _producer_carriers,
         })
 
         # STEP2 (consumer): the call_site line where X is invoked.
@@ -3638,6 +3703,7 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
             "line": _ln,
             "excerpt": _excerpt,
             "role": "consumer",
+            "carriers": _consumer_carriers,
         })
 
         # Iter13e: deliberately DO NOT descend into the child's forward()
