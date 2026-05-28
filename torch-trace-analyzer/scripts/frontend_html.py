@@ -2813,6 +2813,7 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
                                     },
                                     "role": s.get("role", "step"),
                                     "carriers": s.get("carriers", []),
+                                    "arg_carriers": s.get("arg_carriers", []),
                                 })
                             return out
                         edge["evidence"] = {

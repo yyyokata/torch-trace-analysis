@@ -6374,6 +6374,10 @@ def _build_data_dependency_edges(source_files, class_map, module_attrs, class_st
                     for v_clean in _ast_lhs_targets:
                         var_producers[v_clean] = (set(last_calls), phys_lineno)
                         _record_lineage(v_clean, _vars_in(line), phys_lineno)
+                        if v_clean in var_lineage and var_lineage[v_clean]:
+                            var_lineage[v_clean][-1]["carriers"] = list(_ast_lhs_targets)
+                            if _ast_assign_like and _ast_assign_like.get("rhs_node") is not None:
+                                var_lineage[v_clean][-1]["arg_carriers"] = _extract_all_names(_ast_assign_like.get("rhs_node"))
                     _handled_lhs = True
                 if not _handled_lhs:
                     # AST-only LHS handling.
