@@ -3569,9 +3569,10 @@ def build_loc_index(dag):
             loc_index[key].append(candidate)
 
     if isinstance(dag, dict) and "classes" not in dag:
-        for class_name, info in dag.items():
+        for class_key, info in dag.items():
             if not isinstance(info, dict):
                 continue
+            class_name = class_key[1] if isinstance(class_key, tuple) and len(class_key) >= 2 else class_key
             attrs = info.get("attrs", {}) or {}
             first_call = info.get("first_call_loc", {}) or {}
             attr_def = info.get("attr_def_loc", {}) or {}
@@ -3580,6 +3581,12 @@ def build_loc_index(dag):
                 add(first_call.get(attr_name), class_name, attr_name)
                 if attr_name not in first_call:
                     add(attr_def.get(attr_name), class_name, attr_name)
+            if not attrs and not first_call and not attr_def and not dep_locs:
+                file_path = class_key[0] if isinstance(class_key, tuple) and len(class_key) >= 2 else info.get("file")
+                for method_name, (start, end) in (info.get("methods") or {}).items():
+                    if method_name == "forward":
+                        for line in range(int(start), int(end) + 1):
+                            add((file_path, line), class_name, "<self>")
             for (from_attr, to_attr), ev in dep_locs.items():
                 if isinstance(ev, dict):
                     add((ev.get("file"), ev.get("from_line")), class_name, from_attr)
@@ -3626,6 +3633,9 @@ def match_kernel_to_instance(chain, loc_index, dag) -> MatchResult:
     depth, frame, candidates = max(matched, key=lambda item: item[0])
 
     for class_name, attr_name in candidates:
+        if attr_name == "<self>":
+            file_path, line = _frame_file_line(frame)
+            return MatchResult((class_name, "<self>", line or 0, ()), "matched_self_forward_frame", frame, candidates)
         parent_key = _lookup_parent_instance_key(dag, class_name, attr_name)
         instance_suffix = getattr(chain, "instance_suffix", "") or ""
         if instance_suffix == "":
@@ -4500,15 +4510,6 @@ def build_kernel_attribution_table(events, source_files, class_map, step_infos, 
                 continue
             hit_counts[result.instance_key] = hit_counts.get(result.instance_key, 0) + 1
             total_hits += 1
-
-        if total_hits == 0 and not loc_index:
-            for chain in chains:
-                chain_keys = _extract_instance_keys_from_stack(chain, class_map)
-                if not chain_keys:
-                    continue
-                leaf = chain_keys[-1]
-                hit_counts[leaf] = hit_counts.get(leaf, 0) + 1
-                total_hits += 1
 
         if total_hits == 0:
             mod_name = meta.get("mod_name") or ext_to_module.get((event.get("args") or {}).get("External id"))
