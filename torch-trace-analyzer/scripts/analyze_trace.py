@@ -8499,6 +8499,8 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
             c.isupper() or c.isdigit() or c == "_" for c in _s
         )
 
+    nn_import_aliases = {}  # {alias_name: short_name}, e.g. {"TorchLinear": "Linear"}
+
     for _fname, _lines in source_files.items():
         int_consts = {}
         str_list_consts_raw = {}
@@ -8506,6 +8508,13 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
         _file_tree = _fe.tree if _fe is not None else None
         if _file_tree is not None:
             for _node in _file_tree.body:
+                if isinstance(_node, ast.ImportFrom) and _node.module == "torch.nn":
+                    for _alias in _node.names:
+                        if _alias.name == "*":
+                            continue
+                        _alias_name = _alias.asname or _alias.name
+                        nn_import_aliases[_alias_name] = _alias.name
+                    continue
                 if not isinstance(_node, ast.Assign) or len(_node.targets) != 1:
                     continue
                 _t = _node.targets[0]
@@ -8527,6 +8536,24 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                     str_list_consts_raw[_t.id] = _inner_text
         file_int_consts[_fname] = int_consts
         file_str_list_globals_raw[_fname] = str_list_consts_raw
+
+    def _extract_nn_short(cls_ref_full, nn_import_aliases=None):
+        """Normalize a constructor ref into _is_nn_leaf_stub's short name.
+
+        Supports nn.Linear, torch.nn.Linear, and from-torch.nn import aliases.
+        Returns (short_name, canonical_ref) or (None, None).
+        """
+        cls_ref_full = (cls_ref_full or "").strip()
+        if cls_ref_full.startswith("nn."):
+            short = cls_ref_full.split(".", 1)[1]
+            return short, cls_ref_full
+        if cls_ref_full.startswith("torch.nn."):
+            short = cls_ref_full.split(".", 2)[2]
+            return short, "nn." + short
+        if nn_import_aliases and cls_ref_full in nn_import_aliases:
+            short = nn_import_aliases[cls_ref_full]
+            return short, "nn." + short
+        return None, None
 
     # 全局常量：同名常量在多个文件出现时，若值唯一则可跨文件解析
     global_int_const_values = defaultdict(set)
@@ -9312,10 +9339,9 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                         cls_ref_full = _ast_init_item.get("class") or ""
                     cls_ref = cls_ref_full.split('.')[-1]
                     native_cls_ref = None
-                    if cls_ref_full.startswith("nn."):
-                        _nn_short = cls_ref_full.split(".", 1)[1]  # e.g. "Linear", "ModuleDict"
-                        if _is_nn_leaf_stub(_nn_short):
-                            native_cls_ref = cls_ref_full
+                    _nn_short, _nn_canonical = _extract_nn_short(cls_ref_full, nn_import_aliases)
+                    if _nn_short and _is_nn_leaf_stub(_nn_short):
+                        native_cls_ref = _nn_canonical
                     if cls_ref in nn_module_classes:
                         # Iter13 Step1: track conditional attrs regardless of mode.
                         if _active_branch is not None:
@@ -9386,16 +9412,31 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                             _len = _eval_list_len_node(_gen0.iter, fname, cname, mname)
                             if _len is not None:
                                 _n = _len
-                        if _n is not None and _cls_ref in nn_module_classes:
-                            attrs.setdefault(cont, _cls_ref)
-                            attr_def_loc.setdefault((cname, cont), (fname, phys_lineno))
-                            for i in range(_n):
-                                _ensure_elem(cont, cname, _elem_attr_list(cont, i), _cls_ref, fname, phys_lineno, attrs)
+                        if _n is not None:
+                            _short, _canonical = _extract_nn_short(_node_to_text(_arg0.elt.func), nn_import_aliases)
+                            if _short and _is_nn_leaf_stub(_short):
+                                attrs.setdefault(cont, _canonical)
+                                attr_def_loc.setdefault((cname, cont), (fname, phys_lineno))
+                                torch_native_module_classes.add(_canonical)
+                                for i in range(_n):
+                                    _ensure_elem(cont, cname, _elem_attr_list(cont, i), _canonical, fname, phys_lineno, attrs)
+                            elif _cls_ref in nn_module_classes:
+                                attrs.setdefault(cont, _cls_ref)
+                                attr_def_loc.setdefault((cname, cont), (fname, phys_lineno))
+                                for i in range(_n):
+                                    _ensure_elem(cont, cname, _elem_attr_list(cont, i), _cls_ref, fname, phys_lineno, attrs)
                     elif isinstance(_arg0, ast.List):
                         for i, _elt in enumerate(_arg0.elts):
                             if isinstance(_elt, ast.Call):
-                                cls_ref = _node_to_text(_elt.func).split('.')[-1]
-                                if cls_ref in nn_module_classes:
+                                cls_ref_full = _node_to_text(_elt.func)
+                                cls_ref = cls_ref_full.split('.')[-1]
+                                _short, _canonical = _extract_nn_short(cls_ref_full, nn_import_aliases)
+                                if _short and _is_nn_leaf_stub(_short):
+                                    attrs.setdefault(cont, _canonical)
+                                    attr_def_loc.setdefault((cname, cont), (fname, phys_lineno))
+                                    torch_native_module_classes.add(_canonical)
+                                    _ensure_elem(cont, cname, _elem_attr_list(cont, i), _canonical, fname, phys_lineno, attrs)
+                                elif cls_ref in nn_module_classes:
                                     attrs.setdefault(cont, cls_ref)
                                     attr_def_loc.setdefault((cname, cont), (fname, phys_lineno))
                                     _ensure_elem(cont, cname, _elem_attr_list(cont, i), cls_ref, fname, phys_lineno, attrs)
@@ -9422,7 +9463,15 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                     attr_name = _ast_append_ctor.get("attr")
                     cls_ref_full = _ast_append_ctor.get("class_full") or ""
                     cls_ref = cls_ref_full.split('.')[-1]
-                    if cls_ref in nn_module_classes:
+                    _short, _canonical = _extract_nn_short(cls_ref_full, nn_import_aliases)
+                    if _short and _is_nn_leaf_stub(_short):
+                        attrs[attr_name] = _canonical
+                        attr_def_loc.setdefault((cname, attr_name), (fname, phys_lineno))
+                        torch_native_module_classes.add(_canonical)
+                        idx = len(container_elems[cname][attr_name])
+                        _ensure_elem(attr_name, cname, _elem_attr_list(attr_name, idx), _canonical, fname, phys_lineno, attrs)
+                        _record_container_kind(cname, attr_name, "list")
+                    elif cls_ref in nn_module_classes:
                         # 保留基线：container 名仍映射到子类
                         attrs[attr_name] = cls_ref
                         attr_def_loc.setdefault((cname, attr_name), (fname, phys_lineno))
@@ -9529,7 +9578,25 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                         cls_ref_full = _ast_setattr_ctor.get("class_full") or ""
                     if cls_ref_full:
                         cls_ref = cls_ref_full.split('.')[-1]
-                        if cls_ref in nn_module_classes:
+                        _native_short, _native_canonical = _extract_nn_short(cls_ref_full, nn_import_aliases)
+                        if _native_short and _is_nn_leaf_stub(_native_short):
+                            # name literal: 'xxx' / "xxx" / f'xxx'(no {}) / f"xxx"(no {})
+                            real_attr = None
+                            try:
+                                _name_node = ast.parse(name_expr, mode='eval').body
+                            except SyntaxError:
+                                _name_node = None
+                            if isinstance(_name_node, ast.Constant) and isinstance(_name_node.value, str):
+                                real_attr = _name_node.value
+                            elif isinstance(_name_node, ast.JoinedStr):
+                                if all(isinstance(v, ast.Constant) and isinstance(v.value, str)
+                                       for v in _name_node.values):
+                                    real_attr = ''.join(v.value for v in _name_node.values)
+                            if real_attr:
+                                attrs[real_attr] = _native_canonical
+                                attr_def_loc.setdefault((cname, real_attr), (fname, phys_lineno))
+                                torch_native_module_classes.add(_native_canonical)
+                        elif cls_ref in nn_module_classes:
                             # name literal: 'xxx' / "xxx" / f'xxx'(no {}) / f"xxx"(no {})
                             real_attr = None
                             _fstr_handled = False
