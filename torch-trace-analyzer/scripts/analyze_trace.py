@@ -4409,6 +4409,7 @@ def build_kernel_attribution_table(events, source_files, class_map, step_infos, 
                     "bwd_via_flow_narrowed": 0}
 
     ext_to_module = _build_external_id_to_module_map(events)
+    loc_index = build_loc_index(class_map)
     kernel_rows = build_kernel_stack_cost_table(events, source_files, fwdbwd_index)
     kernel_rows = filter_kernel_stack_chains(kernel_rows, source_files, step_infos)
 
@@ -4488,12 +4489,26 @@ def build_kernel_attribution_table(events, source_files, class_map, step_infos, 
         hit_counts = {}
         total_hits = 0
         for chain in chains:
-            chain_keys = _extract_instance_keys_from_stack(chain, class_map)
-            if not chain_keys:
+            kernel_chain = KernelChain(
+                kernel_name=meta.get("name") or event.get("name", ""),
+                duration_us=meta.get("dur_us", 0.0),
+                frames=chain,
+                instance_suffix=meta.get("instance_suffix", ""),
+            )
+            result = match_kernel_to_instance(kernel_chain, loc_index, class_map)
+            if result.instance_key == "__unattributed__":
                 continue
-            leaf = chain_keys[-1]
-            hit_counts[leaf] = hit_counts.get(leaf, 0) + 1
+            hit_counts[result.instance_key] = hit_counts.get(result.instance_key, 0) + 1
             total_hits += 1
+
+        if total_hits == 0 and not loc_index:
+            for chain in chains:
+                chain_keys = _extract_instance_keys_from_stack(chain, class_map)
+                if not chain_keys:
+                    continue
+                leaf = chain_keys[-1]
+                hit_counts[leaf] = hit_counts.get(leaf, 0) + 1
+                total_hits += 1
 
         if total_hits == 0:
             mod_name = meta.get("mod_name") or ext_to_module.get((event.get("args") or {}).get("External id"))
