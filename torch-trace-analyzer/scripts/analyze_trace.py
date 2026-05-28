@@ -2248,18 +2248,10 @@ class ConstantResolver:
         param = self.table.self_to_param.get(cls_key, {}).get(head)
         if param is None:
             return None
-        chain = None
-        if scope.parent_cls is not None and scope.parent_attr is not None:
-            inst_key = (scope.parent_cls, scope.parent_attr)
-            chain = self.table.instance_const_chain.get(inst_key, {}).get(param)
-        if chain is None:
-            annos = self.table.class_init_param_anno.get(cls_key, {})
-            anno_cls = annos.get(param)
-            if anno_cls:
-                for (_df_file, _df_cls), defaults in self.table.dataclass_defaults.items():
-                    if _df_cls == anno_cls:
-                        chain = defaults
-                        break
+        if scope.parent_cls is None or scope.parent_attr is None:
+            return None
+        inst_key = (scope.parent_cls, scope.parent_attr)
+        chain = self.table.instance_const_chain.get(inst_key, {}).get(param)
         if chain is None:
             return None
         cur: Any = chain
