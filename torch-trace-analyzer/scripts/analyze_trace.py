@@ -3408,7 +3408,6 @@ def _build_external_id_to_module_map(events):
 
 
 _STACK_FRAME_RE = re.compile(r'File "([^"]+)", line (\d+), in (\w+)')
-_DYNAMO_RESUME_RE = re.compile(r'torch_dynamo_resume_in_')
 
 
 def _parse_user_frames(traces, source_files):
@@ -3728,7 +3727,7 @@ def _is_backward_trace(traces):
 def build_kernel_stack_cost_table(events, source_files, fwdbwd_index):
     """
     返回 list[dict]，每条 kernel 对应一条，dict 字段：
-      name, dur_us, phase, path, chains, unmatched
+      name, dur_us, phase, has_stack_traces, chains, unmatched
     chains 元素为 (file, line, func) tuple，innermost first。
     phase: "bwd"(launch.tid != main_thread_tid) | "non-bwd"
 
@@ -3846,47 +3845,42 @@ def build_kernel_stack_cost_table(events, source_files, fwdbwd_index):
             line = callsite_line
         return (file_path, line, name_str)
 
-    def _is_dynamo_resume_top_frame(traces):
-        if not traces:
-            return False
-        first_trace = str(traces[0])
-        first_line = first_trace.splitlines()[0] if first_trace else ""
-        return bool(_DYNAMO_RESUME_RE.search(first_line))
+    def _upper_frames_for_non_bwd(launch):
+        if launch is None:
+            return []
+        launch_ts = launch.get("ts")
+        if launch_ts is None:
+            return []
+        tid = main_thread_tid if main_thread_tid is not None else launch.get("tid")
+        return [_module_event_to_frame(e) for e in _covering_nn_modules(tid, launch_ts)]
 
-    def _find_innermost_nn_module_on_main_thread(launch_ts):
-        if main_thread_tid is None or launch_ts is None:
-            return None
-        covering = _find_covering(tid_nn_module_sorted.get(main_thread_tid, []), launch_ts)
-        return covering[0][1] if covering else None
-
-    def _nn_module_event_to_outermost_frame(ev):
-        name_str = str(ev.get("name", ""))
-        m_name = re.match(r"nn\.Module:\s*(.+?)(?:,\s*callsite:.+)?$", name_str)
-        func = m_name.group(1).strip() if m_name else name_str
-        call_from = (ev.get("args") or {}).get("CallFrom", "")
-        if ":" in str(call_from):
-            file_path, line_s = str(call_from).rsplit(":", 1)
-            try:
-                line = int(line_s.strip())
-            except ValueError:
-                line = 0
-        else:
-            file_path = str(call_from)
-            line = 0
-        return (file_path.strip(), line, func)
-
-    def _build_path_a_prime_row(idx, kernel, ts, tid, traces, launch):
-        chains = _parse_stack_frames(traces)
-        nn_ev = _find_innermost_nn_module_on_main_thread(launch.get("ts") if launch else None)
-        if nn_ev is None:
-            return _row(idx, kernel, ts, tid, "non-bwd", "A'", [], True, traces=traces)
-        chains.append(_nn_module_event_to_outermost_frame(nn_ev))
-        return _row(idx, kernel, ts, tid, "non-bwd", "A'", chains, False, traces=traces)
+    def _upper_frames_for_bwd(launch):
+        if launch is None:
+            return []
+        bwd_tid = launch.get("tid")
+        launch_ts = launch.get("ts")
+        cpu_chain = _covering_cpu_ops(bwd_tid, launch_ts)
+        f_ev = None
+        for cpu_op in cpu_chain:
+            op_ts = cpu_op.get("ts")
+            if op_ts is None:
+                continue
+            f_ev = fwdbwd_f_by_tid_ts.get((bwd_tid, op_ts))
+            if f_ev is not None:
+                break
+        if f_ev is None:
+            return []
+        s_ev = fwdbwd_s_by_id.get(f_ev.get("id"))
+        if s_ev is None:
+            return []
+        fwd_tid = s_ev.get("tid")
+        fwd_ts = s_ev.get("ts")
+        return [_module_event_to_frame(e) for e in _covering_nn_modules(fwd_tid, fwd_ts)]
 
     def _legacy_chains_from_frames(frames):
         return [list(frames)] if frames else []
 
-    def _row(idx, ev, ts, tid, phase, path, chains, unmatched, traces=None, mod_name=None):
+    def _row(idx, ev, ts, tid, phase, has_stack_traces, chains, unmatched, traces=None, mod_name=None):
         normalized = _normalize_runtime_module_name(mod_name) if mod_name else None
         class_name = normalized.get("class_name") if normalized else None
         is_bwd = phase == "bwd"
@@ -3894,7 +3888,7 @@ def build_kernel_stack_cost_table(events, source_files, fwdbwd_index):
             "name": ev.get("name", ""),
             "dur_us": float(ev.get("dur") or 0.0),
             "phase": phase,
-            "path": path,
+            "has_stack_traces": bool(has_stack_traces),
             "chains": chains,
             "unmatched": unmatched,
             # Legacy compatibility for build_kernel_attribution_table.
@@ -3932,56 +3926,18 @@ def build_kernel_stack_cost_table(events, source_files, fwdbwd_index):
         else:
             phase = "bwd" if (launch and launch.get("tid") != main_thread_tid) else "non-bwd"
 
-        if traces:
-            if (
-                launch is not None
-                and main_thread_tid is not None
-                and launch.get("tid") == main_thread_tid
-                and _is_dynamo_resume_top_frame(traces)
-            ):
-                rows.add(idx, _build_path_a_prime_row(idx, kernel, ts, tid, traces, launch))
-            else:
-                chains = _parse_stack_frames(traces)
-                rows.add(idx, _row(idx, kernel, ts, tid, phase, "A", chains, False, traces=traces))
-            continue
-
-        if phase == "bwd":
-            chains = []
-            unmatched = True
-            if launch is not None:
-                bwd_tid = launch.get("tid")
-                launch_ts = launch.get("ts")
-                cpu_chain = _covering_cpu_ops(bwd_tid, launch_ts)
-                f_ev = None
-                for cpu_op in cpu_chain:
-                    op_ts = cpu_op.get("ts")
-                    if op_ts is None:
-                        continue
-                    f_ev = fwdbwd_f_by_tid_ts.get((bwd_tid, op_ts))
-                    if f_ev is not None:
-                        break
-                if f_ev is not None:
-                    s_ev = fwdbwd_s_by_id.get(f_ev.get("id"))
-                    if s_ev is not None:
-                        fwd_tid = s_ev.get("tid")
-                        fwd_ts = s_ev.get("ts")
-                        module_chain = _covering_nn_modules(fwd_tid, fwd_ts)
-                        chains = [_module_event_to_frame(e) for e in module_chain]
-                        unmatched = not bool(chains)
-            rows.add(idx, _row(idx, kernel, ts, tid, "bwd", "B", chains, unmatched, traces=[]))
-            continue
-
-        chains = []
-        unmatched = True
-        if launch is not None:
-            module_chain = _covering_nn_modules(launch.get("tid"), launch.get("ts"))
-            chains = [_module_event_to_frame(e) for e in module_chain]
-            unmatched = not bool(chains)
+        base_chains = _parse_stack_frames(traces)
+        has_stack_traces = bool(base_chains)
+        upper_frames = _upper_frames_for_bwd(launch) if phase == "bwd" else _upper_frames_for_non_bwd(launch)
+        chains = base_chains + upper_frames
+        unmatched = not bool(chains)
         ext_id = args.get("External id") if isinstance(args, dict) else None
         mod_name = ext_to_module.get(ext_id)
         if not mod_name:
             mod_name, _pidx = find_module_parent(kernel, events or [])
-        rows.add(idx, _row(idx, kernel, ts, tid, "non-bwd", "C", chains, unmatched and mod_name is None, traces=[], mod_name=mod_name))
+        if phase == "non-bwd" and not chains and mod_name is not None:
+            unmatched = False
+        rows.add(idx, _row(idx, kernel, ts, tid, phase, has_stack_traces, chains, unmatched, traces=traces, mod_name=mod_name))
 
     return rows
 
