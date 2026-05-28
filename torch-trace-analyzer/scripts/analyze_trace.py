@@ -2215,18 +2215,10 @@ class ConstantResolver:
         param = self.table.self_to_param.get(cls_key, {}).get(head)
         if param is None:
             return None
+        if scope.parent_cls is None or scope.parent_attr is None:
+            return None
         inst_key = (scope.parent_cls, scope.parent_attr)
         chain = self.table.instance_const_chain.get(inst_key, {}).get(param)
-        # Phase E1.2: when no concrete parent has bound the param, fall back
-        # to the dataclass-default field map driven by the formal-param
-        # annotation (e.g. ``cfg: Cfg`` → look up ``Cfg`` defaults).
-        if chain is None:
-            anno_cls = self.table.class_init_param_anno.get(cls_key, {}).get(param)
-            if anno_cls:
-                for (_f, _c), defaults in self.table.dataclass_defaults.items():
-                    if _c == anno_cls:
-                        chain = defaults
-                        break
         if chain is None:
             return None
         cur: Any = chain
