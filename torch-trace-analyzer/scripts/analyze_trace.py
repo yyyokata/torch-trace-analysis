@@ -1204,6 +1204,10 @@ class ConstantTable:
         # ── Per-instance (tables 9-11) ─────────────────────────────────
         self.instance_kw_int: Dict[Tuple[str, str], Dict[str, IntValue]] = {}
         self.instance_kw_list_len: Dict[Tuple[str, str], Dict[str, int]] = {}
+        # Auxiliary: retain per-instance concrete list literals so callers can
+        # recover the real item sequence (for example ``['x', 'y']`` vs
+        # ``['x', 'y', 'z']``) instead of only the aggregated class-level max len.
+        self.instance_kw_list_items: Dict[Tuple[str, str], Dict[str, ListValue]] = {}
         # instance_const_chain[(parent_cls, parent_attr)] ->
         #   {param_name: {field: IntValue}}
         self.instance_const_chain: Dict[
@@ -1618,22 +1622,8 @@ class ConstantTable:
                 sub_cls = self._call_class_name(value.func)
                 if sub_cls is None:
                     continue
-                # --- Step 5/6: literal args via kwargs --------------------
-                for kw in value.keywords:
-                    if kw.arg is None:
-                        continue
-                    kw_val = kw.value
-                    if isinstance(kw_val, ast.Constant) and isinstance(kw_val.value, int) and not isinstance(kw_val.value, bool):
-                        self.instance_kw_int.setdefault((class_name, attr_name), {})[kw.arg] = IntValue(kw_val.value, "kw_arg")
-                    elif (isinstance(kw_val, ast.UnaryOp) and isinstance(kw_val.op, ast.USub)
-                          and isinstance(kw_val.operand, ast.Constant)
-                          and isinstance(kw_val.operand.value, int)
-                          and not isinstance(kw_val.operand.value, bool)):
-                        self.instance_kw_int.setdefault((class_name, attr_name), {})[kw.arg] = IntValue(-kw_val.operand.value, "kw_arg")
-                    elif isinstance(kw_val, ast.List):
-                        self.instance_kw_list_len.setdefault((class_name, attr_name), {})[kw.arg] = len(kw_val.elts)
-                # --- Step 1-4 (Phase E1.2): positional/keyword binding +
-                # dataclass propagation.
+                # --- Step 1-6: positional/keyword binding + per-instance
+                # literal/dataclass propagation.
                 # Locate ``SubClass.__init__`` formal parameter list across
                 # any defining file (the dataclass / subclass may live in a
                 # different file than the parent class).
@@ -1668,12 +1658,20 @@ class ConstantTable:
                 if not bound:
                     continue
                 scope_key = (fname, class_name, "__init__")
+                scope = Scope(file=fname, cls=class_name, method="__init__")
+                inst_key = (class_name, attr_name)
                 for param, expr_node in bound.items():
+                    iv = self._resolve_bound_int(expr_node, scope)
+                    if iv is not None:
+                        self.instance_kw_int.setdefault(inst_key, {})[param] = iv
+                    list_value = self._resolve_bound_list_value(expr_node, scope_key)
+                    if list_value is not None:
+                        self.instance_kw_list_len.setdefault(inst_key, {})[param] = list_value.length
+                        self.instance_kw_list_items.setdefault(inst_key, {})[param] = list_value
                     fields = self._resolve_bound_dataclass_fields(expr_node, scope_key)
                     if not fields:
                         continue
-                    chain_key = (class_name, attr_name)
-                    slot = self.instance_const_chain.setdefault(chain_key, {})
+                    slot = self.instance_const_chain.setdefault(inst_key, {})
                     existing = slot.get(param)
                     if existing is None:
                         slot[param] = fields
@@ -1690,6 +1688,32 @@ class ConstantTable:
             if _cname == sub_cls:
                 return params
         return []
+
+    def _resolve_bound_int(self,
+                           expr_node: ast.expr,
+                           scope: Scope) -> Optional[IntValue]:
+        resolver = ConstantResolver(self)
+        iv = resolver.eval_int(expr_node, scope)
+        if iv is None:
+            return None
+        return IntValue(iv.value, "callsite_bind")
+
+    def _resolve_bound_list_value(self,
+                                  expr_node: ast.expr,
+                                  scope_key: Tuple[str, str, str]) -> Optional[ListValue]:
+        fname, cname, mname = scope_key
+        resolver = ConstantResolver(self)
+        list_node = resolver._resolve_to_list_literal(
+            expr_node,
+            Scope(file=fname, cls=cname, method=mname),
+        )
+        if list_node is None:
+            return None
+        return ListValue(
+            length=len(list_node.elts),
+            items=tuple(list_node.elts),
+            origin="callsite_bind",
+        )
 
     def _resolve_bound_dataclass_fields(self,
                                         expr_node: ast.expr,
@@ -1939,10 +1963,18 @@ class ConstantResolver:
         # ③ Global unique constant.
         if node.id in self.table.global_int_consts:
             return self.table.global_int_consts[node.id]
-        # ④ Class formal parameter — try class-level union (only when unique).
+        # ④ Class formal parameter — try per-instance first, then class-level
+        #    union (only when unique).
         if scope.cls is not None:
             params = self.table.class_init_params.get((scope.file, scope.cls), [])
             if node.id in params:
+                # Per-instance override via instance_kw_int.
+                inst_key = scope.instance_key
+                if inst_key[0] is not None and inst_key[1] is not None:
+                    inst_int = self.table.instance_kw_int.get(inst_key, {})
+                    if node.id in inst_int:
+                        return inst_int[node.id]
+                # Fallback to class-level ctor_kw_args union when unique.
                 kw_set = self.table.ctor_kw_args.get(scope.cls, {}).get(node.id)
                 if kw_set and len(kw_set) == 1:
                     return next(iter(kw_set))
@@ -2072,8 +2104,18 @@ class ConstantResolver:
         file_lists = self.table.file_str_list_consts.get(scope.file, {})
         if node.id in file_lists:
             return file_lists[node.id].length
-        # ③ class-level kwarg union (only when single value)
+        # ③ class-level kwarg union (only when single value). Prefer
+        #    per-instance specialisation from instance_kw_list_len when the
+        #    current scope is evaluating inside a child class for a specific
+        #    parent instance.
         if scope.cls is not None:
+            params = self.table.class_init_params.get((scope.file, scope.cls), [])
+            if node.id in params:
+                inst_key = scope.instance_key
+                if inst_key[0] is not None and inst_key[1] is not None:
+                    inst_lens = self.table.instance_kw_list_len.get(inst_key, {})
+                    if node.id in inst_lens:
+                        return inst_lens[node.id]
             kw_set = self.table.ctor_kw_list_args.get(scope.cls, {}).get(node.id)
             if kw_set:
                 # Phase E1.2: when multiple list lengths exist across instances,
@@ -2329,6 +2371,15 @@ class ConstantResolver:
                 return None
             if target_node is not node:
                 return self._resolve_to_list_literal(target_node, scope)
+            if scope.cls is not None:
+                params = self.table.class_init_params.get((scope.file, scope.cls), [])
+                if node.id in params:
+                    inst_key = scope.instance_key
+                    if inst_key[0] is not None and inst_key[1] is not None:
+                        inst_lists = self.table.instance_kw_list_items.get(inst_key, {})
+                        list_value = inst_lists.get(node.id)
+                        if list_value is not None and list_value.items is not None:
+                            return ast.List(elts=list(list_value.items), ctx=ast.Load())
             file_lists = self.table.file_str_list_consts.get(scope.file, {})
             if node.id in file_lists:
                 items = file_lists[node.id].items
