@@ -1793,8 +1793,12 @@ class ConstantResolver:
     _MAX_ATTR_CHAIN_DEPTH = 8
     MAX_ALIAS_DEPTH = 8
 
-    def __init__(self, table: ConstantTable):
+    def __init__(self, table: ConstantTable, runtime_overrides: Optional[Dict[str, int]] = None,
+                 diagnostics: Optional[List[str]] = None):
         self.table = table
+        self.runtime_overrides = runtime_overrides or {}
+        self.diagnostics = diagnostics if diagnostics is not None else []
+        self._diagnostic_keys: Set[str] = set()
         # Cache key: (file, cls, method, parent_cls or "", parent_attr or "",
         # id(node), kind).  Using ``id(node)`` skips the O(n) ``ast.unparse``
         # cost while remaining stable for the lifetime of the table (section
@@ -2253,6 +2257,10 @@ class ConstantResolver:
         inst_key = (scope.parent_cls, scope.parent_attr)
         chain = self.table.instance_const_chain.get(inst_key, {}).get(param)
         if chain is None:
+            override = self._lookup_runtime_override(attrs, scope)
+            if override is not None:
+                return IntValue(override, "runtime_override")
+            self._warn_unresolved_runtime_config(attrs, scope)
             return None
         cur: Any = chain
         for key in attrs[1:]:
@@ -2265,6 +2273,42 @@ class ConstantResolver:
         if isinstance(cur, int):
             return IntValue(cur, "dataclass_field")
         return None
+
+    def _runtime_override_candidates(self, attrs: List[str], scope: Scope) -> List[str]:
+        joined = ".".join(attrs)
+        leaf = attrs[-1] if attrs else ""
+        candidates: List[str] = []
+        if scope.cls and joined:
+            candidates.append(f"{scope.cls}.{joined}")
+        if scope.parent_cls and scope.parent_attr and joined:
+            candidates.append(f"{scope.parent_cls}.{scope.parent_attr}.{joined}")
+        if leaf:
+            candidates.append(leaf)
+        if joined and joined not in candidates:
+            candidates.append(joined)
+        return candidates
+
+    def _lookup_runtime_override(self, attrs: List[str], scope: Scope) -> Optional[int]:
+        for key in self._runtime_override_candidates(attrs, scope):
+            if key not in self.runtime_overrides:
+                continue
+            value = self.runtime_overrides[key]
+            if isinstance(value, int) and not isinstance(value, bool):
+                return value
+        return None
+
+    def _warn_unresolved_runtime_config(self, attrs: List[str], scope: Scope) -> None:
+        joined = ".".join(attrs)
+        owner = scope.cls or "<unknown>"
+        inst = f" for {scope.parent_cls}.{scope.parent_attr}" if scope.parent_cls and scope.parent_attr else ""
+        diag_key = f"{owner}:{inst}:{joined}"
+        if diag_key in self._diagnostic_keys:
+            return
+        self._diagnostic_keys.add(diag_key)
+        self.diagnostics.append(
+            f"Cannot statically resolve {owner}.{joined}{inst}. "
+            f"Please provide runtime_overrides or explicit constructor arguments."
+        )
 
     def _resolve_to_dict_items(self, node: ast.expr, scope: Scope) -> Optional[Dict[str, ast.expr]]:
         if isinstance(node, ast.Dict):
@@ -8062,7 +8106,7 @@ def _expand_fstring_with_loop_vars(joined_str_node, loop_var_to_str_items: dict)
     return results
 
 
-def build_static_module_tree(source_files, preferred_root=None, conditional_mode="infer"):
+def build_static_module_tree(source_files, preferred_root=None, conditional_mode="infer", runtime_overrides=None):
     """Build module hierarchy tree purely from source code.
     Args:
         source_files: dict of {filename: [lines]}
@@ -8249,6 +8293,7 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
     # ------------------------------------------------------------------
     _new_eval_table = None
     _new_eval_resolver = None
+    _new_eval_diagnostics = []
     _new_eval_ast_frontends = {}
     for _fname in source_files.keys():
         _fe = _get_ast_frontend(_fname)
@@ -8259,7 +8304,11 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
         ast_frontends=_new_eval_ast_frontends,
         nn_module_classes=set(nn_module_classes),
     )
-    _new_eval_resolver = ConstantResolver(_new_eval_table)
+    _new_eval_resolver = ConstantResolver(
+        _new_eval_table,
+        runtime_overrides=runtime_overrides,
+        diagnostics=_new_eval_diagnostics,
+    )
 
 
     # Per-class attr->class mapping. We scan ALL methods (not just __init__) because
@@ -9138,7 +9187,7 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                         _cls_ref = _node_to_text(_arg0.elt.func).split('.')[-1]
                         _n = None
                         if _gen0 and isinstance(_gen0.iter, ast.Call) and (_expr_leaf_name(_gen0.iter.func) == "range") and len(_gen0.iter.args) == 1:
-                            _n = _eval_int_node(_gen0.iter.args[0], fname, cname, mname)
+                            _n = _eval_int_node(_gen0.iter.args[0], fname, cname, mname, parent_cls=preferred_root, parent_attr='stack')
                         # Phase E1.1: literal list iter, e.g.
                         # ``[Cls(name) for name in ['a', 'b', 'c']]``
                         if _n is None and _gen0 is not None and isinstance(_gen0.iter, ast.List):
@@ -10017,6 +10066,7 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
     # Stash input_source_attrs on the tree for downstream consumers
     for cname in tree:
         tree[cname]["input_source_attrs"] = input_source_attrs.get(cname, set())
+        tree[cname]["static_diagnostics"] = list(_new_eval_diagnostics)
 
     # Iter14 container-group: stash recorded container kinds on the tree so the
     # DAG renderer can build container parent groups labelled e.g.
