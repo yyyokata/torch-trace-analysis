@@ -1717,10 +1717,13 @@ class ConstantTable:
         local_inst = self.local_dataclass_inst.get(scope_key, {})
         if expr_node.id in local_inst:
             return dict(local_inst[expr_node.id])
-        method_aliases = self.local_aliases.get(scope_key, {})
-        alias_node = method_aliases.get(expr_node.id)
-        if isinstance(alias_node, ast.Name) and alias_node.id in local_inst:
-            return dict(local_inst[alias_node.id])
+        resolver = ConstantResolver(self)
+        target_node = resolver._resolve_alias_chain(expr_node, scope_key)
+        if isinstance(target_node, ast.Name) and target_node.id in local_inst:
+            return dict(local_inst[target_node.id])
+        fields = self._resolve_dataclass_call_fields(target_node, scope_key) if target_node is not None else None
+        if fields:
+            return fields
         return None
 
     def _resolve_dataclass_call_fields(self,
@@ -1788,6 +1791,7 @@ class ConstantResolver:
 
     # Conservative recursion depth limit (section 4.3).
     _MAX_ATTR_CHAIN_DEPTH = 8
+    MAX_ALIAS_DEPTH = 8
 
     def __init__(self, table: ConstantTable):
         self.table = table
@@ -1934,10 +1938,9 @@ class ConstantResolver:
 
     def _visit_Name_int(self, node: ast.Name, scope: Scope) -> Optional[IntValue]:
         # ① Method-local alias chain.
-        method_aliases = self.table.local_aliases.get(scope.method_key)
-        if method_aliases and node.id in method_aliases:
-            rhs = method_aliases[node.id]
-            sub = self.eval_int(rhs, scope)
+        resolved_alias = self._resolve_alias_chain(node, scope.method_key)
+        if resolved_alias is not None and resolved_alias is not node:
+            sub = self.eval_int(resolved_alias, scope)
             if sub is not None:
                 return IntValue(sub.value, "alias")
         # ② File-level constant.
@@ -2072,10 +2075,10 @@ class ConstantResolver:
         return total
 
     def _visit_Name_list_len(self, node: ast.Name, scope: Scope) -> Optional[int]:
-        # ① local alias → recurse on its RHS
-        method_aliases = self.table.local_aliases.get(scope.method_key)
-        if method_aliases and node.id in method_aliases:
-            return self.eval_list_len(method_aliases[node.id], scope)
+        # ① local alias → recurse on its final RHS
+        resolved_alias = self._resolve_alias_chain(node, scope.method_key)
+        if resolved_alias is not None and resolved_alias is not node:
+            return self.eval_list_len(resolved_alias, scope)
         # ② file-level str-list literal
         file_lists = self.table.file_str_list_consts.get(scope.file, {})
         if node.id in file_lists:
@@ -2176,6 +2179,36 @@ class ConstantResolver:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+    def _resolve_alias_chain(self,
+                             node: ast.expr,
+                             scope_key: Tuple[str, str, str],
+                             visited: Optional[Set[str]] = None,
+                             depth: int = 0) -> Optional[ast.expr]:
+        """Follow method-local ``Name`` aliases to their final RHS.
+
+        Returns ``None`` on cycles or when the chain exceeds
+        ``MAX_ALIAS_DEPTH``.  Non-name expressions are already concrete and are
+        returned unchanged.
+        """
+        if not isinstance(node, ast.Name):
+            return node
+        if depth >= self.MAX_ALIAS_DEPTH:
+            return None
+        method_aliases = self.table.local_aliases.get(scope_key, {})
+        if node.id not in method_aliases:
+            return node
+        if visited is None:
+            visited = set()
+        if node.id in visited:
+            return None
+        visited.add(node.id)
+        return self._resolve_alias_chain(
+            method_aliases[node.id],
+            scope_key,
+            visited,
+            depth + 1,
+        )
+
     def _flatten_attr_chain(self, node: ast.Attribute) -> Optional[Tuple[ast.expr, List[str]]]:
         """Convert ``a.b.c.d`` into ``(<Name 'a'>, ['b', 'c', 'd'])``.
 
@@ -2242,9 +2275,11 @@ class ConstantResolver:
                 out[k_node.value] = v_node
             return out
         if isinstance(node, ast.Name):
-            method_aliases = self.table.local_aliases.get(scope.method_key)
-            if method_aliases and node.id in method_aliases:
-                return self._resolve_to_dict_items(method_aliases[node.id], scope)
+            target_node = self._resolve_alias_chain(node, scope.method_key)
+            if target_node is None:
+                return None
+            if target_node is not node:
+                return self._resolve_to_dict_items(target_node, scope)
             file_dicts = self.table.file_dict_literals.get(scope.file, {})
             if node.id in file_dicts:
                 return dict(file_dicts[node.id])
@@ -2260,9 +2295,11 @@ class ConstantResolver:
         if isinstance(node, ast.List):
             return node
         if isinstance(node, ast.Name):
-            method_aliases = self.table.local_aliases.get(scope.method_key)
-            if method_aliases and node.id in method_aliases:
-                return self._resolve_to_list_literal(method_aliases[node.id], scope)
+            target_node = self._resolve_alias_chain(node, scope.method_key)
+            if target_node is None:
+                return None
+            if target_node is not node:
+                return self._resolve_to_list_literal(target_node, scope)
             file_lists = self.table.file_str_list_consts.get(scope.file, {})
             if node.id in file_lists:
                 items = file_lists[node.id].items
