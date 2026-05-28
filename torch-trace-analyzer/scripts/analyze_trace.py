@@ -4676,6 +4676,8 @@ def build_timing_panel_data(instance_timing, class_map, step_dur_us):
         (class level = sum of all instances' inclusive)
     """
     by_class = defaultdict(list)
+    root_step_phase_str = None
+    root_step_phase_total = -1.0
     for key, rec in instance_timing.items():
         cls = rec["class_name"]
         csf = rec["callsite_file"]
@@ -4713,7 +4715,16 @@ def build_timing_panel_data(instance_timing, class_map, step_dur_us):
             "inclusive_us": inc_total,
             "inclusive_forward_us": inc_fwd,
             "inclusive_backward_us": inc_bwd,
+            "inclusive_optimize_us": inc_opt,
+            "inclusive_other_us": inc_oth,
         }
+        if not anc and inc_total > root_step_phase_total:
+            root_step_phase_total = inc_total
+            root_step_phase_str = (
+                f"fwd={inc_fwd / 1000.0:.3f} "
+                f"bwd={inc_bwd / 1000.0:.3f} "
+                f"opt={inc_opt / 1000.0:.3f} ms"
+            )
         by_class[cls].append(item)
 
     # Sort each class's instances deterministically.
@@ -4741,6 +4752,7 @@ def build_timing_panel_data(instance_timing, class_map, step_dur_us):
         "class_durations": class_durations,
         "class_durations_fwd": class_durations_fwd,
         "class_durations_bwd": class_durations_bwd,
+        "step_phase_str": root_step_phase_str,
     }
 
 
@@ -11288,9 +11300,6 @@ _FRONTEND_HTML_REEXPORT_NAMES = (
     "generate_html_flowchart_dual",
     "build_timing_data_from_trace",
     "_generate_flowchart_html",
-    "_classify_kernel",
-    "compute_step_breakdown",
-    "subtree_rollup",
 )
 
 
