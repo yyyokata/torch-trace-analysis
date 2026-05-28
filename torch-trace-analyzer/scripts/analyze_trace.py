@@ -11288,6 +11288,9 @@ _FRONTEND_HTML_REEXPORT_NAMES = (
     "generate_html_flowchart_dual",
     "build_timing_data_from_trace",
     "_generate_flowchart_html",
+    "_classify_kernel",
+    "compute_step_breakdown",
+    "subtree_rollup",
 )
 
 

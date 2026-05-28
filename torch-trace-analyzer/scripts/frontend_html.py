@@ -56,6 +56,274 @@ from analyze_trace import (  # noqa: E402  (sys.path tweak above is intentional)
 )
 
 
+_COMM_KERNEL_PREFIXES = (
+    "nccldevkernel_",
+    "ncclkernel_",
+    "allreduce",
+    "allgather",
+    "reducescatter",
+    "sendrecv",
+)
+
+_OPTIMIZER_KERNEL_PREFIXES = (
+    "adagrad_update_",
+    "adam_cuda_kernel",
+    "sgd_",
+    "lars_",
+    "lamb_",
+)
+
+
+def _classify_kernel(name: str) -> str:
+    """Classify a GPU event name into step-breakdown buckets.
+
+    Priority is strictly: communication > optimizer > forward/backward.
+    Non-kernel / memcpy-like names fall into ``other``.
+    """
+    text = str(name or "").strip()
+    lname = text.lower()
+    if not lname:
+        return "other"
+    if any(token in lname for token in _COMM_KERNEL_PREFIXES):
+        return "comm"
+    if any(token in lname for token in _OPTIMIZER_KERNEL_PREFIXES):
+        return "optimizer"
+    if lname.startswith("memcpy") or lname.startswith("memset"):
+        return "other"
+    return "fwd_bwd"
+
+
+def _extract_kernel_name(item) -> str:
+    if isinstance(item, dict):
+        return str(
+            item.get("name")
+            or item.get("kernel_name")
+            or item.get("runtime_name")
+            or ""
+        )
+    return str(item or "")
+
+
+def _extract_kernel_dur_us(item) -> float:
+    if not isinstance(item, dict):
+        return 0.0
+    for key in ("dur", "dur_us", "duration_us", "kernel_us", "total_us"):
+        value = item.get(key)
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return 0.0
+
+
+def compute_step_breakdown(all_kernels) -> dict:
+    """Aggregate kernel durations into A/B/C(+other) buckets, in milliseconds."""
+    totals_us = {
+        "fwd_bwd": 0.0,
+        "comm": 0.0,
+        "optimizer": 0.0,
+        "other": 0.0,
+    }
+    for item in all_kernels or []:
+        dur_us = _extract_kernel_dur_us(item)
+        if dur_us <= 0:
+            continue
+        bucket = _classify_kernel(_extract_kernel_name(item))
+        totals_us[bucket] += dur_us
+    return {
+        "fwd_bwd_ms": totals_us["fwd_bwd"] / 1000.0,
+        "comm_ms": totals_us["comm"] / 1000.0,
+        "optimizer_ms": totals_us["optimizer"] / 1000.0,
+        "other_ms": totals_us["other"] / 1000.0,
+    }
+
+
+def subtree_rollup(group, node_lookup=None, group_lookup=None, step_dur_us=0.0) -> float:
+    """Compute subtree-inclusive kernel timing for a static DAG group.
+
+    The function preserves existing ``kernel_us`` semantics by storing the
+    original group-local value under ``self_kernel_us`` and writing the rolled-up
+    total to new ``subtree_*`` fields.
+    """
+    if not isinstance(group, dict):
+        return 0.0
+
+    def _resolve_node(child):
+        if isinstance(child, dict):
+            return child
+        if node_lookup is None:
+            return None
+        return node_lookup.get(child)
+
+    def _resolve_group(child):
+        if isinstance(child, dict):
+            return child
+        if group_lookup is None:
+            return None
+        return group_lookup.get(child)
+
+    self_kernel_us = float(group.get("self_kernel_us", group.get("kernel_us", 0.0)) or 0.0)
+    self_fwd_us = float(group.get("self_fwd_kernel_us", group.get("fwd_kernel_us", 0.0)) or 0.0)
+    self_bwd_us = float(group.get("self_bwd_kernel_us", group.get("bwd_kernel_us", 0.0)) or 0.0)
+    self_other_us = float(group.get("self_other_kernel_us", group.get("other_kernel_us", 0.0)) or 0.0)
+
+    group["self_kernel_us"] = self_kernel_us
+    group["self_kernel_ms"] = self_kernel_us / 1000.0
+    group["self_fwd_kernel_us"] = self_fwd_us
+    group["self_bwd_kernel_us"] = self_bwd_us
+    group["self_other_kernel_us"] = self_other_us
+
+    subtree_kernel_us = self_kernel_us
+    subtree_fwd_us = self_fwd_us
+    subtree_bwd_us = self_bwd_us
+    subtree_other_us = self_other_us
+
+    for child in group.get("children_nodes", []) or []:
+        node = _resolve_node(child)
+        if not isinstance(node, dict):
+            continue
+        node_kernel_us = float(node.get("kernel_us", 0.0) or 0.0)
+        node_fwd_us = float(node.get("fwd_kernel_us", 0.0) or 0.0)
+        node_bwd_us = float(node.get("bwd_kernel_us", 0.0) or 0.0)
+        node_other_us = float(node.get("other_kernel_us", 0.0) or 0.0)
+        node["subtree_kernel_us"] = node_kernel_us
+        node["subtree_inclusive_us"] = node_kernel_us
+        node["subtree_inclusive_ms"] = node_kernel_us / 1000.0
+        node["subtree_fwd_kernel_us"] = node_fwd_us
+        node["subtree_bwd_kernel_us"] = node_bwd_us
+        node["subtree_other_kernel_us"] = node_other_us
+        subtree_kernel_us += node_kernel_us
+        subtree_fwd_us += node_fwd_us
+        subtree_bwd_us += node_bwd_us
+        subtree_other_us += node_other_us
+
+    for child in group.get("children_groups", []) or []:
+        child_group = _resolve_group(child)
+        if not isinstance(child_group, dict):
+            continue
+        subtree_kernel_us += subtree_rollup(
+            child_group,
+            node_lookup=node_lookup,
+            group_lookup=group_lookup,
+            step_dur_us=step_dur_us,
+        )
+        subtree_fwd_us += float(child_group.get("subtree_fwd_kernel_us", 0.0) or 0.0)
+        subtree_bwd_us += float(child_group.get("subtree_bwd_kernel_us", 0.0) or 0.0)
+        subtree_other_us += float(child_group.get("subtree_other_kernel_us", 0.0) or 0.0)
+
+    group["subtree_kernel_us"] = subtree_kernel_us
+    group["subtree_inclusive_us"] = subtree_kernel_us
+    group["subtree_inclusive_ms"] = subtree_kernel_us / 1000.0
+    group["subtree_fwd_kernel_us"] = subtree_fwd_us
+    group["subtree_bwd_kernel_us"] = subtree_bwd_us
+    group["subtree_other_kernel_us"] = subtree_other_us
+    group["subtree_pct"] = (
+        subtree_kernel_us / float(step_dur_us) * 100.0 if step_dur_us and step_dur_us > 0 else 0.0
+    )
+    group["has_timing"] = bool(group.get("has_timing")) or subtree_kernel_us > 0
+    group["has_phase_timing"] = bool(group.get("has_phase_timing")) or any(
+        v > 0 for v in (subtree_fwd_us, subtree_bwd_us, subtree_other_us)
+    )
+    return subtree_kernel_us
+
+
+def _apply_subtree_rollup(flowchart_data, step_dur_us=0.0):
+    node_lookup = {
+        node.get("id"): node
+        for node in (flowchart_data.get("nodes", []) or [])
+        if isinstance(node, dict) and node.get("id")
+    }
+    group_lookup = {
+        group.get("id"): group
+        for group in (flowchart_data.get("groups", []) or [])
+        if isinstance(group, dict) and group.get("id")
+    }
+
+    for node in node_lookup.values():
+        node_kernel_us = float(node.get("kernel_us", 0.0) or 0.0)
+        node["subtree_kernel_us"] = node_kernel_us
+        node["subtree_inclusive_us"] = node_kernel_us
+        node["subtree_inclusive_ms"] = node_kernel_us / 1000.0
+        node["subtree_fwd_kernel_us"] = float(node.get("fwd_kernel_us", 0.0) or 0.0)
+        node["subtree_bwd_kernel_us"] = float(node.get("bwd_kernel_us", 0.0) or 0.0)
+        node["subtree_other_kernel_us"] = float(node.get("other_kernel_us", 0.0) or 0.0)
+
+    for group in group_lookup.values():
+        group.setdefault("self_kernel_us", float(group.get("kernel_us", 0.0) or 0.0))
+        group.setdefault("self_kernel_ms", float(group.get("self_kernel_us", 0.0) or 0.0) / 1000.0)
+        group.setdefault("self_fwd_kernel_us", float(group.get("fwd_kernel_us", 0.0) or 0.0))
+        group.setdefault("self_bwd_kernel_us", float(group.get("bwd_kernel_us", 0.0) or 0.0))
+        group.setdefault("self_other_kernel_us", float(group.get("other_kernel_us", 0.0) or 0.0))
+        group.setdefault("subtree_kernel_us", float(group.get("kernel_us", 0.0) or 0.0))
+        group.setdefault("subtree_inclusive_us", float(group.get("kernel_us", 0.0) or 0.0))
+        group.setdefault("subtree_inclusive_ms", float(group.get("kernel_us", 0.0) or 0.0) / 1000.0)
+        group.setdefault("subtree_fwd_kernel_us", float(group.get("fwd_kernel_us", 0.0) or 0.0))
+        group.setdefault("subtree_bwd_kernel_us", float(group.get("bwd_kernel_us", 0.0) or 0.0))
+        group.setdefault("subtree_other_kernel_us", float(group.get("other_kernel_us", 0.0) or 0.0))
+        group.setdefault("subtree_pct", group.get("pct", 0.0) or 0.0)
+
+    for root_id in flowchart_data.get("root_groups", []) or []:
+        root_group = group_lookup.get(root_id)
+        if isinstance(root_group, dict):
+            subtree_rollup(
+                root_group,
+                node_lookup=node_lookup,
+                group_lookup=group_lookup,
+                step_dur_us=step_dur_us,
+            )
+    return flowchart_data
+
+
+def _clip_kernel_events_to_steps(trace_events, step_infos):
+    clipped = []
+    if not trace_events:
+        return clipped
+    intervals = [info.get("step_interval") for info in (step_infos or []) if info.get("step_interval")]
+    for event in trace_events:
+        if not isinstance(event, dict):
+            continue
+        dur_us = _extract_kernel_dur_us(event)
+        if dur_us <= 0:
+            continue
+        cat = str(event.get("cat") or "")
+        if cat not in {"kernel", "gpu_memcpy", "gpu_memset"}:
+            continue
+        if not intervals:
+            clipped.append({"name": _extract_kernel_name(event), "dur": dur_us})
+            continue
+        ts = float(event.get("ts") or 0.0)
+        end_ts = ts + dur_us
+        for start_ts, stop_ts in intervals:
+            overlap = min(end_ts, float(stop_ts)) - max(ts, float(start_ts))
+            if overlap > 0:
+                clipped.append({"name": _extract_kernel_name(event), "dur": overlap})
+    return clipped
+
+
+def _build_step_breakdown_meta(trace_events, flowchart_data):
+    if not trace_events:
+        return None
+    _main_tid, main_events, children = build_main_thread_hierarchy(trace_events)
+    step_infos = extract_step_phase_intervals(main_events, children) if main_events else []
+    clipped = _clip_kernel_events_to_steps(trace_events, step_infos)
+    breakdown = compute_step_breakdown(clipped)
+    num_steps = max(1, len(step_infos))
+    for key in ("fwd_bwd_ms", "comm_ms", "optimizer_ms", "other_ms"):
+        breakdown[key] = float(breakdown.get(key, 0.0) or 0.0) / float(num_steps)
+
+    breakdown["display_total_ms"] = (
+        float(breakdown.get("fwd_bwd_ms", 0.0) or 0.0)
+        + float(breakdown.get("comm_ms", 0.0) or 0.0)
+        + float(breakdown.get("optimizer_ms", 0.0) or 0.0)
+    )
+    breakdown["display_str"] = (
+        f"{breakdown['fwd_bwd_ms']:.3f} + {breakdown['comm_ms']:.3f} + {breakdown['optimizer_ms']:.3f} ms"
+    )
+    return breakdown
+
+
 FLOWCHART_HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -877,8 +1145,8 @@ function render() {
                 tl.setAttribute('x', ox + pos.w/2); tl.setAttribute('y', oy + pos.h/2 + 12);
                 tl.setAttribute('text-anchor', 'middle');
                 tl.setAttribute('class', 'group-timing');
-                // Kernel-only contract: g.dur_us already mirrors kernel_us.
-                tl.textContent = `Kernel ${g.pct.toFixed(1)}% · ${formatDur(g.dur_us)}`;
+                const disp = computeGroupDisplayTiming(g);
+                tl.textContent = `Kernel ${disp.pct.toFixed(1)}% · ${formatDur(disp.kernelUs)}`;
                 bindGroupHover(tl, gid);
                 svg.appendChild(tl);
             }
@@ -942,8 +1210,8 @@ function render() {
             tl.setAttribute('x', ox + pos.w - 10); tl.setAttribute('y', oy + 18);
             tl.setAttribute('text-anchor', 'end');
             tl.setAttribute('class', 'group-timing');
-            // Kernel-only contract: g.dur_us already mirrors kernel_us.
-            tl.textContent = `Kernel ${g.pct.toFixed(1)}% · ${formatDur(g.dur_us)}`;
+            const disp = computeGroupDisplayTiming(g);
+            tl.textContent = `Kernel ${disp.pct.toFixed(1)}% · ${formatDur(disp.kernelUs)}`;
             bindGroupHover(tl, gid);
             svg.appendChild(tl);
         }
@@ -1297,7 +1565,8 @@ function render() {
     const meta = DATA.meta;
     if (DATA.has_timing) {
         document.getElementById('mode-badge').innerHTML = '<span class="mode-badge mode-timing">📊 Structure + Timing</span>';
-        document.getElementById('meta-info').textContent = `Device: ${meta.device} | Step: ${meta.step_dur_str} | Modules: ${meta.num_modules}`;
+        const stepDisplay = meta.step_breakdown_str || meta.step_dur_str;
+        document.getElementById('meta-info').textContent = `Device: ${meta.device} | Step: ${stepDisplay} | Modules: ${meta.num_modules}`;
     } else {
         document.getElementById('mode-badge').innerHTML = '<span class="mode-badge mode-structure">🏗️ Static Structure (source code)</span>';
         document.getElementById('meta-info').textContent = `Modules: ${meta.num_modules} | Root: ${meta.roots ? meta.roots.join(", ") : "N/A"}`;
@@ -1349,6 +1618,34 @@ function computeSelfMs(item) {
     return (excPct > 0 && stepUs > 0) ? (excPct * stepUs / 100.0 / 1000.0) : 0;
 }
 
+function computeGroupDisplayTiming(group) {
+    const kernelUs = Number(
+        group && group.subtree_inclusive_us != null
+            ? group.subtree_inclusive_us
+            : (group && group.subtree_kernel_us != null
+                ? group.subtree_kernel_us
+                : (group && group.kernel_us != null ? group.kernel_us : (group && group.dur_us || 0)))
+    );
+    const pct = Number(group && group.subtree_pct != null ? group.subtree_pct : (group && group.pct || 0));
+    return { kernelUs, pct };
+}
+
+function getTimingFields(item) {
+    const useSubtree = !!(item && item.subtree_inclusive_us != null);
+    return {
+        kernelMs: Number(
+            useSubtree
+                ? item.subtree_inclusive_us
+                : (item && item.kernel_us != null ? item.kernel_us : (item && item.dur_us || 0))
+        ) / 1000.0,
+        fwdMs: Number(useSubtree ? (item.subtree_fwd_kernel_us || 0) : (item && item.fwd_kernel_us || 0)) / 1000.0,
+        bwdMs: Number(useSubtree ? (item.subtree_bwd_kernel_us || 0) : (item && item.bwd_kernel_us || 0)) / 1000.0,
+        otherMs: Number(useSubtree ? (item.subtree_other_kernel_us || 0) : (item && item.other_kernel_us || 0)) / 1000.0,
+        selfMs: Number(item && item.self_kernel_us || 0) / 1000.0,
+        useSubtree,
+    };
+}
+
 function fmtTimingMs(value, forceShow) {
     const num = Number(value || 0);
     if (num > 0) return `${num.toFixed(1)} ms`;
@@ -1373,16 +1670,14 @@ function renderTimingRow(label, value, kind) {
 function showTooltip(e, n) {
     const tt = document.getElementById('tooltip');
     let html = `<div class="tt-title">${n.attr_name || n.label || n.class_name} <span style="opacity:0.6">(${n.class_name || n.label || 'Module'})</span></div>`;
-    // Kernel-only contract: dur_us mirrors kernel_us; fwd/bwd/other are the
-    // only phase splits we expose. No host walltime / overhead displayed.
-    const kernelMs = Number(n && n.kernel_us != null ? n.kernel_us : (n.dur_us || 0)) / 1000.0;
-    const fwdMs = Number(n && n.fwd_kernel_us || 0) / 1000.0;
-    const bwdMs = Number(n && n.bwd_kernel_us || 0) / 1000.0;
-    const otherMs = Number(n && n.other_kernel_us || 0) / 1000.0;
-    html += `<div class="tt-row">Kernel: ${fmtTimingMs(kernelMs, true)}</div>`;
-    html += `<div class="tt-row">Forward: ${fmtTimingMs(fwdMs, true)}</div>`;
-    html += `<div class="tt-row">Backward: ${fmtTimingMs(bwdMs, true)}</div>`;
-    html += `<div class="tt-row">Other: ${fmtTimingMs(otherMs, true)}</div>`;
+    const tf = getTimingFields(n);
+    html += `<div class="tt-row">Kernel: ${fmtTimingMs(tf.kernelMs, true)}</div>`;
+    html += `<div class="tt-row">Forward: ${fmtTimingMs(tf.fwdMs, true)}</div>`;
+    html += `<div class="tt-row">Backward: ${fmtTimingMs(tf.bwdMs, true)}</div>`;
+    html += `<div class="tt-row">Other: ${fmtTimingMs(tf.otherMs, true)}</div>`;
+    if (tf.useSubtree) {
+        html += `<div class="tt-row">Self: ${fmtTimingMs(tf.selfMs, true)}</div>`;
+    }
     tt.innerHTML = html;
     tt.style.left = (e.clientX + 12) + 'px';
     tt.style.top = (e.clientY + 12) + 'px';
@@ -1482,19 +1777,17 @@ function showSourcePanel(item) {
         : '(class definition not available in supplied sources)';
     document.getElementById('sp-subtitle').textContent = fileLabel;
     let bodyHtml = '';
-    // Kernel-only contract: dur_us mirrors kernel_us; fwd/bwd/other are the
-    // only phase splits we expose. No host walltime / overhead displayed.
-    const kernelMs = Number(item && item.kernel_us != null ? item.kernel_us : (item.dur_us || 0)) / 1000.0;
-    const fwdMs = Number(item && item.fwd_kernel_us || 0) / 1000.0;
-    const bwdMs = Number(item && item.bwd_kernel_us || 0) / 1000.0;
-    const otherMs = Number(item && item.other_kernel_us || 0) / 1000.0;
-    if (item.has_timing || item.has_phase_timing) {
+    const tf = getTimingFields(item);
+    if (item.has_timing || item.has_phase_timing || tf.useSubtree) {
         bodyHtml += '<div class="side-panel-section"><h4>Timing</h4>' +
-            renderTimingRow('Kernel', kernelMs, 'kernel') +
-            renderTimingRow('Forward', fwdMs, 'forward') +
-            renderTimingRow('Backward', bwdMs, 'backward') +
-            renderTimingRow('Other', otherMs, 'other') +
-            '</div>';
+            renderTimingRow('Kernel', tf.kernelMs, 'kernel') +
+            renderTimingRow('Forward', tf.fwdMs, 'forward') +
+            renderTimingRow('Backward', tf.bwdMs, 'backward') +
+            renderTimingRow('Other', tf.otherMs, 'other');
+        if (tf.useSubtree) {
+            bodyHtml += renderTimingRow('Self', tf.selfMs, 'kernel');
+        }
+        bodyHtml += '</div>';
     }
     if (item.src_snippet) {
         bodyHtml += '<div class="side-panel-section"><h4>Class definition</h4>' +
@@ -6175,6 +6468,14 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
             "roots": roots,
         }
     }
+
+    if has_timing:
+        _apply_subtree_rollup(flowchart_data, step_dur_us=step_dur_us)
+        breakdown_meta = _build_step_breakdown_meta(trace_events, flowchart_data)
+        if breakdown_meta:
+            flowchart_data["meta"]["step_breakdown"] = breakdown_meta
+            flowchart_data["meta"]["step_breakdown_str"] = breakdown_meta.get("display_str")
+            flowchart_data["meta"]["step_display_total_ms"] = breakdown_meta.get("display_total_ms", 0.0)
 
     # 统计信息（用于防回退校验）
     try:
