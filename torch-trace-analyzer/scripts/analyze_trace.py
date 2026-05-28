@@ -6278,6 +6278,14 @@ def _build_data_dependency_edges(source_files, class_map, module_attrs, class_st
                     # because every call now originates from the AST scan and
                     # always carries a real ``ast.Call`` node.
 
+                    def _filter_chain_by_producer(chain, producer, var_producers):
+                        result = []
+                        for step in chain or []:
+                            producers_of_step = var_producers.get(step.get("var", ""), (set(), None))[0]
+                            if not producers_of_step or producer in producers_of_step:
+                                result.append(step)
+                        return result
+
                     for producer in consumed_producers:
                         if producer != attr:
                             edges.add((producer, attr))
@@ -6292,6 +6300,7 @@ def _build_data_dependency_edges(source_files, class_map, module_attrs, class_st
                             _chain = []
                             if isinstance(_carrier, str) and _carrier in var_lineage:
                                 _chain = list(var_lineage.get(_carrier) or [])
+                                _chain = _filter_chain_by_producer(_chain, producer, var_producers)
                             _consumer_text = _line_text(phys_lineno)
                             if _consumer_text:
                                 _consumer_step = {"var": _carrier if isinstance(_carrier, str) else "",
