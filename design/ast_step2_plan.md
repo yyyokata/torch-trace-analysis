@@ -32,3 +32,24 @@
 | P4 | 删 _parse_local_stmt，搬 8 个 helper 到 ASTFrontend | Phase C |
 | P5 | 全量 regex fallback 删除 | Phase D 剩余 |
 | P6 | EvalTrace dataclass + --debug-eval CLI | Phase F 完整版 |
+
+**P8：torch native stub 深度补全**
+
+目标：完全覆盖 torch 原生 nn.Module（nn.Linear、nn.Embedding 等）在各种注册方式下的 leaf 识别。
+
+当前已覆盖：
+- `self.xxx = nn.Linear(...)` 直接赋值路径
+
+尚未覆盖的缺口（按优先级）：
+
+| 优先级 | 缺口 | 影响 |
+|---|---|---|
+| 🔴 高 | `setattr(self, name, nn.Linear(...))` 动态注册 | setattr 路径对 `nn.*` 类型不走 `_is_nn_leaf_stub` 判断，误入 `dynamic_attr` |
+| 🔴 高 | `nn.ModuleList([nn.Linear(...), ...])` 容器内 native 元素 | ModuleList 展开时子元素是 native class 时不识别为 leaf，直接丢失 |
+| 🟡 中 | `torch.nn.Linear` / `from torch.nn import Linear` 等别名前缀 | 非标准 `nn.` 前缀的 import 方式会 miss |
+| 🟢 低 | `nn.Sequential` 内嵌 native 子层 | 场景较少 |
+
+实现思路：
+1. setattr 路径：在 `dynamic_attrs_per_class` 收集时，对 `cls_ref` 做 `_is_nn_leaf_stub` 判断，命中时改为写入 `torch_native_module_classes`
+2. ModuleList 元素：在 ModuleList 展开逻辑中，对元素 `cls_ref` 做 native 判断，命中时补入 native leaf
+3. 别名前缀：扩展 `_is_nn_leaf_stub` 的匹配逻辑，支持 `torch.nn.xxx` 完整前缀和 `from torch.nn import xxx` 导入形式
