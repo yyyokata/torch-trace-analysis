@@ -3724,6 +3724,211 @@ def _is_backward_trace(traces):
     return False
 
 
+PARALLEL_WRAPPER_CLASSES = ("FullyShardedDataParallel", "DistributedDataParallel", "CheckpointWrapper", "OffloadWrapper")
+PARALLEL_WRAPPER_PREFIXES = ("FSDP", "DDP")
+
+
+def _frame_get(frame, idx, name, default=None):
+    if isinstance(frame, dict):
+        return frame.get(name, default)
+    if hasattr(frame, name):
+        return getattr(frame, name)
+    try:
+        return frame[idx]
+    except (TypeError, IndexError, KeyError):
+        return default
+
+
+def _frame_with_func(frame, new_func):
+    if isinstance(frame, dict):
+        copied = dict(frame)
+        copied["func"] = new_func
+        return copied
+    if hasattr(frame, "_replace"):
+        try:
+            return frame._replace(func=new_func)
+        except (TypeError, ValueError):
+            pass
+    if hasattr(frame, "__dataclass_fields__"):
+        try:
+            from dataclasses import replace
+            return replace(frame, func=new_func)
+        except (TypeError, ValueError):
+            pass
+    try:
+        return (frame[0], frame[1], new_func)
+    except (TypeError, IndexError):
+        return frame
+
+
+def _is_user_source_frame(frame, source_files):
+    file_path = str(_frame_get(frame, 0, "file", "") or "").replace("\\", "/")
+    fname = os.path.basename(file_path)
+    if fname in (source_files or {}):
+        return True
+    for src_name in (source_files or {}):
+        norm_src = str(src_name or "").replace("\\", "/")
+        src_base = os.path.basename(norm_src)
+        if file_path == norm_src or file_path.endswith("/" + norm_src):
+            return True
+        if src_base and (file_path == src_base or file_path.endswith("/" + src_base)):
+            return True
+    return False
+
+
+def _extract_frame_class_name(func):
+    text = str(func or "")
+    if text.startswith("nn.Module:"):
+        short = text.replace("nn.Module: ", "").replace("nn.Module:", "")
+        short = re.sub(r',\s*callsite:\s*\d+', '', short).strip()
+        return re.sub(r'_\d+$', '', short)
+    m = re.match(r'([A-Za-z_]\w*)\.', text)
+    if m:
+        return m.group(1)
+    return text
+
+
+def _normalize_parallel_wrapper_frame(frame):
+    func = str(_frame_get(frame, 2, "func", "") or "")
+    cls = _extract_frame_class_name(func)
+    if cls in PARALLEL_WRAPPER_CLASSES:
+        return None
+    new_func = func
+    for prefix in PARALLEL_WRAPPER_PREFIXES:
+        if func.startswith("nn.Module: " + prefix):
+            new_func = "nn.Module: " + func[len("nn.Module: " + prefix):]
+            break
+        if func.startswith("nn.Module:" + prefix):
+            new_func = "nn.Module:" + func[len("nn.Module:" + prefix):]
+            break
+        if func.startswith(prefix):
+            new_func = func[len(prefix):]
+            break
+    return _frame_with_func(frame, new_func) if new_func != func else frame
+
+
+def _dedup_consecutive_frames(frames):
+    deduped = []
+    last_key = None
+    for frame in frames or []:
+        key = (_frame_get(frame, 0, "file"), _frame_get(frame, 1, "line"), _frame_get(frame, 2, "func"))
+        if key == last_key:
+            continue
+        deduped.append(frame)
+        last_key = key
+    return deduped
+
+
+def filter_kernel_stack_chains(rows, source_files, step_infos):
+    stats = {
+        "total": 0,
+        "phase_fwd": 0,
+        "phase_bwd": 0,
+        "phase_other": 0,
+        "frames_in": 0,
+        "frames_kept_user": 0,
+        "frames_dropped_framework": 0,
+        "unmatched_after_filter": 0,
+        "non_bwd_overlaps_backward": 0,
+    }
+
+    class FilteredKernelStackRows(list):
+        def __init__(self):
+            super().__init__()
+            self.by_event_idx = {}
+            self.step1b_stats = stats
+
+        def add(self, event_idx, row):
+            if event_idx is not None:
+                self.by_event_idx[event_idx] = row
+            self.append(row)
+
+        def items(self):
+            return self.by_event_idx.items() if self.by_event_idx else enumerate(self)
+
+        def keys(self):
+            return self.by_event_idx.keys() if self.by_event_idx else range(len(self))
+
+        def values(self):
+            return self.by_event_idx.values() if self.by_event_idx else list(self)
+
+        def get(self, key, default=None):
+            if self.by_event_idx:
+                return self.by_event_idx.get(key, default)
+            try:
+                return self[key]
+            except (TypeError, IndexError):
+                return default
+
+        def __getitem__(self, key):
+            if isinstance(key, int) and key in self.by_event_idx:
+                return self.by_event_idx[key]
+            return super().__getitem__(key)
+
+    def _row_get(row, key, default=None):
+        if isinstance(row, dict):
+            return row.get(key, default)
+        return getattr(row, key, default)
+
+    def _row_set(row, key, value):
+        if isinstance(row, dict):
+            row[key] = value
+        elif hasattr(row, key):
+            try:
+                setattr(row, key, value)
+            except Exception:
+                pass
+
+    def _copy_row(row):
+        if isinstance(row, dict):
+            return dict(row)
+        return row
+
+    def _refine_phase(row):
+        phase = _row_get(row, "phase", "non-bwd")
+        if phase == "bwd":
+            return "bwd"
+        ts = float(_row_get(row, "ts", 0.0) or 0.0)
+        dur = float(_row_get(row, "dur_us", 0.0) or 0.0)
+        window_phase = classify_kernel_phase(ts, ts + dur, step_infos or [])
+        if window_phase == "forward":
+            return "fwd"
+        if window_phase == "backward":
+            stats["non_bwd_overlaps_backward"] += 1
+        return "other"
+
+    out = FilteredKernelStackRows()
+    for input_idx, row in enumerate(rows or []):
+        stats["total"] += 1
+        filtered = []
+        for frame in _row_get(row, "chains", []) or []:
+            stats["frames_in"] += 1
+            normalized_frame = _normalize_parallel_wrapper_frame(frame)
+            if normalized_frame is None:
+                stats["frames_dropped_framework"] += 1
+                continue
+            if _is_user_source_frame(normalized_frame, source_files):
+                filtered.append(normalized_frame)
+                stats["frames_kept_user"] += 1
+            else:
+                stats["frames_dropped_framework"] += 1
+        filtered = _dedup_consecutive_frames(filtered)
+        refined_phase = _refine_phase(row)
+        new_row = _copy_row(row)
+        _row_set(new_row, "phase", refined_phase)
+        _row_set(new_row, "chains", filtered)
+        _row_set(new_row, "unmatched", len(filtered) == 0)
+        _row_set(new_row, "is_bwd", refined_phase == "bwd")
+        _row_set(new_row, "legacy_chains", [filtered] if filtered else [])
+        stats[f"phase_{refined_phase}"] += 1
+        if len(filtered) == 0:
+            stats["unmatched_after_filter"] += 1
+        event_idx = _row_get(new_row, "event_idx", input_idx)
+        out.add(event_idx, new_row)
+
+    return out
+
+
 def build_kernel_stack_cost_table(events, source_files, fwdbwd_index):
     """
     返回 list[dict]，每条 kernel 对应一条，dict 字段：
@@ -3957,6 +4162,7 @@ def build_kernel_attribution_table(events, source_files, class_map, step_infos, 
 
     ext_to_module = _build_external_id_to_module_map(events)
     kernel_rows = build_kernel_stack_cost_table(events, source_files, fwdbwd_index)
+    kernel_rows = filter_kernel_stack_chains(kernel_rows, source_files, step_infos)
 
     attribution = {}
     stats = {

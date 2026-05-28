@@ -13,8 +13,8 @@ Step 1b 在 Step 1a 之后执行，负责把 Step 1a 的输出进一步清洗为
 
 核心目标：
 
-1. **过滤 framework frame**：从 `chains` 中剔除 torch / dynamo / autograd / profiler / python runtime 等框架栈，只保留用户模型源码 frame。
-2. **保持上层 `nn.Module` frame 可用**：Step 1a 补上的 `nn.Module python_function` frame 本身代表 runtime module scope，虽然可能不是严格意义上的用户源码文件 frame，但它是 Step 2 归属的关键补充，不能被误删。
+1. **过滤非模型源码 frame**：从 `chains` 中剔除所有不属于用户模型源码的 frame（包括 torch、dynamo、autograd 等框架栈，以及框架注入的 `nn.Module` scope 标记）。
+2. **精简归属链**：只保留能映射回 `source_files` 的 frame，确保 Step 2 attribution 逻辑只处理用户可理解的代码行。
 3. **正式细化 phase**：把 Step 1a 的 `non-bwd` 进一步拆为 `fwd` / `other`；`bwd` 保持为 `bwd`。
 4. **不改变 kernel 顺序**：输出顺序必须与 Step 1a 输入顺序一致。
 5. **不在 Step 1b 做 instance attribution**：Step 1b 只做调用链清洗和 phase 细化，不识别 `InstanceKey`，不做权重分配。
@@ -62,7 +62,7 @@ class KernelStackEntry:
 字段变化：
 
 - `phase`：取值从 Step 1a 的 `"bwd" / "non-bwd"` 变为 `"fwd" / "bwd" / "other"`。
-- `chains`：从 Step 1a 的原始合并链，变为过滤后的用户模型链 + 必要的 `nn.Module` scope frame。
+- `chains`：从 Step 1a 的原始合并链，变为过滤后的用户模型链。
 - `unmatched`：根据过滤后的 `chains` 重新计算。若清洗后没有任何可用 frame，则为 `True`。
 - `has_stack_traces`：保持 Step 1a 原语义，不因过滤后链为空而改写。它只表达 kernel 原生 `stack_traces` 是否存在并被 Step 1a 解析到。
 
@@ -117,48 +117,17 @@ def _is_user_source_frame(frame, source_files):
     return False
 ```
 
-### 3.2 `nn.Module` scope frame
+### 3.2 框架与冗余 frame (全部删除)
 
-Step 1a 的 `_module_event_to_frame(...)` 会把 `nn.Module python_function` 事件转换为 frame，通常具有以下特征：
+所有不命中用户源码 frame 的记录（包括 site-packages、torch 源码、以及框架自动注入的 `nn.Module` scope frame）均被视为 framework/redundant frame，应予以删除。
 
-- `frame.func` 或 tuple 第三项包含 `nn.Module:`。
-- `frame.file` 可能来自 event args `CallFrom`，也可能为空字符串。
-- `frame.line` 通常来自 `callsite` 或 `CallFrom`。
+判断逻辑极其简化：
+1. 调用 `_is_user_source_frame(frame, source_files)`。
+2. 若返回 `True` 则保留，否则直接丢弃。
 
-这类 frame 应保留，因为它提供 runtime module scope，是无 stack trace 或 stack trace 被截断场景的重要兜底。
+不再保留 `nn.Module` 特判。对于用户自定义 Module，其 `CallFrom` 记录的 callsite 必定位于模型源码内，已能被 3.1 规则覆盖。对于框架内置 Module（如 `torch.nn.Linear`），其 callsite 位于框架内部，属于应过滤的范畴。
 
-建议实现为：
-
-```python
-def _is_nn_module_scope_frame(frame):
-    return "nn.Module" in str(frame.func or "")
-```
-
-### 3.3 framework frame
-
-不满足用户源码 frame、也不是 `nn.Module` scope frame 的 frame，若命中以下规则，应删除：
-
-1. 路径包含 site-packages、dist-packages、python 标准库路径。
-2. 路径或函数名包含 torch、torchvision、torch._dynamo、torch._inductor、functorch、autograd、profiler、cuda graph 等框架关键词。
-3. 路径包含 `<built-in>`、`<frozen ...>`、`python` runtime helper。
-4. 函数名为常见框架调度入口，例如 `run_backward`、`apply`、`_call_impl`、`_wrapped_call_impl`、`compile_fx`、`call_function`。
-
-建议实现为 deny-list，但 deny-list 只能用于删除 framework frame，不能覆盖用户源码命中结果：
-
-```python
-_FRAMEWORK_PATH_KEYWORDS = (
-    "/site-packages/", "/dist-packages/", "/torch/", "/torchvision/",
-    "/torch._dynamo/", "/torch/_dynamo/", "/torch/_inductor/",
-    "/functorch/", "/autograd/", "/profiler/",
-)
-
-_FRAMEWORK_FUNC_KEYWORDS = (
-    "run_backward", "autograd", "_call_impl", "_wrapped_call_impl",
-    "torch_dynamo", "compile_fx", "call_function", "apply",
-)
-```
-
-### 3.4 保留顺序与去重
+### 3.3 保留顺序与去重
 
 过滤后仍保持 **innermost first**，不反转顺序。
 
@@ -166,7 +135,30 @@ _FRAMEWORK_FUNC_KEYWORDS = (
 
 1. 连续重复 frame 可以压缩为一个。
 2. 非连续重复 frame 不删除，避免误删递归或多次调用路径。
-3. 用户源码 frame 优先于 `nn.Module` scope frame；若两者 file+line 指向同一位置，但 func 不同，可以都保留，留给 Step 2 决定如何使用。
+3. 移除“用户源码优先于 nn.Module”等复杂冲突处理，因为所有保留下来的 frame 均已确定属于用户源码。
+
+### 3.4 Parallel Wrapper 处理规则 (DDP/FSDP)
+
+对于并行训练中引入的 Wrapper 层，Step 1b 需要进行清洗，以保证归属类名的纯洁度。
+
+#### 3.4.1 Wrapper 类跳过 (Wrapper Class Skip)
+
+为了减少调用链中的冗余层，对于以下已知的并行/显存优化 Wrapper 类，其 frame 直接跳过：
+- `PARALLEL_WRAPPER_CLASSES = ("FullyShardedDataParallel", "DistributedDataParallel", "CheckpointWrapper", "OffloadWrapper")`
+
+逻辑：
+1. 如果 frame 的 `func`（或解析出的 `class_name`）命中了上述列表。
+2. 则该 frame 不进入 `filtered_chains`。
+
+#### 3.4.2 类名前缀剥离 (Prefix Strip)
+
+为了将 DDP/FSDP 包裹后的实例还原为原始模型类，对以下前缀进行剥离：
+- `PARALLEL_WRAPPER_PREFIXES = ("FSDP", "DDP")`
+
+逻辑：
+1. 如果 frame 的 `class_name` 以上述前缀开头（如 `DDPDenseTower`、`FSDPTransformerLayer`）。
+2. 则剥离该前缀，还原为真实类名（如 `DenseTower`、`TransformerLayer`）。
+3. 剥离后的名称用于 Step 2 的 `class_map` 匹配。
 
 ---
 
@@ -280,13 +272,7 @@ def filter_kernel_stack_chains(rows, source_files, step_infos):
             if _is_user_source_frame(frame, source_files):
                 filtered.append(frame)
                 stats["frames_kept_user"] += 1
-            elif _is_nn_module_scope_frame(frame):
-                filtered.append(frame)
-                stats["frames_kept_module_scope"] += 1
-            elif _is_framework_frame(frame):
-                stats["frames_dropped_framework"] += 1
             else:
-                # 默认删除 unknown non-user frame，避免污染 Step 2。
                 stats["frames_dropped_framework"] += 1
 
         filtered = _dedup_consecutive_frames(filtered)
@@ -355,7 +341,6 @@ step1b_stats = {
     "phase_other": int,
     "frames_in": int,
     "frames_kept_user": int,
-    "frames_kept_module_scope": int,
     "frames_dropped_framework": int,
     "unmatched_after_filter": int,
     "non_bwd_overlaps_backward": int,
@@ -366,7 +351,7 @@ step1b_stats = {
 
 ```text
 [Timing Step1b] kernels=12345 phase_fwd=6789 phase_bwd=4321 phase_other=1235
-[Timing Step1b] frames_in=88888 kept_user=22222 kept_module_scope=9999 dropped_framework=56667 unmatched=12
+[Timing Step1b] frames_in=88888 kept_user=22222 dropped_framework=66666 unmatched=12
 ```
 
 质量预期：
@@ -402,21 +387,17 @@ assert out[0].unmatched is False
 assert out[0].has_stack_traces is True
 ```
 
-### 8.2 T-1b-2：保留 `nn.Module` scope frame
+### 8.2 T-1b-2：`nn.Module` frame 若在模型内则保留，否则删除
 
-构造 Step 1a 输出，其中 `chains` 只有一个 module scope frame：
+构造两条记录：
+1. `chains = [FrameInfo("main_model.py", 169, "nn.Module: DDPAwemeLiveCVR_0, callsite: 169")]`
+2. `chains = [FrameInfo("torch/nn/modules/linear.py", 114, "nn.Module: Linear_0, callsite: 114")]`
 
-```python
-chains = [FrameInfo("model.py", 88, "nn.Module: DenseTower_3, callsite: 88")]
-```
+`source_files = {"main_model.py": "..."}`。
 
 断言：
-
-```python
-assert len(out[0].chains) == 1
-assert "nn.Module" in out[0].chains[0].func
-assert out[0].unmatched is False
-```
+- 记录 1 保留，`chains` 长度为 1。
+- 记录 2 过滤，`chains` 为空，`unmatched` 为 `True`。
 
 ### 8.3 T-1b-3：`non-bwd` + forward window → `fwd`
 
@@ -471,6 +452,33 @@ assert out[0].chains == []
 assert out[0].unmatched is True
 assert out[0].has_stack_traces is True
 ```
+
+### 8.7 T-1b-7：FSDP/DDP prefix strip
+
+构造 `FrameInfo`：
+- `chains = [FrameInfo("model.py", 100, "nn.Module: DDPDenseTower_0, callsite: 100")]`
+- `source_files = {"model.py": "..."}`
+
+断言：
+- `chains[0]` 的 `func`（或 class_name）应被处理为 `nn.Module: DenseTower_0, callsite: 100`。
+- 归属逻辑应能正确识别出 `DenseTower` 类。
+
+### 8.8 T-1b-8：Wrapper class skip
+
+构造 `FrameInfo`：
+- `chains = [FrameInfo("torch/nn/parallel/distributed.py", 50, "DistributedDataParallel.forward")]`
+- 虽然可能因为某些原因未被 framework filter 滤掉（或属于被允许的 wrapper 路径），但命中 `PARALLEL_WRAPPER_CLASSES`。
+
+断言：
+- 该 frame 被跳过，`chains` 长度减少。
+
+### 8.9 T-1b-9：Phase 空链归 other 的修正
+
+修正：当 kernel 既不属于 `forward` 也不属于 `backward` 窗口时，其 `phase` 必须被归为 `other`。
+
+断言：
+- 构造 `non-bwd` kernel 落在空档期或 `optimize` 期，`phase` 应为 `other`。
+- 若 `chains` 为空且无法通过窗口判定，默认归为 `other`。
 
 ---
 
