@@ -12,7 +12,11 @@ import argparse
 import subprocess
 import textwrap
 import tokenize
+import logging
+from dataclasses import dataclass
 from collections import Counter, defaultdict
+
+LOG = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Module identity registration.
@@ -1265,11 +1269,11 @@ class ASTFrontend:
 #     stub method.  PR5 wires it for the scenario-5 transformer cases.
 #   * `EvalTrace` debug instrumentation is left as a no-op hook.
 # ---------------------------------------------------------------------------
-from dataclasses import dataclass, field
+from dataclasses import dataclass as _dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 
-@dataclass(frozen=True)
+@_dataclass(frozen=True)
 class Scope:
     """Evaluation context for ``ConstantResolver`` look-ups.
 
@@ -1299,7 +1303,7 @@ class Scope:
         return (self.parent_cls, self.parent_attr)
 
 
-@dataclass(frozen=True)
+@_dataclass(frozen=True)
 class IntValue:
     """A resolved integer with provenance metadata for diagnostics."""
 
@@ -1307,7 +1311,7 @@ class IntValue:
     origin: str = "literal"
 
 
-@dataclass(frozen=True)
+@_dataclass(frozen=True)
 class ListValue:
     """A resolved list-length (with optional original AST element nodes)."""
 
@@ -3408,6 +3412,249 @@ def _build_external_id_to_module_map(events):
 
 
 _STACK_FRAME_RE = re.compile(r'File "([^"]+)", line (\d+), in (\w+)')
+_INSTANCE_SUFFIX_RE = re.compile(r'_(\d+)$')
+
+
+@dataclass(frozen=True)
+class StackFrame:
+    file: str
+    line: int
+    func: str = ""
+
+
+@dataclass(frozen=True)
+class InstanceKey:
+    class_name: str
+    instance_suffix: str = ""
+
+
+@dataclass(frozen=True)
+class KernelChain:
+    kernel_name: str
+    duration_us: float
+    frames: list
+    instance_suffix: str = ""
+
+
+@dataclass(frozen=True)
+class MatchResult:
+    instance_key: object
+    reason: str
+    matched_frame: object
+    candidates: list
+
+
+def extract_instance_suffix(event_name: str) -> str:
+    """Extract an explicit trailing ModuleList instance suffix.
+
+    Only a final ``_N`` token is accepted, e.g. ``FSDPBlock_3`` -> ``_3``.
+    Missing or non-final numeric tokens return ``""``; no weak inference is
+    performed from annotations or source context.
+    """
+    m = _INSTANCE_SUFFIX_RE.search(str(event_name or ""))
+    return f"_{m.group(1)}" if m else ""
+
+
+def _frame_file_line(frame):
+    file_path = _frame_get(frame, 0, "file", "")
+    line = _frame_get(frame, 1, "line", None)
+    try:
+        line = int(line)
+    except (TypeError, ValueError):
+        line = None
+    return file_path, line
+
+
+def _source_loc_file_line(loc):
+    if not loc:
+        return None
+    if isinstance(loc, dict):
+        file_path = loc.get("file") or loc.get("fname") or loc.get("path")
+        line = loc.get("line") or loc.get("lineno") or loc.get("to_line") or loc.get("from_line")
+    elif isinstance(loc, (tuple, list)) and len(loc) >= 2:
+        file_path, line = loc[0], loc[1]
+    else:
+        file_path = getattr(loc, "file", None) or getattr(loc, "fname", None) or getattr(loc, "path", None)
+        line = getattr(loc, "line", None) or getattr(loc, "lineno", None)
+    if not file_path or line is None:
+        return None
+    try:
+        return os.path.basename(str(file_path)), int(line)
+    except (TypeError, ValueError):
+        return None
+
+
+def _lookup_from_dag(dag, method_name, *args):
+    method = getattr(dag, method_name, None)
+    if callable(method):
+        return method(*args)
+    if isinstance(dag, dict):
+        table = dag.get(method_name)
+        if callable(table):
+            return table(*args)
+        if isinstance(table, dict):
+            return table.get(tuple(args))
+    return None
+
+
+def _fallback_parent_key_from_attr(class_name, attr_name):
+    base = str(attr_name or "").split("[", 1)[0]
+    if class_name and base and base != attr_name:
+        return InstanceKey(class_name, "")
+    return InstanceKey(class_name or "", "")
+
+
+def _fallback_instance_key_from_attr(class_name, attr_name):
+    m = re.search(r'\[(\d+)\]$', str(attr_name or ""))
+    if m:
+        return InstanceKey(class_name or "", f"_{m.group(1)}")
+    return InstanceKey(class_name or "", "")
+
+
+def _lookup_parent_instance_key(dag, class_name, attr_name):
+    key = _lookup_from_dag(dag, "lookup_parent_instance_key", class_name, attr_name)
+    if key is not None:
+        return key
+    if isinstance(dag, dict):
+        parent_map = dag.get("parent_instance_keys") or dag.get("parent_keys") or {}
+        key = parent_map.get((class_name, attr_name)) or parent_map.get(attr_name)
+        if key is not None:
+            return key
+    return _fallback_parent_key_from_attr(class_name, attr_name)
+
+
+def _lookup_instance_key(dag, class_name, attr_name):
+    key = _lookup_from_dag(dag, "lookup_instance_key", class_name, attr_name)
+    if key is not None:
+        return key
+    if isinstance(dag, dict):
+        instance_map = dag.get("instance_keys") or dag.get("instances") or {}
+        key = instance_map.get((class_name, attr_name)) or instance_map.get(attr_name)
+        if key is not None:
+            return key
+        if instance_map:
+            return None
+    if re.search(r'\[(\d+)\]$', str(attr_name or "")):
+        return None
+    return _fallback_instance_key_from_attr(class_name, attr_name)
+
+
+def _make_indexed_attr_name(attr_name, index):
+    text = str(attr_name or "")
+    base = text.split("[", 1)[0]
+    return f"{base}[{index}]"
+
+
+def _parse_instance_suffix(instance_suffix):
+    m = _INSTANCE_SUFFIX_RE.fullmatch(str(instance_suffix or ""))
+    return int(m.group(1)) if m else None
+
+
+def build_loc_index(dag):
+    """Build source-location inverted index for Step 2 matching.
+
+    key: ``(basename(file), line)``; value: ``[(class_name, attr_name), ...]``.
+    ``first_call_loc`` / ``call_loc`` are preferred over declaration locations.
+    The function accepts the analyzer's static tree dict and lightweight mock
+    DAG objects used by tests.
+    """
+    loc_index = defaultdict(list)
+
+    def add(loc, class_name, attr_name):
+        key = _source_loc_file_line(loc)
+        if not key or not class_name or not attr_name:
+            return
+        candidate = (class_name, attr_name)
+        if candidate not in loc_index[key]:
+            loc_index[key].append(candidate)
+
+    if isinstance(dag, dict) and "classes" not in dag:
+        for class_name, info in dag.items():
+            if not isinstance(info, dict):
+                continue
+            attrs = info.get("attrs", {}) or {}
+            first_call = info.get("first_call_loc", {}) or {}
+            attr_def = info.get("attr_def_loc", {}) or {}
+            dep_locs = info.get("dep_edge_locs", {}) or {}
+            for attr_name in attrs:
+                add(first_call.get(attr_name), class_name, attr_name)
+                if attr_name not in first_call:
+                    add(attr_def.get(attr_name), class_name, attr_name)
+            for (from_attr, to_attr), ev in dep_locs.items():
+                if isinstance(ev, dict):
+                    add((ev.get("file"), ev.get("from_line")), class_name, from_attr)
+                    add((ev.get("file"), ev.get("to_line")), class_name, to_attr)
+        return dict(loc_index)
+
+    class_nodes = getattr(dag, "classes", None)
+    if class_nodes is None and isinstance(dag, dict):
+        class_nodes = dag.get("classes", [])
+    for class_node in class_nodes or []:
+        class_name = getattr(class_node, "class_name", None) or getattr(class_node, "name", None)
+        attrs = getattr(class_node, "attrs", None) or []
+        if isinstance(class_node, dict):
+            class_name = class_node.get("class_name") or class_node.get("name")
+            attrs = class_node.get("attrs", [])
+        if isinstance(attrs, dict):
+            attrs = attrs.values()
+        for attr in attrs:
+            attr_name = getattr(attr, "attr_name", None) or getattr(attr, "name", None)
+            loc = getattr(attr, "call_loc", None) or getattr(attr, "forward_loc", None) or getattr(attr, "source_loc", None)
+            if isinstance(attr, dict):
+                attr_name = attr.get("attr_name") or attr.get("name") or attr.get("attr")
+                loc = attr.get("call_loc") or attr.get("forward_loc") or attr.get("source_loc") or attr.get("loc")
+            add(loc, class_name, attr_name)
+    return dict(loc_index)
+
+
+def match_kernel_to_instance(chain, loc_index, dag) -> MatchResult:
+    matched = []
+    for depth, frame in enumerate(chain.frames or []):
+        file_path, line = _frame_file_line(frame)
+        if line is None:
+            continue
+        key = (os.path.basename(str(file_path or "")), line)
+        candidates = loc_index.get(key)
+        if candidates:
+            matched.append((depth, frame, candidates))
+
+    if not matched:
+        return MatchResult("__unattributed__", "no_stack_frame_hit_loc_index", None, [])
+
+    # Step 1 stores frames in outer→inner order; therefore the largest enumerate
+    # depth is the deepest / innermost matched frame.
+    depth, frame, candidates = max(matched, key=lambda item: item[0])
+
+    for class_name, attr_name in candidates:
+        parent_key = _lookup_parent_instance_key(dag, class_name, attr_name)
+        instance_suffix = getattr(chain, "instance_suffix", "") or ""
+        if instance_suffix == "":
+            instance_key = _lookup_instance_key(dag, class_name, attr_name) or parent_key
+            return MatchResult(instance_key, "matched_without_instance_suffix", frame, candidates)
+
+        index = _parse_instance_suffix(instance_suffix)
+        if index is None:
+            return MatchResult(parent_key, "instance_suffix_index_missing_fallback_to_parent_group", frame, candidates)
+        child_attr_name = _make_indexed_attr_name(attr_name, index)
+        child_key = _lookup_instance_key(dag, class_name, child_attr_name)
+        if child_key is not None:
+            return MatchResult(child_key, "matched_with_instance_suffix", frame, candidates)
+
+        file_path, line = _frame_file_line(frame)
+        LOG.error(
+            "ModuleList index mismatch: kernel=%s suffix=%s class=%s attr=%s indexed_attr=%s frame=%s:%s; "
+            "runtime trace has this instance but static DAG does not. Attribute cost to parent group.",
+            getattr(chain, "kernel_name", ""),
+            instance_suffix,
+            class_name,
+            attr_name,
+            child_attr_name,
+            os.path.basename(str(file_path or "")),
+            line,
+        )
+        return MatchResult(parent_key, "instance_suffix_index_missing_fallback_to_parent_group", frame, candidates)
+
+    return MatchResult("__unattributed__", "matched_frame_but_no_resolvable_candidate", frame, candidates)
 
 
 def _parse_user_frames(traces, source_files):
@@ -4095,6 +4342,7 @@ def build_kernel_stack_cost_table(events, source_files, fwdbwd_index):
             "phase": phase,
             "has_stack_traces": bool(has_stack_traces),
             "chains": chains,
+            "instance_suffix": extract_instance_suffix(ev.get("name", "")),
             "unmatched": unmatched,
             # Legacy compatibility for build_kernel_attribution_table.
             "event": ev,
