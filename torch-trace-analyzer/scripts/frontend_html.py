@@ -142,6 +142,13 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 .lineage-tag.tag-consumer { background: rgba(255,209,102,0.18); color: #ffd166; border: 1px solid rgba(255,209,102,0.4); }
 .lineage-tag.tag-step { background: rgba(100,181,246,0.15); color: #64b5f6; border: 1px solid rgba(100,181,246,0.35); }
 .lineage-loc { font-size: 10px; color: #6f7a93; font-family: 'SFMono-Regular', Consolas, monospace; }
+.lineage-carrier-section { margin: 0 12px 10px; border: 1px solid rgba(100,181,246,0.16); border-radius: 8px; background: rgba(255,255,255,0.025); overflow: hidden; }
+.lineage-carrier-toggle { width: 100%; border: none; border-bottom: 1px solid rgba(100,181,246,0.12); background: rgba(100,181,246,0.10); color: #d6e8ff; cursor: pointer; text-align: left; padding: 8px 12px; font-size: 11px; font-weight: 700; font-family: 'SFMono-Regular', Consolas, monospace; display: flex; align-items: center; justify-content: space-between; }
+.lineage-carrier-toggle::after { content: '▾'; color: #8fc5ff; font-size: 10px; }
+.lineage-carrier-toggle[aria-expanded="false"]::after { content: '▸'; }
+.lineage-carrier-toggle:hover { background: rgba(100,181,246,0.18); color: #fff; }
+.lineage-carrier-body { display: none; padding-top: 10px; }
+.lineage-carrier-toggle[aria-expanded="true"] + .lineage-carrier-body { display: block; }
 .dag-svg .group-clickable { cursor: pointer; }
 .dag-svg .edge-path { pointer-events: stroke; cursor: pointer; }
 .dag-svg .edge-path:hover { stroke-width: 3.4; opacity: 1 !important; }
@@ -1518,6 +1525,12 @@ function showSourcePanel(item) {
             '</div>';
     }
     document.getElementById('sp-body').innerHTML = bodyHtml;
+    document.querySelectorAll('#sp-body .lineage-carrier-toggle').forEach((btn) => {
+        btn.addEventListener('click', () => {
+            const expanded = btn.getAttribute('aria-expanded') === 'true';
+            btn.setAttribute('aria-expanded', expanded ? 'false' : 'true');
+        });
+    });
     sp.classList.add('open');
 }
 
@@ -1532,6 +1545,10 @@ function showEdgePanel(edge) {
     let bodyHtml = '';
     const ev = edge.evidence;
     const isInputEdge = (fromAttr === 'Input');
+    const lineageByCarrier = ev && ev.lineage_by_carrier && typeof ev.lineage_by_carrier === 'object'
+        ? Object.entries(ev.lineage_by_carrier).filter(([name, steps]) => Array.isArray(steps) && steps.length > 0)
+        : [];
+    const history = Array.isArray(ev && ev.var_history) ? ev.var_history : [];
     if (ev) {
         const fmtShape = (shape) => {
             if (shape === null || shape === undefined) return '';
@@ -1562,25 +1579,43 @@ function showEdgePanel(edge) {
         // Iter11 varlineage: render the full assignment chain
         // (var_history) when available so the user sees how the
         // value travels from producer → intermediate ops → consumer.
-        const history = Array.isArray(ev.var_history) ? ev.var_history : [];
-                if (history.length > 0) {
-                    bodyHtml += '<div class="side-panel-section"><h4>Variable lineage (' + history.length + ' step' + (history.length === 1 ? '' : 's') + ')</h4>';
-                    history.forEach((step, idx) => {
-                        const tag = (step.role === 'consumer')
-                            ? '<span class="lineage-tag tag-consumer">consumer</span>'
-                            : (idx === 0 ? '<span class="lineage-tag tag-producer">producer</span>'
-                                       : '<span class="lineage-tag tag-step">step ' + (idx + 1) + '</span>');
-                        const vlabel = step.var ? ('<code>' + escapeHtml(step.var) + '</code>') : '<code>(carrier)</code>';
-                        const stepMarkClass = (step.role === 'consumer') ? 'consumer-mark' : 'producer-mark';
-                        bodyHtml += '<div class="lineage-step">' +
-                            '<div class="lineage-head">' + tag + ' ' + vlabel +
-                            ' <span class="lineage-loc">@' + escapeHtml(step.file || ev.file) + ':' + step.line + '</span></div>' +
-                            renderCodeBlock(step.excerpt && step.excerpt.text, step.excerpt && step.excerpt.start, step.excerpt && step.excerpt.highlight, (step.carriers && step.carriers.length > 0) ? step.carriers : (step.var ? [step.var] : []), stepMarkClass) +
-                            '</div>';
-                    });
-                    bodyHtml += '</div>';
-                } else {
-        
+        const renderLineageStep = (step, idx) => {
+            const tag = (step.role === 'consumer')
+                ? '<span class="lineage-tag tag-consumer">consumer</span>'
+                : (idx === 0 ? '<span class="lineage-tag tag-producer">producer</span>'
+                           : '<span class="lineage-tag tag-step">step ' + (idx + 1) + '</span>');
+            const vlabel = step.var ? ('<code>' + escapeHtml(step.var) + '</code>') : '<code>(carrier)</code>';
+            const stepMarkClass = (step.role === 'consumer') ? 'consumer-mark' : 'producer-mark';
+            return '<div class="lineage-step">' +
+                '<div class="lineage-head">' + tag + ' ' + vlabel +
+                ' <span class="lineage-loc">@' + escapeHtml(step.file || ev.file) + ':' + step.line + '</span></div>' +
+                renderCodeBlock(step.excerpt && step.excerpt.text, step.excerpt && step.excerpt.start, step.excerpt && step.excerpt.highlight, (step.carriers && step.carriers.length > 0) ? step.carriers : (step.var ? [step.var] : []), stepMarkClass) +
+                '</div>';
+        };
+        if (lineageByCarrier.length > 0) {
+            bodyHtml += '<div class="side-panel-section"><h4>Variable lineage (' + history.length + ' step' + (history.length === 1 ? '' : 's') + ')</h4>';
+            lineageByCarrier.forEach(([carrierName, steps], carrierIdx) => {
+                const expanded = carrierIdx === 0;
+                bodyHtml += '<div class="lineage-carrier-section" data-carrier="' + escapeHtml(carrierName) + '">' +
+                    '<button type="button" class="lineage-carrier-toggle" aria-expanded="' + (expanded ? 'true' : 'false') + '">' + escapeHtml(carrierName) + '</button>' +
+                    '<div class="lineage-carrier-body">';
+                steps.forEach((step, idx) => {
+                    bodyHtml += renderLineageStep(step, idx);
+                });
+                bodyHtml += '</div></div>';
+            });
+            bodyHtml += '</div>';
+        } else if (history.length > 0) {
+            bodyHtml += '<div class="side-panel-section"><h4>Variable lineage (' + history.length + ' step' + (history.length === 1 ? '' : 's') + ')</h4>';
+            history.forEach((step, idx) => {
+                bodyHtml += renderLineageStep(step, idx);
+            });
+            bodyHtml += '</div>';
+        } else {
+            bodyHtml += '<div class="side-panel-section"><h4>Variable lineage</h4><div class="evidence-meta" style="color:#7a849c">No variable lineage data available for this edge.</div></div>';
+        }
+        if (history.length === 0) {
+            
             // Fall back to producer/consumer two-block layout when no
             // lineage chain was attached. For Input/top edges we skip
             // the empty producer block — there's no real Python line
@@ -1618,6 +1653,12 @@ function showEdgePanel(edge) {
         throw new Error(errMsg);
     }
     document.getElementById('sp-body').innerHTML = bodyHtml;
+    document.querySelectorAll('#sp-body .lineage-carrier-toggle').forEach((btn) => {
+        btn.addEventListener('click', () => {
+            const expanded = btn.getAttribute('aria-expanded') === 'true';
+            btn.setAttribute('aria-expanded', expanded ? 'false' : 'true');
+        });
+    });
     sp.classList.add('open');
 }
 
@@ -1689,6 +1730,32 @@ render();
 </script>
 </body>
 </html>"""
+
+
+def _build_lineage_by_carrier(var_history):
+    """Group step-level var_history by carrier in first-seen carrier order."""
+    groups = {}
+    order = []
+    for step in var_history or []:
+        if not isinstance(step, dict):
+            continue
+        seen_in_step = set()
+        for carrier in step.get("carriers") or []:
+            if not carrier or carrier in seen_in_step:
+                continue
+            seen_in_step.add(carrier)
+            if carrier not in groups:
+                groups[carrier] = []
+                order.append(carrier)
+            groups[carrier].append(step)
+    return {name: groups[name] for name in order}
+
+
+def _finalize_edge_evidence(evidence):
+    if not evidence:
+        return evidence
+    evidence["lineage_by_carrier"] = _build_lineage_by_carrier(evidence.get("var_history") or [])
+    return evidence
 
 
 def generate_html_flowchart(source_files, timing_data=None, meta=None, output_path="flowchart.html", trace_events=None, conditional_mode="infer", _return_data_only=False):
@@ -2832,6 +2899,7 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
                             "to_excerpt": _excerpt(ev["to_line"]),
                             "var_history": _var_history_from(ev.get("lineage")),
                         }
+                        _finalize_edge_evidence(edge["evidence"])
                         # Iter12-final-fix Rule1c: relocate excerpt highlights
                         # onto real ``self.{attr}(...)`` call sites in cname's
                         # forward() body when the data-flow tracer's chosen
@@ -2894,7 +2962,7 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
                             cname, from_attr, ev_anchor.get("from_excerpt"))
                         ev_anchor["to_excerpt"] = _relocate_excerpt_to_self_call(
                             cname, to_attr, ev_anchor.get("to_excerpt"))
-                        edge["evidence"] = ev_anchor
+                        edge["evidence"] = _finalize_edge_evidence(ev_anchor)
                     internal_edges.append(edge)
 
         # Iter17: Bug 2 fix — REMOVED the "sequential call order" fallback.
@@ -3954,7 +4022,7 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
                     _vh = _input_edge_var_history(_root_cname, consumer_attr, _call_loc)
                     if _vh:
                         _ev_data["var_history"] = _vh
-                edge_entry["evidence"] = _ev_data
+                edge_entry["evidence"] = _finalize_edge_evidence(_ev_data)
             else:
                 edge_entry["type"] = "boundary"
             dag_edges.append(edge_entry)
@@ -4027,7 +4095,7 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
                         _vh = _input_edge_var_history(_root_cname, _g_attr, _call_loc)
                         if _vh:
                             _ev_data["var_history"] = _vh
-                    edge_entry["evidence"] = _ev_data
+                    edge_entry["evidence"] = _finalize_edge_evidence(_ev_data)
                 else:
                     edge_entry["type"] = "boundary"
                 dag_edges.append(edge_entry)
@@ -4064,7 +4132,7 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
             _edge_entry = {"from": input_node_id, "to": _consumer_id, "type": "dep",
                            "from_attr": "Input", "to_attr": _consumer_attr}
             if _ev_data:
-                _edge_entry["evidence"] = _ev_data
+                _edge_entry["evidence"] = _finalize_edge_evidence(_ev_data)
             dag_edges.append(_edge_entry)
             _input_connected_ids.add(_consumer_id)
 
@@ -4157,7 +4225,7 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
                         _vh = _input_edge_var_history(_root_cname, child_attr, _call_loc)
                         if _vh:
                             _ev_data["var_history"] = _vh
-                    edge_entry["evidence"] = _ev_data
+                    edge_entry["evidence"] = _finalize_edge_evidence(_ev_data)
                 else:
                     # Iter12-final: if no Rule1b-safe call-site can be found,
                     # demote this synthetic entry edge to type=boundary so it
@@ -4219,7 +4287,7 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
                         _ev_data["var_history"] = _vh_probe
                 _entry = {"from": input_node_id, "to": _consumer_id, "type": "dep", "from_attr": "Input", "to_attr": _consumer_attr}
                 if _ev_data:
-                    _entry["evidence"] = _ev_data
+                    _entry["evidence"] = _finalize_edge_evidence(_ev_data)
                 dag_edges.append(_entry)
                 _input_connected_ids.add(_consumer_id)
 
@@ -4248,7 +4316,7 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
                         _ev_data["var_history"] = _vh
                 _entry = {"from": input_node_id, "to": _consumer_id, "type": "dep", "from_attr": "Input", "to_attr": _consumer_attr}
                 if _ev_data:
-                    _entry["evidence"] = _ev_data
+                    _entry["evidence"] = _finalize_edge_evidence(_ev_data)
                 dag_edges.append(_entry)
 
         if not _input_connected_ids:
@@ -4283,7 +4351,7 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
             }
             edge_entry = {"from": producer_id, "to": loss_node_id, "type": "dep",
                           "from_attr": producer_attr, "to_attr": "Result",
-                          "evidence": _ev_data}
+                          "evidence": _finalize_edge_evidence(_ev_data)}
             # Iter12-final-fix Rule1c: ensure from_excerpt highlights a real call.
             if _root_cname and _ev_data:
                 _ev_data["from_excerpt"] = _relocate_excerpt_to_self_call(
@@ -4323,8 +4391,9 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
                         "role": "consumer",
                         "carriers": _var_carriers,
                     })
-                if _vh_steps:
-                    _ev_data["var_history"] = _vh_steps
+            if _vh_steps:
+                _ev_data["var_history"] = _vh_steps
+            _finalize_edge_evidence(_ev_data)
             dag_edges.append(edge_entry)
             _result_connected_ids.add(producer_id)
 
@@ -4375,7 +4444,7 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
                                 "excerpt": _from_ex,
                                 "role": "step",
                             }]
-                    edge_entry["evidence"] = _ev_data
+                    edge_entry["evidence"] = _finalize_edge_evidence(_ev_data)
                 dag_edges.append(edge_entry)
                 _result_connected_ids.add(child_id)
 
@@ -5416,7 +5485,7 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
                             g_label, consumer_attr, _ev_data.get("from_excerpt"))
                     # Only attach evidence when we did not redirect to a boundary.
                     if _redirect_to is None:
-                        edge_entry["evidence"] = _ev_data
+                        edge_entry["evidence"] = _finalize_edge_evidence(_ev_data)
                 else:
                     # Iter12-final: no Rule1b-safe call site; demote to boundary
                     # so the testset Rule1/Rule1b validators skip this edge.
@@ -5514,7 +5583,7 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
                         _ev_data["from_excerpt"] = _relocate_excerpt_to_self_call(
                             g_label, attr, _ev_data.get("from_excerpt"))
                     if _redirect_to2 is None:
-                        edge_entry["evidence"] = _ev_data
+                        edge_entry["evidence"] = _finalize_edge_evidence(_ev_data)
                 elif effective_edge_type == "dep":
                     # Iter12-final: no Rule1b-safe call site; demote to boundary.
                     edge_entry["type"] = "boundary"
@@ -5780,9 +5849,9 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
                         # Demote to boundary BUT keep var_history so Rule6_out
                         # still validates (return + consumer LHS + var fields).
                         edge_entry["type"] = "boundary"
-                        edge_entry["evidence"] = _ev_data
+                        edge_entry["evidence"] = _finalize_edge_evidence(_ev_data)
                     else:
-                        edge_entry["evidence"] = _ev_data
+                        edge_entry["evidence"] = _finalize_edge_evidence(_ev_data)
                 else:
                     # Iter12-final: when no `self.{attr}(...)` call site can be
                     # located in g's source (e.g. attr is invoked dynamically
