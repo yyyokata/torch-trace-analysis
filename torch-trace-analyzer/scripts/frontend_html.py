@@ -194,6 +194,8 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 
 <script>
 const DATA = __FLOWCHART_DATA_PLACEHOLDER__;
+const HAS_TIMING_DATA = !!DATA.has_timing_data || !!DATA.has_timing;
+const HAS_TRACE_STEP  = !!DATA.has_trace_step || Number(DATA.meta?.step_dur_us || 0) > 0;
 
 const groupMap = {};
 const nodeMap = {};
@@ -492,7 +494,7 @@ function formatDur(us) {
 }
 
 function getNodeColor(n) {
-    if (!DATA.has_timing || !n.has_timing) {
+    if (!HAS_TIMING_DATA || !n.has_timing) {
         const depthColors = ['#4a6fa5', '#5b8c5a', '#8e6fad', '#c77a3c', '#4aa5a0', '#a05c7b'];
         return depthColors[(n.depth || 0) % depthColors.length];
     }
@@ -508,7 +510,7 @@ function getNodeColor(n) {
 }
 
 function getGroupBorderColor(g) {
-    if (!DATA.has_timing || !g.has_timing) {
+    if (!HAS_TIMING_DATA || !g.has_timing) {
         const depthColors = ['rgba(74,111,165,0.5)', 'rgba(91,140,90,0.5)', 'rgba(142,111,173,0.5)', 'rgba(199,122,60,0.5)'];
         return depthColors[(g.depth || 0) % depthColors.length];
     }
@@ -877,8 +879,8 @@ function render() {
                 tl.setAttribute('x', ox + pos.w/2); tl.setAttribute('y', oy + pos.h/2 + 12);
                 tl.setAttribute('text-anchor', 'middle');
                 tl.setAttribute('class', 'group-timing');
-                // Kernel-only contract: g.dur_us already mirrors kernel_us.
-                tl.textContent = `Kernel ${g.pct.toFixed(1)}% · ${formatDur(g.dur_us)}`;
+                const disp = computeGroupDisplayTiming(g);
+                tl.textContent = `Subtree ${disp.pct.toFixed(1)}% · ${formatDur(disp.kernelUs)}`;
                 bindGroupHover(tl, gid);
                 svg.appendChild(tl);
             }
@@ -942,8 +944,8 @@ function render() {
             tl.setAttribute('x', ox + pos.w - 10); tl.setAttribute('y', oy + 18);
             tl.setAttribute('text-anchor', 'end');
             tl.setAttribute('class', 'group-timing');
-            // Kernel-only contract: g.dur_us already mirrors kernel_us.
-            tl.textContent = `Kernel ${g.pct.toFixed(1)}% · ${formatDur(g.dur_us)}`;
+            const disp = computeGroupDisplayTiming(g);
+            tl.textContent = `Subtree ${disp.pct.toFixed(1)}% · ${formatDur(disp.kernelUs)}`;
             bindGroupHover(tl, gid);
             svg.appendChild(tl);
         }
@@ -1295,9 +1297,10 @@ function render() {
 
     // Header info
     const meta = DATA.meta;
-    if (DATA.has_timing) {
+    if (HAS_TIMING_DATA) {
         document.getElementById('mode-badge').innerHTML = '<span class="mode-badge mode-timing">📊 Structure + Timing</span>';
-        document.getElementById('meta-info').textContent = `Device: ${meta.device} | Step: ${meta.step_dur_str} | Modules: ${meta.num_modules}`;
+        const stepDisplay = HAS_TRACE_STEP ? (meta.step_phase_str || meta.step_dur_str) : meta.step_dur_str;
+        document.getElementById('meta-info').textContent = `Device: ${meta.device} | Step: ${stepDisplay} | Modules: ${meta.num_modules}`;
     } else {
         document.getElementById('mode-badge').innerHTML = '<span class="mode-badge mode-structure">🏗️ Static Structure (source code)</span>';
         document.getElementById('meta-info').textContent = `Modules: ${meta.num_modules} | Root: ${meta.roots ? meta.roots.join(", ") : "N/A"}`;
@@ -1305,7 +1308,7 @@ function render() {
 
     // Legend
     const legendDiv = document.getElementById('legend');
-    if (DATA.has_timing) {
+    if (HAS_TIMING_DATA) {
         legendDiv.innerHTML = `
             <div class="legend-item"><div class="legend-dot" style="background:#2980b9"></div>&gt;20%</div>
             <div class="legend-item"><div class="legend-dot" style="background:#27ae60"></div>10-20%</div>
@@ -1328,7 +1331,7 @@ function render() {
     const summaryDiv = document.getElementById('summary');
     const allNodes = DATA.nodes;
     const allGroups = DATA.groups;
-    if (DATA.has_timing) {
+    if (HAS_TRACE_STEP) {
         const topN = [...allNodes, ...allGroups].filter(x => x.has_timing).sort((a,b) => b.pct - a.pct).slice(0,5);
         summaryDiv.innerHTML = `<h3>📊 Top Modules by Time</h3><p>${
             topN.map(x => `<b>${x.label || x.class_name}</b> ${x.pct.toFixed(1)}%`).join(' → ')
@@ -1347,6 +1350,52 @@ function computeSelfMs(item) {
     const excPct = Number(item && item.exc_pct || 0);
     const stepUs = Number(DATA && DATA.meta && DATA.meta.step_dur_us || 0);
     return (excPct > 0 && stepUs > 0) ? (excPct * stepUs / 100.0 / 1000.0) : 0;
+}
+
+function computeGroupDisplayTiming(group) {
+    const kernelUs = Number(
+        group && group.subtree_inclusive_us != null
+            ? group.subtree_inclusive_us
+            : (group && group.inclusive_us != null
+                ? group.inclusive_us
+                : (group && group.kernel_us != null ? group.kernel_us : (group && group.dur_us || 0)))
+    );
+    const pct = Number(group && group.subtree_pct != null ? group.subtree_pct : (group && group.pct || 0));
+    return { kernelUs, pct };
+}
+
+function getTimingFields(item) {
+    const kernelUs = Number(
+        item && item.inclusive_us != null
+            ? item.inclusive_us
+            : (item && item.kernel_us != null ? item.kernel_us : (item && item.dur_us || 0))
+    );
+    const fwdUs = Number(
+        item && item.inclusive_forward_us != null
+            ? item.inclusive_forward_us
+            : (item && item.fwd_kernel_us || 0)
+    );
+    const bwdUs = Number(
+        item && item.inclusive_backward_us != null
+            ? item.inclusive_backward_us
+            : (item && item.bwd_kernel_us || 0)
+    );
+    const optimizeUs = Number(item && item.inclusive_optimize_us != null ? item.inclusive_optimize_us : 0);
+    const otherUs = Number(
+        item && item.inclusive_other_us != null
+            ? item.inclusive_other_us
+            : (item && item.other_kernel_us || 0)
+    );
+    const selfUs = Number(item && item.self_kernel_us != null ? item.self_kernel_us : 0);
+    const useSubtree = !!(item && item.self_kernel_us != null && item.self_kernel_us !== kernelUs);
+    return {
+        kernelMs: kernelUs / 1000.0,
+        fwdMs: fwdUs / 1000.0,
+        bwdMs: bwdUs / 1000.0,
+        otherMs: (optimizeUs + otherUs) / 1000.0,
+        selfMs: selfUs / 1000.0,
+        useSubtree,
+    };
 }
 
 function fmtTimingMs(value, forceShow) {
@@ -1373,16 +1422,14 @@ function renderTimingRow(label, value, kind) {
 function showTooltip(e, n) {
     const tt = document.getElementById('tooltip');
     let html = `<div class="tt-title">${n.attr_name || n.label || n.class_name} <span style="opacity:0.6">(${n.class_name || n.label || 'Module'})</span></div>`;
-    // Kernel-only contract: dur_us mirrors kernel_us; fwd/bwd/other are the
-    // only phase splits we expose. No host walltime / overhead displayed.
-    const kernelMs = Number(n && n.kernel_us != null ? n.kernel_us : (n.dur_us || 0)) / 1000.0;
-    const fwdMs = Number(n && n.fwd_kernel_us || 0) / 1000.0;
-    const bwdMs = Number(n && n.bwd_kernel_us || 0) / 1000.0;
-    const otherMs = Number(n && n.other_kernel_us || 0) / 1000.0;
-    html += `<div class="tt-row">Kernel: ${fmtTimingMs(kernelMs, true)}</div>`;
-    html += `<div class="tt-row">Forward: ${fmtTimingMs(fwdMs, true)}</div>`;
-    html += `<div class="tt-row">Backward: ${fmtTimingMs(bwdMs, true)}</div>`;
-    html += `<div class="tt-row">Other: ${fmtTimingMs(otherMs, true)}</div>`;
+    const tf = getTimingFields(n);
+    html += `<div class="tt-row">Kernel: ${fmtTimingMs(tf.kernelMs, true)}</div>`;
+    html += `<div class="tt-row">Forward: ${fmtTimingMs(tf.fwdMs, true)}</div>`;
+    html += `<div class="tt-row">Backward: ${fmtTimingMs(tf.bwdMs, true)}</div>`;
+    html += `<div class="tt-row">Other: ${fmtTimingMs(tf.otherMs, true)}</div>`;
+    if (tf.useSubtree) {
+        html += `<div class="tt-row">Self: ${fmtTimingMs(tf.selfMs, true)}</div>`;
+    }
     tt.innerHTML = html;
     tt.style.left = (e.clientX + 12) + 'px';
     tt.style.top = (e.clientY + 12) + 'px';
@@ -1482,19 +1529,17 @@ function showSourcePanel(item) {
         : '(class definition not available in supplied sources)';
     document.getElementById('sp-subtitle').textContent = fileLabel;
     let bodyHtml = '';
-    // Kernel-only contract: dur_us mirrors kernel_us; fwd/bwd/other are the
-    // only phase splits we expose. No host walltime / overhead displayed.
-    const kernelMs = Number(item && item.kernel_us != null ? item.kernel_us : (item.dur_us || 0)) / 1000.0;
-    const fwdMs = Number(item && item.fwd_kernel_us || 0) / 1000.0;
-    const bwdMs = Number(item && item.bwd_kernel_us || 0) / 1000.0;
-    const otherMs = Number(item && item.other_kernel_us || 0) / 1000.0;
-    if (item.has_timing || item.has_phase_timing) {
+    const tf = getTimingFields(item);
+    if (item.has_timing || item.has_phase_timing || tf.useSubtree) {
         bodyHtml += '<div class="side-panel-section"><h4>Timing</h4>' +
-            renderTimingRow('Kernel', kernelMs, 'kernel') +
-            renderTimingRow('Forward', fwdMs, 'forward') +
-            renderTimingRow('Backward', bwdMs, 'backward') +
-            renderTimingRow('Other', otherMs, 'other') +
-            '</div>';
+            renderTimingRow('Kernel', tf.kernelMs, 'kernel') +
+            renderTimingRow('Forward', tf.fwdMs, 'forward') +
+            renderTimingRow('Backward', tf.bwdMs, 'backward') +
+            renderTimingRow('Other', tf.otherMs, 'other');
+        if (tf.useSubtree) {
+            bodyHtml += renderTimingRow('Self', tf.selfMs, 'kernel');
+        }
+        bodyHtml += '</div>';
     }
     if (item.src_snippet) {
         bodyHtml += '<div class="side-panel-section"><h4>Class definition</h4>' +
@@ -3332,6 +3377,11 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
             _cont_fwd_kernel_us = 0.0
             _cont_bwd_kernel_us = 0.0
             _cont_other_kernel_us = 0.0
+            _cont_inclusive_us = 0.0
+            _cont_inclusive_forward_us = 0.0
+            _cont_inclusive_backward_us = 0.0
+            _cont_inclusive_optimize_us = 0.0
+            _cont_inclusive_other_us = 0.0
             _cont_exc_us = 0.0
             _cont_calls = 0
             _cont_role = "main"
@@ -3343,6 +3393,11 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
                             _cont_fwd_kernel_us += _n.get("fwd_kernel_us", 0) or 0
                             _cont_bwd_kernel_us += _n.get("bwd_kernel_us", 0) or 0
                             _cont_other_kernel_us += _n.get("other_kernel_us", 0) or 0
+                            _cont_inclusive_us += _n.get("inclusive_us", _n.get("kernel_us", 0)) or 0
+                            _cont_inclusive_forward_us += _n.get("inclusive_forward_us", _n.get("fwd_kernel_us", 0)) or 0
+                            _cont_inclusive_backward_us += _n.get("inclusive_backward_us", _n.get("bwd_kernel_us", 0)) or 0
+                            _cont_inclusive_optimize_us += _n.get("inclusive_optimize_us", 0) or 0
+                            _cont_inclusive_other_us += _n.get("inclusive_other_us", _n.get("other_kernel_us", 0)) or 0
                             _cont_calls += _n.get("calls", 0) or 0
                             break
                 else:
@@ -3352,6 +3407,11 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
                             _cont_fwd_kernel_us += _cg.get("fwd_kernel_us", 0) or 0
                             _cont_bwd_kernel_us += _cg.get("bwd_kernel_us", 0) or 0
                             _cont_other_kernel_us += _cg.get("other_kernel_us", 0) or 0
+                            _cont_inclusive_us += _cg.get("inclusive_us", _cg.get("kernel_us", 0)) or 0
+                            _cont_inclusive_forward_us += _cg.get("inclusive_forward_us", _cg.get("fwd_kernel_us", 0)) or 0
+                            _cont_inclusive_backward_us += _cg.get("inclusive_backward_us", _cg.get("bwd_kernel_us", 0)) or 0
+                            _cont_inclusive_optimize_us += _cg.get("inclusive_optimize_us", 0) or 0
+                            _cont_inclusive_other_us += _cg.get("inclusive_other_us", _cg.get("other_kernel_us", 0)) or 0
                             _cont_calls += _cg.get("calls", 0) or 0
                             break
             _cont_pct = _cont_kernel_us / step_dur_us * 100 if step_dur_us > 0 else 0
@@ -3374,6 +3434,13 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
                 "fwd_kernel_us": _cont_fwd_kernel_us,
                 "bwd_kernel_us": _cont_bwd_kernel_us,
                 "other_kernel_us": _cont_other_kernel_us,
+                "self_kernel_us": _cont_kernel_us,
+                "inclusive_us": _cont_inclusive_us,
+                "subtree_inclusive_us": _cont_inclusive_us,
+                "inclusive_forward_us": _cont_inclusive_forward_us,
+                "inclusive_backward_us": _cont_inclusive_backward_us,
+                "inclusive_optimize_us": _cont_inclusive_optimize_us,
+                "inclusive_other_us": _cont_inclusive_other_us,
                 "dur_us": _cont_kernel_us,
                 "has_phase_timing": has_timing and (_cont_fwd_kernel_us > 0 or _cont_bwd_kernel_us > 0 or _cont_other_kernel_us > 0),
                 "calls": _cont_calls,
@@ -3425,6 +3492,11 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
         fwd_kernel_us = float(inst_timing["fwd_kernel_us"]) if inst_timing else 0.0
         bwd_kernel_us = float(inst_timing["bwd_kernel_us"]) if inst_timing else 0.0
         other_kernel_us = float(inst_timing["other_kernel_us"]) if inst_timing else 0.0
+        inclusive_us = float(inst_timing.get("inclusive_us", kernel_us)) if inst_timing else kernel_us
+        inclusive_forward_us = float(inst_timing.get("inclusive_forward_us", fwd_kernel_us)) if inst_timing else fwd_kernel_us
+        inclusive_backward_us = float(inst_timing.get("inclusive_backward_us", bwd_kernel_us)) if inst_timing else bwd_kernel_us
+        inclusive_optimize_us = float(inst_timing.get("inclusive_optimize_us", 0.0)) if inst_timing else 0.0
+        inclusive_other_us = float(inst_timing.get("inclusive_other_us", other_kernel_us)) if inst_timing else other_kernel_us
         exc = class_exclusive.get(cname, 0)
         pct = kernel_us / step_dur_us * 100 if step_dur_us > 0 else 0
         exc_pct = exc / step_dur_us * 100 if step_dur_us > 0 else 0
@@ -3453,6 +3525,13 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
             "fwd_kernel_us": fwd_kernel_us,
             "bwd_kernel_us": bwd_kernel_us,
             "other_kernel_us": other_kernel_us,
+            "self_kernel_us": kernel_us,
+            "inclusive_us": inclusive_us,
+            "subtree_inclusive_us": inclusive_us,
+            "inclusive_forward_us": inclusive_forward_us,
+            "inclusive_backward_us": inclusive_backward_us,
+            "inclusive_optimize_us": inclusive_optimize_us,
+            "inclusive_other_us": inclusive_other_us,
             "dur_us": kernel_us,
             "has_phase_timing": has_timing and (fwd_kernel_us > 0 or bwd_kernel_us > 0 or other_kernel_us > 0),
             "calls": calls_n,
@@ -3484,6 +3563,11 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
         fwd_kernel_us = float(inst_timing["fwd_kernel_us"]) if inst_timing else 0.0
         bwd_kernel_us = float(inst_timing["bwd_kernel_us"]) if inst_timing else 0.0
         other_kernel_us = float(inst_timing["other_kernel_us"]) if inst_timing else 0.0
+        inclusive_us = float(inst_timing.get("inclusive_us", kernel_us)) if inst_timing else kernel_us
+        inclusive_forward_us = float(inst_timing.get("inclusive_forward_us", fwd_kernel_us)) if inst_timing else fwd_kernel_us
+        inclusive_backward_us = float(inst_timing.get("inclusive_backward_us", bwd_kernel_us)) if inst_timing else bwd_kernel_us
+        inclusive_optimize_us = float(inst_timing.get("inclusive_optimize_us", 0.0)) if inst_timing else 0.0
+        inclusive_other_us = float(inst_timing.get("inclusive_other_us", other_kernel_us)) if inst_timing else other_kernel_us
         exc = class_exclusive.get(class_name, 0)
         pct = kernel_us / step_dur_us * 100 if step_dur_us > 0 else 0
         exc_pct = exc / step_dur_us * 100 if step_dur_us > 0 else 0
@@ -3504,6 +3588,11 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
             "fwd_kernel_us": fwd_kernel_us,
             "bwd_kernel_us": bwd_kernel_us,
             "other_kernel_us": other_kernel_us,
+            "inclusive_us": inclusive_us,
+            "inclusive_forward_us": inclusive_forward_us,
+            "inclusive_backward_us": inclusive_backward_us,
+            "inclusive_optimize_us": inclusive_optimize_us,
+            "inclusive_other_us": inclusive_other_us,
             "dur_us": kernel_us,
             "has_phase_timing": has_timing and (fwd_kernel_us > 0 or bwd_kernel_us > 0 or other_kernel_us > 0),
             "calls": calls_n,
@@ -6165,12 +6254,19 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
         "loss_node_id": loss_node_id,
         "result_node_id": loss_node_id,
         "has_timing": has_timing,
+        "has_timing_data": has_timing,
+        "has_trace_step": has_timing and step_dur_us > 0,
         "meta": {
             "device": meta.get("device_name", "N/A") if meta else "N/A",
             "step_dur_us": step_dur_us,
             "step_kernel_us": timing_data.get("step_kernel_us", 0) if timing_data else 0,
             "unattributed_kernel_us": timing_data.get("unattributed_kernel_us", 0) if timing_data else 0,
+            "inclusive_forward_us": timing_data.get("inclusive_forward_us") if timing_data else None,
+            "inclusive_backward_us": timing_data.get("inclusive_backward_us") if timing_data else None,
+            "inclusive_optimize_us": timing_data.get("inclusive_optimize_us") if timing_data else None,
+            "inclusive_other_us": timing_data.get("inclusive_other_us") if timing_data else None,
             "step_dur_str": format_duration(step_dur_us) if step_dur_us > 0 else "N/A",
+            "step_phase_str": timing_data.get("step_phase_str") if timing_data else None,
             "num_modules": len(dag_nodes) + len(dag_groups),
             "roots": roots,
         }
@@ -6373,7 +6469,7 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
     return render_flowchart_to_file(flowchart_data, output_path)
 
 
-def build_timing_data_from_trace(events, source_files, mod_info, step_dur_us, profiler_steps, src_info=None, roots=None):
+def build_timing_data_from_trace(events, source_files, mod_info, step_dur_us, profiler_steps, src_info=None, roots=None, static_module_tree=None):
     """Extract per-class and per-instance timing data for the static flowchart."""
     class_map = _build_class_map(source_files)
     timing_data = {
@@ -6430,10 +6526,15 @@ def build_timing_data_from_trace(events, source_files, mod_info, step_dur_us, pr
         # Design doc: timing_fix_workdir/output/timing_redesign.md
         # ------------------------------------------------------------------
         panel = build_instance_timing_pipeline(
-            events, source_files, class_map, step_infos, step_dur_us, roots=roots
+            events, source_files, class_map, step_infos, step_dur_us, roots=roots, static_module_tree=static_module_tree
         )
         timing_data["step_kernel_us"] = panel.get("step_kernel_us", 0)
         timing_data["unattributed_kernel_us"] = panel.get("unattributed_kernel_us", 0)
+        timing_data["step_phase_str"] = panel.get("step_phase_str")
+        timing_data["inclusive_forward_us"] = panel.get("inclusive_forward_us")
+        timing_data["inclusive_backward_us"] = panel.get("inclusive_backward_us")
+        timing_data["inclusive_optimize_us"] = panel.get("inclusive_optimize_us")
+        timing_data["inclusive_other_us"] = panel.get("inclusive_other_us")
         # Class-level totals from instance inclusive (overwrite wrapped-event
         # estimates; new pipeline is authoritative).
         for cls, total_us in panel["class_durations"].items():
@@ -6461,10 +6562,17 @@ def build_timing_data_from_trace(events, source_files, mod_info, step_dur_us, pr
             shimmed = []
             for item in items:
                 it = dict(item)
-                it.setdefault("kernel_us", float(item.get("inclusive_us", item.get("total_us", 0.0))))
-                it.setdefault("fwd_kernel_us", float(item.get("inclusive_forward_us", item.get("forward_us", 0.0))))
-                it.setdefault("bwd_kernel_us", float(item.get("inclusive_backward_us", item.get("backward_us", 0.0))))
-                it.setdefault("other_kernel_us", float(item.get("other_us", 0.0)))
+                inclusive_optimize_us = float(item.get("inclusive_optimize_us", item.get("optimize_us", 0.0)) or 0.0)
+                inclusive_other_us = float(item.get("inclusive_other_us", item.get("other_us", 0.0)) or 0.0)
+                it.setdefault("kernel_us", float(item.get("total_us", item.get("self_us", 0.0)) or 0.0))
+                it.setdefault("fwd_kernel_us", float(item.get("forward_us", 0.0) or 0.0))
+                it.setdefault("bwd_kernel_us", float(item.get("backward_us", 0.0) or 0.0))
+                it.setdefault("other_kernel_us", float(item.get("other_us", 0.0) or 0.0))
+                it.setdefault("inclusive_us", float(item.get("inclusive_us", it.get("kernel_us", 0.0)) or 0.0))
+                it.setdefault("inclusive_forward_us", float(item.get("inclusive_forward_us", item.get("forward_us", 0.0)) or 0.0))
+                it.setdefault("inclusive_backward_us", float(item.get("inclusive_backward_us", item.get("backward_us", 0.0)) or 0.0))
+                it.setdefault("inclusive_optimize_us", inclusive_optimize_us)
+                it.setdefault("inclusive_other_us", inclusive_other_us)
                 shimmed.append(it)
             filtered_runtime[class_name] = shimmed
         timing_data["runtime_instance_timings_by_class"] = filtered_runtime
@@ -6567,26 +6675,24 @@ def _generate_flowchart_html_dual(data_train, data_infer):
 
     # Use the train dataset to render the base template; the JSON payload will
     # be replaced with a dual-data preamble below.
-    base_html = _generate_flowchart_html(data_train)
+    base_html = FLOWCHART_HTML_TEMPLATE
 
     train_json = _json.dumps(data_train, ensure_ascii=True)
     infer_json = _json.dumps(data_infer, ensure_ascii=True)
 
-    # ---- 1. swap `const DATA = {...}` for a dual-data preamble --------------
-    # The single-tab template uses the regex:
-    #   const DATA = ... (?=\nconst groupMap = \{\};)
-    # so we anchor to the same boundary.
+    # ---- 1. swap only the `const DATA = ...;` line for a dual-data preamble ----
+    # Keep the following HAS_TIMING_DATA / HAS_TRACE_STEP constants intact.
     dual_preamble = (
         "const DATA = " + train_json + ";\n"
         "const DATA_TRAIN = " + train_json + ";\n"
         "const DATA_INFER = " + infer_json + ";\n"
     )
     new_html, n_sub = _re.subn(
-        r'const DATA = .*?(?=\nconst groupMap = \{\};)',
-        lambda m: dual_preamble,
+        r'^const DATA = .*;$',
+        lambda m: dual_preamble.rstrip("\n"),
         base_html,
         count=1,
-        flags=_re.DOTALL,
+        flags=_re.MULTILINE,
     )
     if n_sub != 1:
         # Fall back to legacy iframe shell (extremely defensive — should never
@@ -6810,13 +6916,12 @@ def _generate_flowchart_html(data):
     )
     html_template = html_template.replace(_aef_anchor, _aef_replacement, 1)
 
-    # Replace the embedded DATA payload using the stable script markers rather
-    # than a naive non-greedy `{...};` regex: the serialized JSON contains many
-    # nested `};` substrings inside code snippets, which can cause partial
-    # matches and leave stale template data in place.
-    pattern = r'const DATA = .*?(?=\nconst groupMap = \{\};)'
-    replacement = 'const DATA = ' + data_json + '\n'
-    html_template = re.sub(pattern, lambda m: replacement, html_template, flags=re.DOTALL)
+    # Replace the embedded DATA payload by matching only the placeholder line.
+    # Do not span to groupMap, otherwise HAS_TIMING_DATA / HAS_TRACE_STEP are
+    # removed from the rendered HTML preamble.
+    pattern = r'^const DATA = __FLOWCHART_DATA_PLACEHOLDER__;$'
+    replacement = 'const DATA = ' + data_json
+    html_template = re.sub(pattern, lambda m: replacement, html_template, count=1, flags=re.MULTILINE)
     
     return html_template
 
