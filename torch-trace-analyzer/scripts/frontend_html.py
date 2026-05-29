@@ -6675,26 +6675,24 @@ def _generate_flowchart_html_dual(data_train, data_infer):
 
     # Use the train dataset to render the base template; the JSON payload will
     # be replaced with a dual-data preamble below.
-    base_html = _generate_flowchart_html(data_train)
+    base_html = FLOWCHART_HTML_TEMPLATE
 
     train_json = _json.dumps(data_train, ensure_ascii=True)
     infer_json = _json.dumps(data_infer, ensure_ascii=True)
 
-    # ---- 1. swap `const DATA = {...}` for a dual-data preamble --------------
-    # The single-tab template uses the regex:
-    #   const DATA = ... (?=\nconst groupMap = \{\};)
-    # so we anchor to the same boundary.
+    # ---- 1. swap only the `const DATA = ...;` line for a dual-data preamble ----
+    # Keep the following HAS_TIMING_DATA / HAS_TRACE_STEP constants intact.
     dual_preamble = (
         "const DATA = " + train_json + ";\n"
         "const DATA_TRAIN = " + train_json + ";\n"
         "const DATA_INFER = " + infer_json + ";\n"
     )
     new_html, n_sub = _re.subn(
-        r'const DATA = .*?(?=\nconst groupMap = \{\};)',
-        lambda m: dual_preamble,
+        r'^const DATA = .*;$',
+        lambda m: dual_preamble.rstrip("\n"),
         base_html,
         count=1,
-        flags=_re.DOTALL,
+        flags=_re.MULTILINE,
     )
     if n_sub != 1:
         # Fall back to legacy iframe shell (extremely defensive — should never
@@ -6918,13 +6916,12 @@ def _generate_flowchart_html(data):
     )
     html_template = html_template.replace(_aef_anchor, _aef_replacement, 1)
 
-    # Replace the embedded DATA payload using the stable script markers rather
-    # than a naive non-greedy `{...};` regex: the serialized JSON contains many
-    # nested `};` substrings inside code snippets, which can cause partial
-    # matches and leave stale template data in place.
-    pattern = r'const DATA = .*?(?=\nconst groupMap = \{\};)'
-    replacement = 'const DATA = ' + data_json + '\n'
-    html_template = re.sub(pattern, lambda m: replacement, html_template, flags=re.DOTALL)
+    # Replace the embedded DATA payload by matching only the placeholder line.
+    # Do not span to groupMap, otherwise HAS_TIMING_DATA / HAS_TRACE_STEP are
+    # removed from the rendered HTML preamble.
+    pattern = r'^const DATA = __FLOWCHART_DATA_PLACEHOLDER__;$'
+    replacement = 'const DATA = ' + data_json
+    html_template = re.sub(pattern, lambda m: replacement, html_template, count=1, flags=re.MULTILINE)
     
     return html_template
 
