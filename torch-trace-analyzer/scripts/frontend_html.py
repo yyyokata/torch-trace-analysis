@@ -26,6 +26,8 @@ import os
 import sys
 import json as _json
 import re
+import ast
+import textwrap
 from collections import defaultdict
 from pathlib import Path
 
@@ -140,6 +142,13 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 .lineage-tag.tag-consumer { background: rgba(255,209,102,0.18); color: #ffd166; border: 1px solid rgba(255,209,102,0.4); }
 .lineage-tag.tag-step { background: rgba(100,181,246,0.15); color: #64b5f6; border: 1px solid rgba(100,181,246,0.35); }
 .lineage-loc { font-size: 10px; color: #6f7a93; font-family: 'SFMono-Regular', Consolas, monospace; }
+.lineage-carrier-section { margin: 0 12px 10px; border: 1px solid rgba(100,181,246,0.16); border-radius: 8px; background: rgba(255,255,255,0.025); overflow: hidden; }
+.lineage-carrier-toggle { width: 100%; border: none; border-bottom: 1px solid rgba(100,181,246,0.12); background: rgba(100,181,246,0.10); color: #d6e8ff; cursor: pointer; text-align: left; padding: 8px 12px; font-size: 11px; font-weight: 700; font-family: 'SFMono-Regular', Consolas, monospace; display: flex; align-items: center; justify-content: space-between; }
+.lineage-carrier-toggle::after { content: '▾'; color: #8fc5ff; font-size: 10px; }
+.lineage-carrier-toggle[aria-expanded="false"]::after { content: '▸'; }
+.lineage-carrier-toggle:hover { background: rgba(100,181,246,0.18); color: #fff; }
+.lineage-carrier-body { display: none; padding-top: 10px; }
+.lineage-carrier-toggle[aria-expanded="true"] + .lineage-carrier-body { display: block; }
 .dag-svg .group-clickable { cursor: pointer; }
 .dag-svg .edge-path { pointer-events: stroke; cursor: pointer; }
 .dag-svg .edge-path:hover { stroke-width: 3.4; opacity: 1 !important; }
@@ -1516,6 +1525,12 @@ function showSourcePanel(item) {
             '</div>';
     }
     document.getElementById('sp-body').innerHTML = bodyHtml;
+    document.querySelectorAll('#sp-body .lineage-carrier-toggle').forEach((btn) => {
+        btn.addEventListener('click', () => {
+            const expanded = btn.getAttribute('aria-expanded') === 'true';
+            btn.setAttribute('aria-expanded', expanded ? 'false' : 'true');
+        });
+    });
     sp.classList.add('open');
 }
 
@@ -1530,6 +1545,10 @@ function showEdgePanel(edge) {
     let bodyHtml = '';
     const ev = edge.evidence;
     const isInputEdge = (fromAttr === 'Input');
+    const lineageByCarrier = ev && ev.lineage_by_carrier && typeof ev.lineage_by_carrier === 'object'
+        ? Object.entries(ev.lineage_by_carrier).filter(([name, steps]) => Array.isArray(steps) && steps.length > 0)
+        : [];
+    const history = Array.isArray(ev && ev.var_history) ? ev.var_history : [];
     if (ev) {
         const fmtShape = (shape) => {
             if (shape === null || shape === undefined) return '';
@@ -1560,25 +1579,43 @@ function showEdgePanel(edge) {
         // Iter11 varlineage: render the full assignment chain
         // (var_history) when available so the user sees how the
         // value travels from producer → intermediate ops → consumer.
-        const history = Array.isArray(ev.var_history) ? ev.var_history : [];
-                if (history.length > 0) {
-                    bodyHtml += '<div class="side-panel-section"><h4>Variable lineage (' + history.length + ' step' + (history.length === 1 ? '' : 's') + ')</h4>';
-                    history.forEach((step, idx) => {
-                        const tag = (step.role === 'consumer')
-                            ? '<span class="lineage-tag tag-consumer">consumer</span>'
-                            : (idx === 0 ? '<span class="lineage-tag tag-producer">producer</span>'
-                                       : '<span class="lineage-tag tag-step">step ' + (idx + 1) + '</span>');
-                        const vlabel = step.var ? ('<code>' + escapeHtml(step.var) + '</code>') : '<code>(carrier)</code>';
-                        const stepMarkClass = (step.role === 'consumer') ? 'consumer-mark' : 'producer-mark';
-                        bodyHtml += '<div class="lineage-step">' +
-                            '<div class="lineage-head">' + tag + ' ' + vlabel +
-                            ' <span class="lineage-loc">@' + escapeHtml(step.file || ev.file) + ':' + step.line + '</span></div>' +
-                            renderCodeBlock(step.excerpt && step.excerpt.text, step.excerpt && step.excerpt.start, step.excerpt && step.excerpt.highlight, step.var ? [step.var] : [], stepMarkClass) +
-                            '</div>';
-                    });
-                    bodyHtml += '</div>';
-                } else {
-        
+        const renderLineageStep = (step, idx) => {
+            const tag = (step.role === 'consumer')
+                ? '<span class="lineage-tag tag-consumer">consumer</span>'
+                : (idx === 0 ? '<span class="lineage-tag tag-producer">producer</span>'
+                           : '<span class="lineage-tag tag-step">step ' + (idx + 1) + '</span>');
+            const vlabel = step.var ? ('<code>' + escapeHtml(step.var) + '</code>') : '<code>(carrier)</code>';
+            const stepMarkClass = (step.role === 'consumer') ? 'consumer-mark' : 'producer-mark';
+            return '<div class="lineage-step">' +
+                '<div class="lineage-head">' + tag + ' ' + vlabel +
+                ' <span class="lineage-loc">@' + escapeHtml(step.file || ev.file) + ':' + step.line + '</span></div>' +
+                renderCodeBlock(step.excerpt && step.excerpt.text, step.excerpt && step.excerpt.start, step.excerpt && step.excerpt.highlight, (step.carriers && step.carriers.length > 0) ? step.carriers : (step.var ? [step.var] : []), stepMarkClass) +
+                '</div>';
+        };
+        if (lineageByCarrier.length > 0) {
+            bodyHtml += '<div class="side-panel-section"><h4>Variable lineage (' + history.length + ' step' + (history.length === 1 ? '' : 's') + ')</h4>';
+            lineageByCarrier.forEach(([carrierName, steps], carrierIdx) => {
+                const expanded = carrierIdx === 0;
+                bodyHtml += '<div class="lineage-carrier-section" data-carrier="' + escapeHtml(carrierName) + '">' +
+                    '<button type="button" class="lineage-carrier-toggle" aria-expanded="' + (expanded ? 'true' : 'false') + '">' + escapeHtml(carrierName) + '</button>' +
+                    '<div class="lineage-carrier-body">';
+                steps.forEach((step, idx) => {
+                    bodyHtml += renderLineageStep(step, idx);
+                });
+                bodyHtml += '</div></div>';
+            });
+            bodyHtml += '</div>';
+        } else if (history.length > 0) {
+            bodyHtml += '<div class="side-panel-section"><h4>Variable lineage (' + history.length + ' step' + (history.length === 1 ? '' : 's') + ')</h4>';
+            history.forEach((step, idx) => {
+                bodyHtml += renderLineageStep(step, idx);
+            });
+            bodyHtml += '</div>';
+        } else {
+            bodyHtml += '<div class="side-panel-section"><h4>Variable lineage</h4><div class="evidence-meta" style="color:#7a849c">No variable lineage data available for this edge.</div></div>';
+        }
+        if (history.length === 0) {
+            
             // Fall back to producer/consumer two-block layout when no
             // lineage chain was attached. For Input/top edges we skip
             // the empty producer block — there's no real Python line
@@ -1616,6 +1653,12 @@ function showEdgePanel(edge) {
         throw new Error(errMsg);
     }
     document.getElementById('sp-body').innerHTML = bodyHtml;
+    document.querySelectorAll('#sp-body .lineage-carrier-toggle').forEach((btn) => {
+        btn.addEventListener('click', () => {
+            const expanded = btn.getAttribute('aria-expanded') === 'true';
+            btn.setAttribute('aria-expanded', expanded ? 'false' : 'true');
+        });
+    });
     sp.classList.add('open');
 }
 
@@ -1687,6 +1730,32 @@ render();
 </script>
 </body>
 </html>"""
+
+
+def _build_lineage_by_carrier(var_history):
+    """Group step-level var_history by carrier in first-seen carrier order."""
+    groups = {}
+    order = []
+    for step in var_history or []:
+        if not isinstance(step, dict):
+            continue
+        seen_in_step = set()
+        for carrier in step.get("carriers") or []:
+            if not carrier or carrier in seen_in_step:
+                continue
+            seen_in_step.add(carrier)
+            if carrier not in groups:
+                groups[carrier] = []
+                order.append(carrier)
+            groups[carrier].append(step)
+    return {name: groups[name] for name in order}
+
+
+def _finalize_edge_evidence(evidence):
+    if not evidence:
+        return evidence
+    evidence["lineage_by_carrier"] = _build_lineage_by_carrier(evidence.get("var_history") or [])
+    return evidence
 
 
 def generate_html_flowchart(source_files, timing_data=None, meta=None, output_path="flowchart.html", trace_events=None, conditional_mode="infer", _return_data_only=False):
@@ -2325,6 +2394,12 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
                                 prod, prod_line, prod_var = _collect_expr_output_producers(expr, var_producers, phys_lineno)
                                 for p in prod:
                                     _remember(p, phys_lineno, prod_var or expr, prod_line)
+                            for _kw_name, expr in kwargs.items():
+                                if _kw_name in ("prediction", "loss") or not expr:
+                                    continue
+                                prod, prod_line, prod_var = _collect_expr_output_producers(expr, var_producers, phys_lineno)
+                                for p in prod:
+                                    _remember(p, phys_lineno, prod_var or expr, prod_line)
 
                 ret_m = re.match(r'^return\s+(.+)$', line)
                 if ret_m and result_vars:
@@ -2811,6 +2886,8 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
                                         "highlight": _ln,
                                     },
                                     "role": s.get("role", "step"),
+                                    "carriers": s.get("carriers", []),
+                                    "arg_carriers": s.get("arg_carriers", []),
                                 })
                             return out
                         edge["evidence"] = {
@@ -2822,6 +2899,7 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
                             "to_excerpt": _excerpt(ev["to_line"]),
                             "var_history": _var_history_from(ev.get("lineage")),
                         }
+                        _finalize_edge_evidence(edge["evidence"])
                         # Iter12-final-fix Rule1c: relocate excerpt highlights
                         # onto real ``self.{attr}(...)`` call sites in cname's
                         # forward() body when the data-flow tracer's chosen
@@ -2884,7 +2962,7 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
                             cname, from_attr, ev_anchor.get("from_excerpt"))
                         ev_anchor["to_excerpt"] = _relocate_excerpt_to_self_call(
                             cname, to_attr, ev_anchor.get("to_excerpt"))
-                        edge["evidence"] = ev_anchor
+                        edge["evidence"] = _finalize_edge_evidence(ev_anchor)
                     internal_edges.append(edge)
 
         # Iter17: Bug 2 fix — REMOVED the "sequential call order" fallback.
@@ -3572,7 +3650,102 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
             return _steps
         _line_text = _slines[_ln - 1]
 
-        # Determine carry variable on the call_site line.
+        def _append_unique(dst, values):
+            for value in values or []:
+                if value and value != "_" and value not in dst:
+                    dst.append(value)
+
+        def _name_base_from_expr(node):
+            if isinstance(node, ast.Name):
+                return node.id if node.id not in ("self", "cls") else None
+            if isinstance(node, ast.Subscript):
+                return _name_base_from_expr(node.value)
+            if isinstance(node, ast.Attribute):
+                return None
+            return None
+
+        def _extract_lhs_targets_from_node(node):
+            names = []
+            if isinstance(node, ast.Name):
+                _append_unique(names, [node.id])
+            elif isinstance(node, (ast.Tuple, ast.List)):
+                for elt in node.elts:
+                    _append_unique(names, _extract_lhs_targets_from_node(elt))
+            elif isinstance(node, ast.Subscript):
+                base = _name_base_from_expr(node)
+                _append_unique(names, [base])
+            return names
+
+        def _extract_arg_carriers_from_node(node):
+            names = []
+            for n in ast.walk(node):
+                base = _name_base_from_expr(n)
+                _append_unique(names, [base])
+            return names
+
+        def _logical_statement_from_call_line():
+            collected = []
+            paren_depth = bracket_depth = brace_depth = 0
+            in_str = None
+            triple = False
+            esc = False
+            for raw in _slines[_ln - 1:]:
+                collected.append(raw)
+                for ch in raw:
+                    if in_str:
+                        if esc:
+                            esc = False
+                        elif ch == "\\":
+                            esc = True
+                        elif not triple and ch == in_str:
+                            in_str = None
+                        continue
+                    if ch in ("'", '"'):
+                        in_str = ch
+                        triple = False
+                        continue
+                    if ch == "(":
+                        paren_depth += 1
+                    elif ch == ")":
+                        paren_depth = max(0, paren_depth - 1)
+                    elif ch == "[":
+                        bracket_depth += 1
+                    elif ch == "]":
+                        bracket_depth = max(0, bracket_depth - 1)
+                    elif ch == "{":
+                        brace_depth += 1
+                    elif ch == "}":
+                        brace_depth = max(0, brace_depth - 1)
+                if collected and paren_depth == 0 and bracket_depth == 0 and brace_depth == 0 and in_str is None:
+                    break
+            return "\n".join(collected)
+
+        def _extract_statement_carriers(statement_text):
+            try:
+                _tree = ast.parse(textwrap.dedent(statement_text))
+            except SyntaxError:
+                return [], []
+            _producer_names = []
+            _consumer_names = []
+            for _node in _tree.body:
+                if isinstance(_node, ast.Assign):
+                    for _target in _node.targets:
+                        _append_unique(_producer_names, _extract_lhs_targets_from_node(_target))
+                    _value = _node.value
+                    if isinstance(_value, ast.Call):
+                        for _arg in list(_value.args) + [kw.value for kw in _value.keywords if kw.value is not None]:
+                            _append_unique(_producer_names, _extract_arg_carriers_from_node(_arg))
+                elif isinstance(_node, ast.Expr):
+                    _value = _node.value
+                else:
+                    continue
+                for _call in [n for n in ast.walk(_value) if isinstance(n, ast.Call)]:
+                    for _arg in list(_call.args) + [kw.value for kw in _call.keywords if kw.value is not None]:
+                        _append_unique(_consumer_names, _extract_arg_carriers_from_node(_arg))
+            return _producer_names, _consumer_names
+
+        # Determine carry variables from the complete logical call statement.
+        _producer_carriers, _consumer_carriers = _extract_statement_carriers(_logical_statement_from_call_line())
         _base_attr = re.sub(r'#\d+$', '', child_attr or '')
         _container_match = re.match(r'^(\w+)\[(.+)\]$', _base_attr)
         _scan_attr = _container_match.group(1) if _container_match else _base_attr
@@ -3629,6 +3802,7 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
             "line": _ln,
             "excerpt": _excerpt,
             "role": "producer",
+            "carriers": _producer_carriers,
         })
 
         # STEP2 (consumer): the call_site line where X is invoked.
@@ -3638,6 +3812,7 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
             "line": _ln,
             "excerpt": _excerpt,
             "role": "consumer",
+            "carriers": _consumer_carriers,
         })
 
         # Iter13e: deliberately DO NOT descend into the child's forward()
@@ -3667,15 +3842,103 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
 
         _input_connected_ids = set()
 
+        def _infer_input_edges_from_call_args():
+            inferred = []
+            if not _root_cname:
+                return inferred
+            try:
+                for (_fname, _cname), _info in class_map.items():
+                    if _cname != _root_cname:
+                        continue
+                    _fwd_range = (_info.get("methods") or {}).get("forward")
+                    if not _fwd_range:
+                        continue
+                    _lines = source_files.get(_fname, [])
+                    _class_start = None
+                    _class_end = None
+                    for (_cfname, _ccname), _cinfo in class_map.items():
+                        if _cfname == _fname and _ccname == _root_cname:
+                            _class_start = _cinfo.get("start") or 1
+                            _class_end = _cinfo.get("end") or len(_lines)
+                            break
+                    if _class_start is None:
+                        _class_start, _class_end = 1, len(_lines)
+                    _src = "\n".join(_lines)
+                    _mod = ast.parse(textwrap.dedent(_src))
+                    _root_func = None
+                    for _class_node in [n for n in _mod.body if isinstance(n, ast.ClassDef)]:
+                        for _stmt in _class_node.body:
+                            if isinstance(_stmt, ast.FunctionDef) and _stmt.name == "forward":
+                                _root_func = _stmt
+                                break
+                        if _root_func is not None:
+                            break
+                    if _root_func is None:
+                        for _top in _mod.body:
+                            if isinstance(_top, ast.FunctionDef) and _top.name == "forward":
+                                _root_func = _top
+                                break
+                    _walk_root = _root_func if _root_func is not None else _mod
+                    _name_producers = {}
+                    for _node in ast.walk(_walk_root):
+                        if not isinstance(_node, ast.Assign):
+                            continue
+                        _rhs = _node.value
+                        if not isinstance(_rhs, ast.Call):
+                            continue
+                        _func = _rhs.func
+                        if not (isinstance(_func, ast.Attribute) and isinstance(_func.value, ast.Name) and _func.value.id == "self"):
+                            continue
+                        _attr = _func.attr
+                        if _attr not in _root_attr_id_map:
+                            continue
+                        _lhs_names = []
+                        for _target in _node.targets:
+                            _lhs_names.extend(_extract_lhs_targets_from_node(_target))
+                        for _lhs in _lhs_names:
+                            _name_producers[_lhs] = _attr
+                    for _node in ast.walk(_walk_root):
+                        if not isinstance(_node, ast.Call):
+                            continue
+                        _func = _node.func
+                        if not (isinstance(_func, ast.Attribute) and isinstance(_func.value, ast.Name) and _func.value.id == "self"):
+                            continue
+                        _consumer = _func.attr
+                        if _consumer not in _root_attr_id_map:
+                            continue
+                        _input_names = set()
+                        for _arg in _node.args:
+                            if isinstance(_arg, ast.Name):
+                                _src = _arg.id
+                                if _src in _name_producers:
+                                    _src = _name_producers[_src]
+                                _input_names.add(_src)
+                        if len(_input_names) >= 2:
+                            inferred.append(("__inferred_input", _consumer))
+                return inferred
+            except Exception:
+                return inferred
+
         # (a) Direct LG → real_module edges in root group
-        for (lg_attr, consumer_attr) in _root_group.get("input_consumer_edges", []):
+        for (lg_attr, consumer_attr) in list(_root_group.get("input_consumer_edges", [])) + _infer_input_edges_from_call_args():
             if consumer_attr not in _root_attr_id_map:
                 continue
             _, consumer_id = _root_attr_id_map[consumer_attr]
+            ev = _root_edge_locs.get((lg_attr, consumer_attr))
             if consumer_id in _input_connected_ids:
+                if ev:
+                    _existing = next((e for e in dag_edges if e.get("from") == input_node_id and e.get("to") == consumer_id), None)
+                    _existing_hist = (((_existing or {}).get("evidence") or {}).get("var_history") or [])
+                    _extra_line = ev.get("to_line") or ev.get("from_line")
+                    _extra_hist = _input_edge_var_history(_root_cname, consumer_attr, (ev.get("file"), _extra_line))
+                    for _idx, _extra_step in enumerate(_extra_hist):
+                        if _idx < len(_existing_hist):
+                            for _carrier in _extra_step.get("carriers") or []:
+                                _dst = _existing_hist[_idx].setdefault("carriers", [])
+                                if _carrier not in _dst:
+                                    _dst.append(_carrier)
                 continue
             _ev_data = None
-            ev = _root_edge_locs.get((lg_attr, consumer_attr))
             if ev:
                 _ev_lines = source_files.get(ev["file"], [])
                 # Iter12-final Rule1b guard: if the ev points to a
@@ -3759,7 +4022,7 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
                     _vh = _input_edge_var_history(_root_cname, consumer_attr, _call_loc)
                     if _vh:
                         _ev_data["var_history"] = _vh
-                edge_entry["evidence"] = _ev_data
+                edge_entry["evidence"] = _finalize_edge_evidence(_ev_data)
             else:
                 edge_entry["type"] = "boundary"
             dag_edges.append(edge_entry)
@@ -3832,13 +4095,47 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
                         _vh = _input_edge_var_history(_root_cname, _g_attr, _call_loc)
                         if _vh:
                             _ev_data["var_history"] = _vh
-                    edge_entry["evidence"] = _ev_data
+                    edge_entry["evidence"] = _finalize_edge_evidence(_ev_data)
                 else:
                     edge_entry["type"] = "boundary"
                 dag_edges.append(edge_entry)
                 _input_connected_ids.add(gid)
 
         # (c) Fallback: modules with no inbound from siblings also receive Input
+        for _lg_attr, _consumer_attr in _infer_input_edges_from_call_args():
+            if _consumer_attr not in _root_attr_id_map:
+                continue
+            _, _consumer_id = _root_attr_id_map[_consumer_attr]
+            _already = any(e.get("from") == input_node_id and e.get("to") == _consumer_id for e in dag_edges)
+            if _already:
+                continue
+            _call_loc = tree.get(_root_cname, {}).get("first_call_loc", {}).get(_consumer_attr) if _root_cname else None
+            _vh = _input_edge_var_history(_root_cname, _consumer_attr, _call_loc)
+            _ev_data = None
+            if _call_loc:
+                _ev_file, _ev_line = _call_loc
+                _ev_lines = source_files.get(_ev_file, [])
+                _ev_data = {
+                    "file": _ev_file,
+                    "var": f"input → {_consumer_attr}",
+                    "from_line": _ev_line,
+                    "to_line": _ev_line,
+                    "to_excerpt": {
+                        "start": max(1, _ev_line - 1),
+                        "end": min(len(_ev_lines), _ev_line + 1),
+                        "text": "\n".join(_ev_lines[max(0, _ev_line - 2): min(len(_ev_lines), _ev_line + 1)]),
+                        "highlight": _ev_line,
+                    } if _ev_lines else None,
+                }
+                if _vh:
+                    _ev_data["var_history"] = _vh
+            _edge_entry = {"from": input_node_id, "to": _consumer_id, "type": "dep",
+                           "from_attr": "Input", "to_attr": _consumer_attr}
+            if _ev_data:
+                _edge_entry["evidence"] = _finalize_edge_evidence(_ev_data)
+            dag_edges.append(_edge_entry)
+            _input_connected_ids.add(_consumer_id)
+
         _root_internal_targets = set()
         for e in _root_group.get("internal_edges", []):
             _root_internal_targets.add(e["to_child"])
@@ -3928,7 +4225,7 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
                         _vh = _input_edge_var_history(_root_cname, child_attr, _call_loc)
                         if _vh:
                             _ev_data["var_history"] = _vh
-                    edge_entry["evidence"] = _ev_data
+                    edge_entry["evidence"] = _finalize_edge_evidence(_ev_data)
                 else:
                     # Iter12-final: if no Rule1b-safe call-site can be found,
                     # demote this synthetic entry edge to type=boundary so it
@@ -3936,6 +4233,91 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
                     edge_entry["type"] = "boundary"
                 dag_edges.append(edge_entry)
                 _input_connected_ids.add(child_id)
+
+            if _input_connected_ids:
+                # Post-merge carrier enrichment: scan all already-built Input→consumer
+                # edges from their resolved call sites.  This keeps multiple LG
+                # input-source paths merged on the same consumer edge and handles
+                # multi-line calls using the AST logical-statement parser above.
+                for _edge in dag_edges:
+                    if _edge.get("from") != input_node_id:
+                        continue
+                    _to_attr = _edge.get("to_attr")
+                    if not _to_attr or _to_attr == "Input":
+                        continue
+                    _hist = (((_edge.get("evidence") or {}).get("var_history")) or [])
+                    _call_loc = tree.get(_root_cname, {}).get("first_call_loc", {}).get(_to_attr) if _root_cname else None
+                    if not _call_loc:
+                        _te = ((_edge.get("evidence") or {}).get("to_excerpt") or {})
+                        if _te.get("highlight") and (_edge.get("evidence") or {}).get("file"):
+                            _call_loc = ((_edge.get("evidence") or {}).get("file"), _te.get("highlight"))
+                    _new_hist = _input_edge_var_history(_root_cname, _to_attr, _call_loc)
+                    if not _new_hist:
+                        continue
+                    if not _hist:
+                        (_edge.setdefault("evidence", {}))["var_history"] = _new_hist
+                        continue
+                    for _idx, _new_step in enumerate(_new_hist):
+                        if _idx >= len(_hist):
+                            _hist.append(_new_step)
+                            continue
+                        _dst = _hist[_idx].setdefault("carriers", [])
+                        for _carrier in _new_step.get("carriers") or []:
+                            if _carrier not in _dst:
+                                _dst.append(_carrier)
+
+        if _root_cname and _root_attr_id_map:
+            for _consumer_attr, (_kind, _consumer_id) in list(_root_attr_id_map.items()):
+                _call_loc = tree.get(_root_cname, {}).get("first_call_loc", {}).get(_consumer_attr)
+                _vh_probe = _input_edge_var_history(_root_cname, _consumer_attr, _call_loc)
+                _consumer_carriers = set((_vh_probe[1].get("carriers") if len(_vh_probe) > 1 else []) or [])
+                if len(_consumer_carriers) < 2:
+                    continue
+                if any(e.get("from") == input_node_id and e.get("to") == _consumer_id and e.get("type") == "dep" and e.get("from_attr") == "Input" and e.get("to_attr") == _consumer_attr for e in dag_edges):
+                    continue
+                _ev_data = None
+                if _call_loc:
+                    _ev_file, _ev_line = _call_loc
+                    _ev_lines = source_files.get(_ev_file, [])
+                    _ev_data = {"file": _ev_file, "var": f"input → {_consumer_attr}", "from_line": _ev_line, "to_line": _ev_line,
+                                "to_excerpt": {"start": max(1, _ev_line - 1), "end": min(len(_ev_lines), _ev_line + 1),
+                                               "text": "\n".join(_ev_lines[max(0, _ev_line - 2): min(len(_ev_lines), _ev_line + 1)]),
+                                               "highlight": _ev_line} if _ev_lines else None}
+                    if _vh_probe:
+                        _ev_data["var_history"] = _vh_probe
+                _entry = {"from": input_node_id, "to": _consumer_id, "type": "dep", "from_attr": "Input", "to_attr": _consumer_attr}
+                if _ev_data:
+                    _entry["evidence"] = _finalize_edge_evidence(_ev_data)
+                dag_edges.append(_entry)
+                _input_connected_ids.add(_consumer_id)
+
+        if _input_connected_ids:
+            for _consumer_id in list(_input_connected_ids):
+                _consumer_attr = None
+                for _attr, (_kind, _nid) in _root_attr_id_map.items():
+                    if _nid == _consumer_id:
+                        _consumer_attr = _attr
+                        break
+                if not _consumer_attr:
+                    continue
+                if any(e.get("from") == input_node_id and e.get("to") == _consumer_id and e.get("type") == "dep" and e.get("from_attr") == "Input" and e.get("to_attr") == _consumer_attr for e in dag_edges):
+                    continue
+                _call_loc = tree.get(_root_cname, {}).get("first_call_loc", {}).get(_consumer_attr) if _root_cname else None
+                _vh = _input_edge_var_history(_root_cname, _consumer_attr, _call_loc)
+                _ev_data = None
+                if _call_loc:
+                    _ev_file, _ev_line = _call_loc
+                    _ev_lines = source_files.get(_ev_file, [])
+                    _ev_data = {"file": _ev_file, "var": f"input → {_consumer_attr}", "from_line": _ev_line, "to_line": _ev_line,
+                                "to_excerpt": {"start": max(1, _ev_line - 1), "end": min(len(_ev_lines), _ev_line + 1),
+                                               "text": "\n".join(_ev_lines[max(0, _ev_line - 2): min(len(_ev_lines), _ev_line + 1)]),
+                                               "highlight": _ev_line} if _ev_lines else None}
+                    if _vh:
+                        _ev_data["var_history"] = _vh
+                _entry = {"from": input_node_id, "to": _consumer_id, "type": "dep", "from_attr": "Input", "to_attr": _consumer_attr}
+                if _ev_data:
+                    _entry["evidence"] = _finalize_edge_evidence(_ev_data)
+                dag_edges.append(_entry)
 
         if not _input_connected_ids:
             dag_edges.append({"from": input_node_id, "to": f"{top_root_id}__in", "type": "dep"})
@@ -3969,7 +4351,7 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
             }
             edge_entry = {"from": producer_id, "to": loss_node_id, "type": "dep",
                           "from_attr": producer_attr, "to_attr": "Result",
-                          "evidence": _ev_data}
+                          "evidence": _finalize_edge_evidence(_ev_data)}
             # Iter12-final-fix Rule1c: ensure from_excerpt highlights a real call.
             if _root_cname and _ev_data:
                 _ev_data["from_excerpt"] = _relocate_excerpt_to_self_call(
@@ -3979,25 +4361,39 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
             if _ev_data and "var_history" not in _ev_data:
                 _vh_steps = []
                 _from_ex = _ev_data.get("from_excerpt") or {}
+                _var_carriers = []
+                _var_name = _ev_data.get("var")
+                if _var_name and isinstance(_var_name, str) and re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', _var_name):
+                    _var_carriers = [_var_name]
+                if not _var_carriers and _from_ex.get("text"):
+                    for _line in (_from_ex.get("text") or "").split("\n"):
+                        _line = _line.strip()
+                        _m = re.search(r'\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*self\.' + re.escape(producer_attr) + r'\s*\(', _line)
+                        if _m:
+                            _var_carriers = [_m.group(1)]
+                            break
                 if _from_ex.get("highlight"):
                     _vh_steps.append({
                         "var": _ev_data.get("var") or producer_attr,
                         "file": _ev_data.get("file"),
                         "line": _from_ex.get("highlight"),
                         "excerpt": _from_ex,
-                        "role": "step",
+                        "role": "producer",
+                        "carriers": _var_carriers,
                     })
                 _to_ex = _ev_data.get("to_excerpt") or {}
                 if _to_ex.get("highlight") and _to_ex.get("highlight") != _from_ex.get("highlight"):
                     _vh_steps.append({
-                        "var": "result",
+                        "var": _ev_data.get("var") or "result",
                         "file": _ev_data.get("file"),
                         "line": _to_ex.get("highlight"),
                         "excerpt": _to_ex,
                         "role": "consumer",
+                        "carriers": _var_carriers,
                     })
-                if _vh_steps:
-                    _ev_data["var_history"] = _vh_steps
+            if _vh_steps:
+                _ev_data["var_history"] = _vh_steps
+            _finalize_edge_evidence(_ev_data)
             dag_edges.append(edge_entry)
             _result_connected_ids.add(producer_id)
 
@@ -4048,7 +4444,7 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
                                 "excerpt": _from_ex,
                                 "role": "step",
                             }]
-                    edge_entry["evidence"] = _ev_data
+                    edge_entry["evidence"] = _finalize_edge_evidence(_ev_data)
                 dag_edges.append(edge_entry)
                 _result_connected_ids.add(child_id)
 
@@ -5089,7 +5485,7 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
                             g_label, consumer_attr, _ev_data.get("from_excerpt"))
                     # Only attach evidence when we did not redirect to a boundary.
                     if _redirect_to is None:
-                        edge_entry["evidence"] = _ev_data
+                        edge_entry["evidence"] = _finalize_edge_evidence(_ev_data)
                 else:
                     # Iter12-final: no Rule1b-safe call site; demote to boundary
                     # so the testset Rule1/Rule1b validators skip this edge.
@@ -5187,7 +5583,7 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
                         _ev_data["from_excerpt"] = _relocate_excerpt_to_self_call(
                             g_label, attr, _ev_data.get("from_excerpt"))
                     if _redirect_to2 is None:
-                        edge_entry["evidence"] = _ev_data
+                        edge_entry["evidence"] = _finalize_edge_evidence(_ev_data)
                 elif effective_edge_type == "dep":
                     # Iter12-final: no Rule1b-safe call site; demote to boundary.
                     edge_entry["type"] = "boundary"
@@ -5453,9 +5849,9 @@ def generate_html_flowchart(source_files, timing_data=None, meta=None, output_pa
                         # Demote to boundary BUT keep var_history so Rule6_out
                         # still validates (return + consumer LHS + var fields).
                         edge_entry["type"] = "boundary"
-                        edge_entry["evidence"] = _ev_data
+                        edge_entry["evidence"] = _finalize_edge_evidence(_ev_data)
                     else:
-                        edge_entry["evidence"] = _ev_data
+                        edge_entry["evidence"] = _finalize_edge_evidence(_ev_data)
                 else:
                     # Iter12-final: when no `self.{attr}(...)` call site can be
                     # located in g's source (e.g. attr is invoked dynamically
