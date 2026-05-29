@@ -12,7 +12,7 @@ import argparse
 import subprocess
 import textwrap
 import tokenize
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 # ---------------------------------------------------------------------------
 # Module identity registration.
@@ -1066,6 +1066,174 @@ class ASTFrontend:
         self._constant_table_cache[key] = table
         return table
 
+    def parse_local_stmt(self, line: str):
+        text = (line or "").strip()
+        if not text:
+            return None
+        try:
+            mod = ast.parse(text)
+        except Exception:
+            return None
+        if len(mod.body) != 1:
+            return None
+        return mod.body[0]
+
+    def _expr_leaf_name(self, node):
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            base = self._expr_leaf_name(node.value)
+            return (base + "." if base else "") + node.attr
+        return None
+
+    def _local_node_to_text(self, node):
+        # Local snippet nodes are parsed from standalone logical lines, so their
+        # coordinates point into the snippet rather than the full source file.
+        # Use ast.unparse instead of _node_to_text to avoid source-slice drift.
+        try:
+            return ast.unparse(node)
+        except Exception:
+            return ""
+
+    def parse_local_ctor_assign(self, stmt):
+        if not isinstance(stmt, ast.Assign) or not isinstance(stmt.value, ast.Call):
+            return None
+        target = stmt.targets[0] if len(stmt.targets) == 1 else None
+        if target is None:
+            return None
+        attr = self._extract_self_attr_name(target)
+        if not attr:
+            return None
+        return {
+            "attr": attr,
+            "class_full": self._local_node_to_text(stmt.value.func),
+            "kwargs": {kw.arg: self._local_node_to_text(kw.value) for kw in stmt.value.keywords if kw.arg is not None},
+        }
+
+    def parse_local_lg_assign(self, stmt):
+        if not isinstance(stmt, ast.Assign) or not isinstance(stmt.value, ast.Call):
+            return None
+        target = stmt.targets[0] if len(stmt.targets) == 1 else None
+        if target is None:
+            return None
+        attr = self._extract_self_attr_name(target)
+        if not attr:
+            return None
+        func_text = self._local_node_to_text(stmt.value.func)
+        if func_text in {
+            "LG.feature_column", "LG.dense_feature", "LG.get_sample_rate", "LG.get_bias"
+        }:
+            return {"attr": attr}
+        return None
+
+    def parse_local_fc_get_vector_assign(self, stmt):
+        if not isinstance(stmt, ast.Assign) or not isinstance(stmt.value, ast.Call):
+            return None
+        target = stmt.targets[0] if len(stmt.targets) == 1 else None
+        if target is None:
+            return None
+        attr = self._extract_self_attr_name(target)
+        if not attr:
+            return None
+        func = stmt.value.func
+        if not (isinstance(func, ast.Attribute) and func.attr == "get_vector"):
+            return None
+        owner = func.value
+        if not isinstance(owner, ast.Subscript):
+            return None
+        owner_value = owner.value
+        if isinstance(owner_value, ast.Name):
+            owner_attr = owner_value.id
+        else:
+            owner_attr = self._extract_self_attr_name(owner_value)
+        if not owner_attr:
+            return None
+        if not ("dict" in owner_attr or "fc" in owner_attr):
+            return None
+        return {"attr": attr}
+
+    def parse_local_container_ctor(self, stmt):
+        if not isinstance(stmt, ast.Assign) or not isinstance(stmt.value, ast.Call):
+            return None
+        target = stmt.targets[0] if len(stmt.targets) == 1 else None
+        if target is None:
+            return None
+        attr = self._extract_self_attr_name(target)
+        if not attr:
+            return None
+        func_leaf = (self._expr_leaf_name(stmt.value.func) or "").split(".")[-1]
+        if func_leaf not in {"ModuleList", "ModuleDict"}:
+            return None
+        return {"attr": attr, "kind": func_leaf, "call": stmt.value}
+
+    def parse_local_append_ctor(self, stmt):
+        if not isinstance(stmt, ast.Expr) or not isinstance(stmt.value, ast.Call):
+            return None
+        call = stmt.value
+        if not isinstance(call.func, ast.Attribute) or call.func.attr != "append":
+            return None
+        owner = call.func.value
+        if not (isinstance(owner, ast.Attribute) and isinstance(owner.value, ast.Name) and owner.value.id == "self"):
+            return None
+        if len(call.args) != 1 or not isinstance(call.args[0], ast.Call):
+            return None
+        return {
+            "attr": owner.attr,
+            "class_full": self._local_node_to_text(call.args[0].func),
+        }
+
+    def parse_local_subscript_ctor(self, stmt):
+        if not isinstance(stmt, ast.Assign) or not isinstance(stmt.value, ast.Call):
+            return None
+        target = stmt.targets[0] if len(stmt.targets) == 1 else None
+        if not isinstance(target, ast.Subscript):
+            return None
+        owner = target.value
+        if not (isinstance(owner, ast.Attribute) and isinstance(owner.value, ast.Name) and owner.value.id == "self"):
+            return None
+        return {
+            "attr": owner.attr,
+            "key_expr": self._local_node_to_text(target.slice),
+            "class_full": self._local_node_to_text(stmt.value.func),
+        }
+
+    def parse_local_var_ctor(self, stmt):
+        if not isinstance(stmt, ast.Assign) or not isinstance(stmt.value, ast.Call):
+            return None
+        target = stmt.targets[0] if len(stmt.targets) == 1 else None
+        if not isinstance(target, ast.Name):
+            return None
+        return {
+            "name": target.id,
+            "class_full": self._local_node_to_text(stmt.value.func),
+        }
+
+    def parse_local_setattr_ctor(self, stmt):
+        if not isinstance(stmt, ast.Expr) or not isinstance(stmt.value, ast.Call):
+            return None
+        call = stmt.value
+        func_name = self._expr_leaf_name(call.func)
+        if func_name != "setattr" or len(call.args) != 3:
+            return None
+        owner = call.args[0]
+        if not (isinstance(owner, ast.Name) and owner.id == "self"):
+            return None
+        name_expr = self._local_node_to_text(call.args[1]).strip()
+        value = call.args[2]
+        if isinstance(value, ast.Call):
+            return {
+                "name_expr": name_expr,
+                "class_full": self._local_node_to_text(value.func),
+                "two_step": False,
+            }
+        if isinstance(value, ast.Name):
+            return {
+                "name_expr": name_expr,
+                "local_var": value.id,
+                "two_step": True,
+            }
+        return None
+
 
 
 
@@ -1073,10 +1241,8 @@ class ASTFrontend:
 # PR1: ConstantTable + ConstantResolver skeleton
 # ===========================================================================
 # Reference: ast_refactor_workdir/output/ast_evaluator_redesign.md (sections
-# 3-4).  These two classes form the "facts table + pure evaluator" pair that
-# will eventually replace the legacy regex+AST mixed evaluator (`_eval_int_atom`
-# / `_eval_list_len` / `_extract_kw_int_args` / `_extract_kw_list_lens` /
-# `_resolve_range_n` / `_resolve_iter_len`) per the 5-stage PR plan.
+# 3-4).  These two classes form the "facts table + pure evaluator" pair for
+# AST-only constant extraction in the static DAG builder.
 #
 # Scope of PR1 (this commit):
 #   * Class skeletons exist and are *callable* (not just `pass` placeholders).
@@ -1204,6 +1370,10 @@ class ConstantTable:
         # ── Per-instance (tables 9-11) ─────────────────────────────────
         self.instance_kw_int: Dict[Tuple[str, str], Dict[str, IntValue]] = {}
         self.instance_kw_list_len: Dict[Tuple[str, str], Dict[str, int]] = {}
+        # Auxiliary: retain per-instance concrete list literals so callers can
+        # recover the real item sequence (for example ``['x', 'y']`` vs
+        # ``['x', 'y', 'z']``) instead of only the aggregated class-level max len.
+        self.instance_kw_list_items: Dict[Tuple[str, str], Dict[str, ListValue]] = {}
         # instance_const_chain[(parent_cls, parent_attr)] ->
         #   {param_name: {field: IntValue}}
         self.instance_const_chain: Dict[
@@ -1220,19 +1390,23 @@ class ConstantTable:
 
         # ── self.attr → param map (table 14) ───────────────────────────
         self.self_to_param: Dict[Tuple[str, str], Dict[str, str]] = {}
+        # local_self_attr_exprs[(file, cls, method)] -> {attr: [(line, expr), ...]}
+        # Used by P2 to resolve list_len through ``self.attr`` indirection, e.g.
+        # ``self.layers = [..]`` / ``self.layers = [.. for _ in range(n)]`` /
+        # ``self.names = names``.
+        self.local_self_attr_exprs: Dict[
+            Tuple[str, str, str], Dict[str, List[Tuple[int, ast.expr]]]
+        ] = {}
 
         # ── Phase E1.2 auxiliary: per-class ClassDef AST node (used for
         #    cross-class dict-literal lookups during Pass 4 dataclass
         #    propagation).
         self.class_defs: Dict[Tuple[str, str], ast.ClassDef] = {}
 
-        # ── Phase E1.2 auxiliary: ``__init__`` formal-parameter annotations,
-        #    e.g. ``Stack.__init__(self, cfg: Cfg, ...)`` →
-        #    ``{('file','Stack'): {'cfg': 'Cfg'}}``.  Used by
-        #    ``_resolve_self_chain`` as a fall-back when no concrete parent
-        #    instance binds the parameter — we then read defaults straight
-        #    from the dataclass.
-        self.class_init_param_anno: Dict[Tuple[str, str], Dict[str, str]] = {}
+        # ── Annotation fallback is forbidden: when a parameter cannot be
+        #    resolved from concrete caller/default semantics, resolvers must
+        #    conservatively return ``None``. Type annotations are metadata only;
+        #    they must never be used to infer runtime values.
         # ── Auxiliary (referenced in section 4.6) ──────────────────────
         # local_self_dict_literals[(file, cls, method)] ->
         #   {self_attr_name: {key: ast.expr}}
@@ -1425,6 +1599,7 @@ class ConstantTable:
             self.class_defs[(fname, cname)] = classdef
             self._scan_class_init_params(fname, cname, classdef)
             self._scan_self_to_param(fname, cname, fe)
+            self._scan_self_attr_exprs(fname, cname, classdef)
             self._scan_local_aliases(fname, cname, classdef)
             self._scan_self_dict_literals(fname, cname, classdef)
             self._scan_local_dataclass_instances(fname, cname, classdef)
@@ -1435,24 +1610,12 @@ class ConstantTable:
         for stmt in classdef.body:
             if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) and stmt.name == "__init__":
                 params = []
-                annos: Dict[str, str] = {}
                 # Note: stmt.args.args includes `self`; we keep it for index
                 # symmetry with the positional binding pass.
                 for a in stmt.args.args:
                     params.append(a.arg)
-                    # Phase E1.2: capture simple annotation class name
-                    # (``cfg: Cfg`` → ``{'cfg': 'Cfg'}``).  Subscripted /
-                    # complex annotations are skipped — a missing entry just
-                    # disables the dataclass-default fall-back for that param.
-                    anno = a.annotation
-                    if isinstance(anno, ast.Name):
-                        annos[a.arg] = anno.id
-                    elif isinstance(anno, ast.Attribute):
-                        annos[a.arg] = anno.attr
                 # Skip *args / **kwargs (intentionally — section 8.1 R1).
                 self.class_init_params[(fname, cname)] = params
-                if annos:
-                    self.class_init_param_anno[(fname, cname)] = annos
                 return
 
     def _scan_self_to_param(self, fname: str, cname: str,
@@ -1464,6 +1627,34 @@ class ConstantTable:
             aliases = {}
         if aliases:
             self.self_to_param[(fname, cname)] = dict(aliases)
+
+    def _scan_self_attr_exprs(self, fname: str, cname: str,
+                              classdef: ast.ClassDef) -> None:
+        """Record ``self.attr = <expr>`` bindings with source-order information.
+
+        P2 needs list_len resolution through ``self.attr`` indirection.  We keep
+        the original RHS AST node so ``ConstantResolver`` can recurse into it
+        later (for example ``self.layers = [.. for _ in range(n)]`` or
+        ``self.names = names``).
+        """
+        for stmt in classdef.body:
+            if not isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            scope_key = (fname, cname, stmt.name)
+            attr_exprs: Dict[str, List[Tuple[int, ast.expr]]] = {}
+            for sub in ast.walk(stmt):
+                if not isinstance(sub, ast.Assign):
+                    continue
+                if len(sub.targets) != 1:
+                    continue
+                attr_name = self._extract_self_attr_name(sub.targets[0])
+                if attr_name is None:
+                    continue
+                attr_exprs.setdefault(attr_name, []).append((getattr(sub, "lineno", -1), sub.value))
+            if attr_exprs:
+                for entries in attr_exprs.values():
+                    entries.sort(key=lambda item: item[0])
+                self.local_self_attr_exprs[scope_key] = attr_exprs
 
     def _scan_local_aliases(self, fname: str, cname: str,
                             classdef: ast.ClassDef) -> None:
@@ -1633,22 +1824,8 @@ class ConstantTable:
                 sub_cls = self._call_class_name(value.func)
                 if sub_cls is None:
                     continue
-                # --- Step 5/6: literal args via kwargs --------------------
-                for kw in value.keywords:
-                    if kw.arg is None:
-                        continue
-                    kw_val = kw.value
-                    if isinstance(kw_val, ast.Constant) and isinstance(kw_val.value, int) and not isinstance(kw_val.value, bool):
-                        self.instance_kw_int.setdefault((class_name, attr_name), {})[kw.arg] = IntValue(kw_val.value, "kw_arg")
-                    elif (isinstance(kw_val, ast.UnaryOp) and isinstance(kw_val.op, ast.USub)
-                          and isinstance(kw_val.operand, ast.Constant)
-                          and isinstance(kw_val.operand.value, int)
-                          and not isinstance(kw_val.operand.value, bool)):
-                        self.instance_kw_int.setdefault((class_name, attr_name), {})[kw.arg] = IntValue(-kw_val.operand.value, "kw_arg")
-                    elif isinstance(kw_val, ast.List):
-                        self.instance_kw_list_len.setdefault((class_name, attr_name), {})[kw.arg] = len(kw_val.elts)
-                # --- Step 1-4 (Phase E1.2): positional/keyword binding +
-                # dataclass propagation.
+                # --- Step 1-6: positional/keyword binding + per-instance
+                # literal/dataclass propagation.
                 # Locate ``SubClass.__init__`` formal parameter list across
                 # any defining file (the dataclass / subclass may live in a
                 # different file than the parent class).
@@ -1683,12 +1860,20 @@ class ConstantTable:
                 if not bound:
                     continue
                 scope_key = (fname, class_name, "__init__")
+                scope = Scope(file=fname, cls=class_name, method="__init__")
+                inst_key = (class_name, attr_name)
                 for param, expr_node in bound.items():
+                    iv = self._resolve_bound_int(expr_node, scope)
+                    if iv is not None:
+                        self.instance_kw_int.setdefault(inst_key, {})[param] = iv
+                    list_value = self._resolve_bound_list_value(expr_node, scope_key)
+                    if list_value is not None:
+                        self.instance_kw_list_len.setdefault(inst_key, {})[param] = list_value.length
+                        self.instance_kw_list_items.setdefault(inst_key, {})[param] = list_value
                     fields = self._resolve_bound_dataclass_fields(expr_node, scope_key)
                     if not fields:
                         continue
-                    chain_key = (class_name, attr_name)
-                    slot = self.instance_const_chain.setdefault(chain_key, {})
+                    slot = self.instance_const_chain.setdefault(inst_key, {})
                     existing = slot.get(param)
                     if existing is None:
                         slot[param] = fields
@@ -1705,6 +1890,32 @@ class ConstantTable:
             if _cname == sub_cls:
                 return params
         return []
+
+    def _resolve_bound_int(self,
+                           expr_node: ast.expr,
+                           scope: Scope) -> Optional[IntValue]:
+        resolver = ConstantResolver(self)
+        iv = resolver.eval_int(expr_node, scope)
+        if iv is None:
+            return None
+        return IntValue(iv.value, "callsite_bind")
+
+    def _resolve_bound_list_value(self,
+                                  expr_node: ast.expr,
+                                  scope_key: Tuple[str, str, str]) -> Optional[ListValue]:
+        fname, cname, mname = scope_key
+        resolver = ConstantResolver(self)
+        list_node = resolver._resolve_to_list_literal(
+            expr_node,
+            Scope(file=fname, cls=cname, method=mname),
+        )
+        if list_node is None:
+            return None
+        return ListValue(
+            length=len(list_node.elts),
+            items=tuple(list_node.elts),
+            origin="callsite_bind",
+        )
 
     def _resolve_bound_dataclass_fields(self,
                                         expr_node: ast.expr,
@@ -1804,6 +2015,32 @@ class ConstantResolver:
         # cost while remaining stable for the lifetime of the table (section
         # 3.3, R2).
         self._eval_cache: Dict[Tuple[Any, ...], Any] = {}
+        self.fail_reasons: Counter[str] = Counter()
+        self.fail_samples: Dict[str, List[str]] = defaultdict(list)
+
+    def _fail(self, reason: str, node: Optional[ast.AST] = None, scope: Optional[Scope] = None) -> None:
+        allowed = {
+            "name_unresolved",
+            "param_unbound",
+            "call_not_constant",
+            "list_len_unsupported_expr",
+            "alias_unresolved",
+            "annotation_not_value",
+        }
+        if reason not in allowed:
+            reason = "list_len_unsupported_expr"
+        self.fail_reasons[reason] += 1
+        samples = self.fail_samples[reason]
+        if len(samples) < 5:
+            node_desc = type(node).__name__ if node is not None else "<none>"
+            scope_desc = ""
+            if scope is not None:
+                scope_desc = f"{scope.file}:{scope.cls}.{scope.method}:{scope.parent_cls}.{scope.parent_attr}"
+            samples.append(f"{node_desc}@{scope_desc}")
+        return None
+
+    def get_fail_reason_counts(self) -> Dict[str, int]:
+        return dict(self.fail_reasons)
 
     # ------------------------------------------------------------------
     # Public API
@@ -1933,20 +2170,32 @@ class ConstantResolver:
             return self._visit_UnaryOp_int(node, scope)
         if isinstance(node, ast.Call):
             return self._visit_Call_int(node, scope)
-        return None
+        return self._fail("list_len_unsupported_expr", node, scope)
 
     def _visit_Constant_int(self, node: ast.Constant, scope: Scope) -> Optional[IntValue]:
         if isinstance(node.value, int) and not isinstance(node.value, bool):
             return IntValue(node.value, "literal")
-        return None
+        return self._fail("list_len_unsupported_expr", node, scope)
+
+    def _method_param_has_annotation(self, param_name: str, scope: Scope) -> bool:
+        method_node = self._get_method_node_for_scope(scope)
+        if method_node is None:
+            return False
+        for arg in method_node.args.args:
+            if arg.arg == param_name:
+                return arg.annotation is not None
+        return False
 
     def _visit_Name_int(self, node: ast.Name, scope: Scope) -> Optional[IntValue]:
         # ① Method-local alias chain.
         resolved_alias = self._resolve_alias_chain(node, scope.method_key)
-        if resolved_alias is not None and resolved_alias is not node:
+        if resolved_alias is None:
+            return self._fail("alias_unresolved", node, scope)
+        if resolved_alias is not node:
             sub = self.eval_int(resolved_alias, scope)
             if sub is not None:
                 return IntValue(sub.value, "alias")
+            return self._fail("alias_unresolved", node, scope)
         # ② File-level constant.
         file_consts = self.table.file_int_consts.get(scope.file, {})
         if node.id in file_consts:
@@ -1954,14 +2203,25 @@ class ConstantResolver:
         # ③ Global unique constant.
         if node.id in self.table.global_int_consts:
             return self.table.global_int_consts[node.id]
-        # ④ Class formal parameter — try class-level union (only when unique).
+        # ④ Class formal parameter — try per-instance first, then class-level
+        #    union (only when unique).
         if scope.cls is not None:
             params = self.table.class_init_params.get((scope.file, scope.cls), [])
             if node.id in params:
+                # Per-instance override via instance_kw_int.
+                inst_key = scope.instance_key
+                if inst_key[0] is not None and inst_key[1] is not None:
+                    inst_int = self.table.instance_kw_int.get(inst_key, {})
+                    if node.id in inst_int:
+                        return inst_int[node.id]
+                # Fallback to class-level ctor_kw_args union when unique.
                 kw_set = self.table.ctor_kw_args.get(scope.cls, {}).get(node.id)
                 if kw_set and len(kw_set) == 1:
                     return next(iter(kw_set))
-        return None
+                if self._method_param_has_annotation(node.id, scope):
+                    return self._fail("annotation_not_value", node, scope)
+                return self._fail("param_unbound", node, scope)
+        return self._fail("name_unresolved", node, scope)
 
     def _visit_Attribute_int(self, node: ast.Attribute, scope: Scope) -> Optional[IntValue]:
         chain = self._flatten_attr_chain(node)
@@ -2046,7 +2306,7 @@ class ConstantResolver:
             return self.eval_int(arg, scope)
         # Dataclass(...) — section 4.2 says return None for int kind (the
         # caller should use eval_dataclass_fields instead).
-        return None
+        return self._fail("call_not_constant", node, scope)
 
     # ------------------------------------------------------------------
     # list_len dispatcher
@@ -2054,6 +2314,8 @@ class ConstantResolver:
     def _eval_list_len_uncached(self, node: ast.expr, scope: Scope) -> Optional[int]:
         if isinstance(node, ast.List):
             return self._visit_List_list_len(node, scope)
+        if isinstance(node, ast.ListComp):
+            return self._visit_ListComp_list_len(node, scope)
         if isinstance(node, ast.Name):
             return self._visit_Name_list_len(node, scope)
         if isinstance(node, ast.Attribute):
@@ -2063,8 +2325,8 @@ class ConstantResolver:
         if isinstance(node, ast.Starred):
             return self._visit_Starred_list_len(node, scope)
         if isinstance(node, ast.Call):
-            return None  # only int-returning calls are handled
-        return None
+            return self._fail("call_not_constant", node, scope)  # only int-returning calls are handled
+        return self._fail("list_len_unsupported_expr", node, scope)
 
     def _visit_List_list_len(self, node: ast.List, scope: Scope) -> Optional[int]:
         total = 0
@@ -2078,23 +2340,63 @@ class ConstantResolver:
                 total += 1
         return total
 
+    def _visit_ListComp_list_len(self, node: ast.ListComp, scope: Scope) -> Optional[int]:
+        if node.generators is None or not node.generators:
+            return 0
+        total = 1
+        for gen in node.generators:
+            if gen.ifs:
+                return None
+            n = self.eval_list_len(gen.iter, scope)
+            if n is None:
+                if (isinstance(gen.iter, ast.Call)
+                        and isinstance(gen.iter.func, ast.Name)
+                        and gen.iter.func.id == "range"
+                        and len(gen.iter.args) == 1):
+                    iv = self.eval_int(gen.iter.args[0], scope)
+                    if iv is None or iv.value < 0:
+                        return None
+                    n = iv.value
+                else:
+                    return None
+            total *= n
+        return total
+
     def _visit_Name_list_len(self, node: ast.Name, scope: Scope) -> Optional[int]:
         # ① local alias → recurse on its final RHS
         resolved_alias = self._resolve_alias_chain(node, scope.method_key)
-        if resolved_alias is not None and resolved_alias is not node:
-            return self.eval_list_len(resolved_alias, scope)
+        if resolved_alias is None:
+            return self._fail("alias_unresolved", node, scope)
+        if resolved_alias is not node:
+            n = self.eval_list_len(resolved_alias, scope)
+            if n is not None:
+                return n
+            return self._fail("alias_unresolved", node, scope)
         # ② file-level str-list literal
         file_lists = self.table.file_str_list_consts.get(scope.file, {})
         if node.id in file_lists:
             return file_lists[node.id].length
-        # ③ class-level kwarg union (only when single value)
+        # ③ class-level kwarg union (only when single value). Prefer
+        #    per-instance specialisation from instance_kw_list_len when the
+        #    current scope is evaluating inside a child class for a specific
+        #    parent instance.
         if scope.cls is not None:
-            kw_set = self.table.ctor_kw_list_args.get(scope.cls, {}).get(node.id)
-            if kw_set:
-                # Phase E1.2: when multiple list lengths exist across instances,
-                # pick the maximum as a conservative upper bound (section 4.4).
-                return max(kw_set)
-        return None
+            params = self.table.class_init_params.get((scope.file, scope.cls), [])
+            if node.id in params:
+                inst_key = scope.instance_key
+                if inst_key[0] is not None and inst_key[1] is not None:
+                    inst_lens = self.table.instance_kw_list_len.get(inst_key, {})
+                    if node.id in inst_lens:
+                        return inst_lens[node.id]
+                kw_set = self.table.ctor_kw_list_args.get(scope.cls, {}).get(node.id)
+                if kw_set:
+                    # Phase E1.2: when multiple list lengths exist across instances,
+                    # pick the maximum as a conservative upper bound (section 4.4).
+                    return max(kw_set)
+                if self._method_param_has_annotation(node.id, scope):
+                    return self._fail("annotation_not_value", node, scope)
+                return self._fail("param_unbound", node, scope)
+        return self._fail("name_unresolved", node, scope)
 
     def _visit_Attribute_list_len(self, node: ast.Attribute, scope: Scope) -> Optional[int]:
         chain = self._flatten_attr_chain(node)
@@ -2103,12 +2405,17 @@ class ConstantResolver:
         base, attrs = chain
         if not (isinstance(base, ast.Name) and base.id == "self"):
             return None
+        direct = self._lookup_self_attr_expr(attrs, scope, getattr(node, "lineno", None))
+        if direct is not None:
+            n = self.eval_list_len(direct, scope)
+            if n is not None:
+                return n
         if len(attrs) != 1:
-            return None  # multi-level list_len not supported in PR1
+            return self._fail("list_len_unsupported_expr", node, scope)
         cls_key = (scope.file, scope.cls)
         param = self.table.self_to_param.get(cls_key, {}).get(attrs[0])
         if param is None:
-            return None
+            return self._fail("name_unresolved", node, scope)
         # Per-instance overrides class-level.
         inst_key = (scope.parent_cls, scope.parent_attr)
         inst_lens = self.table.instance_kw_list_len.get(inst_key, {})
@@ -2117,7 +2424,7 @@ class ConstantResolver:
         kw_set = self.table.ctor_kw_list_args.get(scope.cls, {}).get(param)
         if kw_set and len(kw_set) == 1:
             return next(iter(kw_set))
-        return None
+        return self._fail("param_unbound", node, scope)
 
     def _visit_BinOp_list_len(self, node: ast.BinOp, scope: Scope) -> Optional[int]:
         if isinstance(node.op, ast.Add):
@@ -2274,6 +2581,21 @@ class ConstantResolver:
             return IntValue(cur, "dataclass_field")
         return None
 
+    def _lookup_self_attr_expr(self,
+                               attrs: List[str],
+                               scope: Scope,
+                               before_line: Optional[int] = None) -> Optional[ast.expr]:
+        if scope.cls is None or scope.method is None or len(attrs) != 1:
+            return None
+        entries = self.table.local_self_attr_exprs.get(scope.method_key, {}).get(attrs[0], [])
+        if not entries:
+            return None
+        if before_line is not None:
+            for lineno, expr in reversed(entries):
+                if lineno <= before_line:
+                    return expr
+        return entries[-1][1]
+
     def _runtime_override_candidates(self, attrs: List[str], scope: Scope) -> List[str]:
         joined = ".".join(attrs)
         leaf = attrs[-1] if attrs else ""
@@ -2344,6 +2666,15 @@ class ConstantResolver:
                 return None
             if target_node is not node:
                 return self._resolve_to_list_literal(target_node, scope)
+            if scope.cls is not None:
+                params = self.table.class_init_params.get((scope.file, scope.cls), [])
+                if node.id in params:
+                    inst_key = scope.instance_key
+                    if inst_key[0] is not None and inst_key[1] is not None:
+                        inst_lists = self.table.instance_kw_list_items.get(inst_key, {})
+                        list_value = inst_lists.get(node.id)
+                        if list_value is not None and list_value.items is not None:
+                            return ast.List(elts=list(list_value.items), ctx=ast.Load())
             file_lists = self.table.file_str_list_consts.get(scope.file, {})
             if node.id in file_lists:
                 items = file_lists[node.id].items
@@ -2351,6 +2682,14 @@ class ConstantResolver:
                     # Re-wrap into an ast.List for uniform handling.
                     fake = ast.List(elts=list(items), ctx=ast.Load())
                     return fake
+        if isinstance(node, ast.Attribute):
+            chain = self._flatten_attr_chain(node)
+            if chain is not None:
+                base, attrs = chain
+                if isinstance(base, ast.Name) and base.id == "self":
+                    direct = self._lookup_self_attr_expr(attrs, scope, getattr(node, "lineno", None))
+                    if direct is not None:
+                        return self._resolve_to_list_literal(direct, scope)
         return None
 
 
@@ -8160,6 +8499,8 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
             c.isupper() or c.isdigit() or c == "_" for c in _s
         )
 
+    nn_import_aliases = {}  # {alias_name: short_name}, e.g. {"TorchLinear": "Linear"}
+
     for _fname, _lines in source_files.items():
         int_consts = {}
         str_list_consts_raw = {}
@@ -8167,6 +8508,13 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
         _file_tree = _fe.tree if _fe is not None else None
         if _file_tree is not None:
             for _node in _file_tree.body:
+                if isinstance(_node, ast.ImportFrom) and _node.module == "torch.nn":
+                    for _alias in _node.names:
+                        if _alias.name == "*":
+                            continue
+                        _alias_name = _alias.asname or _alias.name
+                        nn_import_aliases[_alias_name] = _alias.name
+                    continue
                 if not isinstance(_node, ast.Assign) or len(_node.targets) != 1:
                     continue
                 _t = _node.targets[0]
@@ -8188,6 +8536,24 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                     str_list_consts_raw[_t.id] = _inner_text
         file_int_consts[_fname] = int_consts
         file_str_list_globals_raw[_fname] = str_list_consts_raw
+
+    def _extract_nn_short(cls_ref_full, nn_import_aliases=None):
+        """Normalize a constructor ref into _is_nn_leaf_stub's short name.
+
+        Supports nn.Linear, torch.nn.Linear, and from-torch.nn import aliases.
+        Returns (short_name, canonical_ref) or (None, None).
+        """
+        cls_ref_full = (cls_ref_full or "").strip()
+        if cls_ref_full.startswith("nn."):
+            short = cls_ref_full.split(".", 1)[1]
+            return short, cls_ref_full
+        if cls_ref_full.startswith("torch.nn."):
+            short = cls_ref_full.split(".", 2)[2]
+            return short, "nn." + short
+        if nn_import_aliases and cls_ref_full in nn_import_aliases:
+            short = nn_import_aliases[cls_ref_full]
+            return short, "nn." + short
+        return None, None
 
     # 全局常量：同名常量在多个文件出现时，若值唯一则可跨文件解析
     global_int_const_values = defaultdict(set)
@@ -8553,6 +8919,8 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
         if len(_lists) == 1:
             _global_str_lists_unique[_name] = list(next(iter(_lists)))
 
+    _str_list_resolve_cache = {}
+
     def _resolve_str_list(expr: str, fname: str, cname: str,
                           loop_var_to_str_items: dict):
         """Iter13 Step2 + Phase B: iterative multi-step string-list resolver.
@@ -8563,7 +8931,14 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
           4. file-level / global UPPER_CASE str-list constant
           5. bare Name / dotted attribute → None (unresolvable)
         """
-        return _resolve_str_list_iterative(
+        _loop_key = tuple(
+            sorted((str(k), tuple(v or ())) for k, v in (loop_var_to_str_items or {}).items())
+        )
+        _cache_key = (expr, fname, cname, _loop_key, conditional_mode)
+        if _cache_key in _str_list_resolve_cache:
+            _cached_keys = _str_list_resolve_cache[_cache_key]
+            return list(_cached_keys) if _cached_keys is not None else None
+        _resolved = _resolve_str_list_iterative(
             expr=expr,
             fname=fname,
             cname=cname,
@@ -8575,6 +8950,8 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
             conditional_mode=conditional_mode,
             _global_str_lists_unique=_global_str_lists_unique,
         )
+        _str_list_resolve_cache[_cache_key] = tuple(_resolved) if _resolved is not None else None
+        return list(_resolved) if _resolved is not None else None
 
     for (fname, cname), info in class_map.items():
         if cname not in nn_module_classes:
@@ -8662,173 +9039,11 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
             # {var_name: list[str]}
             _local_var_str_list: dict = {}
 
-            def _parse_local_stmt(_line: str):
-                _text = (_line or "").strip()
-                if not _text:
-                    return None
-                try:
-                    _mod = ast.parse(_text)
-                except Exception:
-                    return None
-                if len(_mod.body) != 1:
-                    return None
-                return _mod.body[0]
-
-            def _expr_leaf_name(_node):
-                if isinstance(_node, ast.Name):
-                    return _node.id
-                if isinstance(_node, ast.Attribute):
-                    return (_expr_leaf_name(_node.value) + "." if _expr_leaf_name(_node.value) else "") + _node.attr
-                return None
-
             def _self_attr_from_target(_target):
                 return _fe._extract_self_attr_name(_target) if _fe else None
 
             def _node_to_text(_node):
-                # IMPORTANT: nodes here come from `_parse_local_stmt(line)` which
-                # parses the joined logical line as a *standalone* tiny source
-                # snippet. Their (lineno, col_offset) point into that snippet,
-                # NOT into the file. If we delegated to `_fe._node_to_text` it
-                # would use the file's `_line_starts` and slice wildly wrong
-                # bytes (e.g. returning `'ogging\\nimpo'` for `DenseTower`).
-                # Always use ast.unparse here — it is position-independent.
-                try:
-                    return ast.unparse(_node)
-                except Exception:
-                    return ""
-
-            def _parse_local_ctor_assign(_stmt):
-                if not isinstance(_stmt, ast.Assign) or not isinstance(_stmt.value, ast.Call):
-                    return None
-                _target = _stmt.targets[0] if len(_stmt.targets) == 1 else None
-                if _target is None:
-                    return None
-                _attr = _self_attr_from_target(_target)
-                if not _attr:
-                    return None
-                return {
-                    "attr": _attr,
-                    "class_full": _node_to_text(_stmt.value.func),
-                    "kwargs": {kw.arg: _node_to_text(kw.value) for kw in _stmt.value.keywords if kw.arg is not None},
-                }
-
-            def _parse_local_lg_assign(_stmt):
-                if not isinstance(_stmt, ast.Assign) or not isinstance(_stmt.value, ast.Call):
-                    return None
-                _target = _stmt.targets[0] if len(_stmt.targets) == 1 else None
-                if _target is None:
-                    return None
-                _attr = _self_attr_from_target(_target)
-                if not _attr:
-                    return None
-                _func_text = _node_to_text(_stmt.value.func)
-                if _func_text in {
-                    "LG.feature_column", "LG.dense_feature", "LG.get_sample_rate", "LG.get_bias"
-                }:
-                    return {"attr": _attr}
-                return None
-
-            def _parse_local_fc_get_vector_assign(_stmt):
-                if not isinstance(_stmt, ast.Assign) or not isinstance(_stmt.value, ast.Call):
-                    return None
-                _target = _stmt.targets[0] if len(_stmt.targets) == 1 else None
-                if _target is None:
-                    return None
-                _attr = _self_attr_from_target(_target)
-                if not _attr:
-                    return None
-                _func = _stmt.value.func
-                if not (isinstance(_func, ast.Attribute) and _func.attr == "get_vector"):
-                    return None
-                _owner = _func.value
-                if not isinstance(_owner, ast.Subscript):
-                    return None
-                _owner_text = _node_to_text(_owner.value).strip()
-                if not re.search(r'(?:^|_)(?:dict|fc)\w*$', _owner_text) and not re.search(r'(?:dict|fc)', _owner_text):
-                    return None
-                return {"attr": _attr}
-
-            def _parse_local_container_ctor(_stmt):
-                if not isinstance(_stmt, ast.Assign) or not isinstance(_stmt.value, ast.Call):
-                    return None
-                _target = _stmt.targets[0] if len(_stmt.targets) == 1 else None
-                if _target is None:
-                    return None
-                _attr = _self_attr_from_target(_target)
-                if not _attr:
-                    return None
-                _func_leaf = (_expr_leaf_name(_stmt.value.func) or "").split(".")[-1]
-                if _func_leaf not in {"ModuleList", "ModuleDict"}:
-                    return None
-                return {"attr": _attr, "kind": _func_leaf, "call": _stmt.value}
-
-            def _parse_local_append_ctor(_stmt):
-                if not isinstance(_stmt, ast.Expr) or not isinstance(_stmt.value, ast.Call):
-                    return None
-                _call = _stmt.value
-                if not isinstance(_call.func, ast.Attribute) or _call.func.attr != "append":
-                    return None
-                _owner = _call.func.value
-                if not (isinstance(_owner, ast.Attribute) and isinstance(_owner.value, ast.Name) and _owner.value.id == "self"):
-                    return None
-                if len(_call.args) != 1 or not isinstance(_call.args[0], ast.Call):
-                    return None
-                return {
-                    "attr": _owner.attr,
-                    "class_full": _node_to_text(_call.args[0].func),
-                }
-
-            def _parse_local_subscript_ctor(_stmt):
-                if not isinstance(_stmt, ast.Assign) or not isinstance(_stmt.value, ast.Call):
-                    return None
-                _target = _stmt.targets[0] if len(_stmt.targets) == 1 else None
-                if not isinstance(_target, ast.Subscript):
-                    return None
-                _owner = _target.value
-                if not (isinstance(_owner, ast.Attribute) and isinstance(_owner.value, ast.Name) and _owner.value.id == "self"):
-                    return None
-                return {
-                    "attr": _owner.attr,
-                    "key_expr": _node_to_text(_target.slice),
-                    "class_full": _node_to_text(_stmt.value.func),
-                }
-
-            def _parse_local_var_ctor(_stmt):
-                if not isinstance(_stmt, ast.Assign) or not isinstance(_stmt.value, ast.Call):
-                    return None
-                _target = _stmt.targets[0] if len(_stmt.targets) == 1 else None
-                if not isinstance(_target, ast.Name):
-                    return None
-                return {
-                    "name": _target.id,
-                    "class_full": _node_to_text(_stmt.value.func),
-                }
-
-            def _parse_local_setattr_ctor(_stmt):
-                if not isinstance(_stmt, ast.Expr) or not isinstance(_stmt.value, ast.Call):
-                    return None
-                _call = _stmt.value
-                _func_name = _expr_leaf_name(_call.func)
-                if _func_name != "setattr" or len(_call.args) != 3:
-                    return None
-                _owner = _call.args[0]
-                if not (isinstance(_owner, ast.Name) and _owner.id == "self"):
-                    return None
-                _name_expr = _node_to_text(_call.args[1]).strip()
-                _value = _call.args[2]
-                if isinstance(_value, ast.Call):
-                    return {
-                        "name_expr": _name_expr,
-                        "class_full": _node_to_text(_value.func),
-                        "two_step": False,
-                    }
-                if isinstance(_value, ast.Name):
-                    return {
-                        "name_expr": _name_expr,
-                        "local_var": _value.id,
-                        "two_step": True,
-                    }
-                return None
+                return _fe._local_node_to_text(_node) if _fe else ""
 
             for phys_lineno, line in logical_lines:
                 # Iter11: track indent of this logical line (use raw source line)
@@ -8843,7 +9058,7 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                 # call site.
                 if line.lstrip().startswith('#'):
                     continue
-                _local_stmt = _parse_local_stmt(line)
+                _local_stmt = _fe.parse_local_stmt(line) if _fe else None
                 # Pop loops whose indent is >= current indent (we left their body)
                 while _loop_indent_stack and _cur_indent <= _loop_indent_stack[-1][0]:
                     _, _popped_var = _loop_indent_stack.pop()
@@ -9078,7 +9293,7 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
 
                 _ast_init_item = _ast_init_assignments_by_line.get(phys_lineno)
 
-                _ast_ctor_assign = _parse_local_ctor_assign(_local_stmt)
+                _ast_ctor_assign = _fe.parse_local_ctor_assign(_local_stmt) if _fe else None
                 if _ast_ctor_assign:
                     _ctor_attr = _ast_ctor_assign.get("attr")
                     _cls_full = _ast_ctor_assign.get("class_full") or ""
@@ -9124,10 +9339,9 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                         cls_ref_full = _ast_init_item.get("class") or ""
                     cls_ref = cls_ref_full.split('.')[-1]
                     native_cls_ref = None
-                    if cls_ref_full.startswith("nn."):
-                        _nn_short = cls_ref_full.split(".", 1)[1]  # e.g. "Linear", "ModuleDict"
-                        if _is_nn_leaf_stub(_nn_short):
-                            native_cls_ref = cls_ref_full
+                    _nn_short, _nn_canonical = _extract_nn_short(cls_ref_full, nn_import_aliases)
+                    if _nn_short and _is_nn_leaf_stub(_nn_short):
+                        native_cls_ref = _nn_canonical
                     if cls_ref in nn_module_classes:
                         # Iter13 Step1: track conditional attrs regardless of mode.
                         if _active_branch is not None:
@@ -9158,7 +9372,7 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                         # Detect LG input source modules:
                         # LG.feature_column(...), LG.dense_feature(...),
                         # LG.get_sample_rate(...), LG.get_bias(...)
-                        _ast_lg = _parse_local_lg_assign(_local_stmt)
+                        _ast_lg = _fe.parse_local_lg_assign(_local_stmt) if _fe else None
                         if _ast_lg:
                             attr_name = _ast_lg.get("attr")
                             attrs[attr_name] = "__LG_InputSource"
@@ -9167,7 +9381,7 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
 
                 # Detect fc_dict[...].get_vector(...) assigned to self.xxx
                 # Pattern: self.xxx = fc_dict[slot].get_vector(...) or similar
-                _ast_fc_gv = _parse_local_fc_get_vector_assign(_local_stmt)
+                _ast_fc_gv = _fe.parse_local_fc_get_vector_assign(_local_stmt) if _fe else None
                 if _ast_fc_gv:
                     attr_name = _ast_fc_gv.get("attr")
                     if attr_name not in attrs:
@@ -9175,7 +9389,7 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                         attr_def_loc.setdefault((cname, attr_name), (fname, phys_lineno))
                         input_source_attrs[cname].add(attr_name)
 
-                _ast_container_ctor = _parse_local_container_ctor(_local_stmt)
+                _ast_container_ctor = _fe.parse_local_container_ctor(_local_stmt) if _fe else None
                 if _ast_container_ctor and _ast_container_ctor.get("kind") == "ModuleList":
                     cont = _ast_container_ctor.get("attr")
                     _record_container_kind(cname, cont, "ModuleList")
@@ -9186,7 +9400,7 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                         _gen0 = _generators[0] if len(_generators) == 1 else None
                         _cls_ref = _node_to_text(_arg0.elt.func).split('.')[-1]
                         _n = None
-                        if _gen0 and isinstance(_gen0.iter, ast.Call) and (_expr_leaf_name(_gen0.iter.func) == "range") and len(_gen0.iter.args) == 1:
+                        if _gen0 and isinstance(_gen0.iter, ast.Call) and (_fe._expr_leaf_name(_gen0.iter.func) == "range") and len(_gen0.iter.args) == 1:
                             _n = _eval_int_node(_gen0.iter.args[0], fname, cname, mname, parent_cls=preferred_root, parent_attr='stack')
                         # Phase E1.1: literal list iter, e.g.
                         # ``[Cls(name) for name in ['a', 'b', 'c']]``
@@ -9198,16 +9412,31 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                             _len = _eval_list_len_node(_gen0.iter, fname, cname, mname)
                             if _len is not None:
                                 _n = _len
-                        if _n is not None and _cls_ref in nn_module_classes:
-                            attrs.setdefault(cont, _cls_ref)
-                            attr_def_loc.setdefault((cname, cont), (fname, phys_lineno))
-                            for i in range(_n):
-                                _ensure_elem(cont, cname, _elem_attr_list(cont, i), _cls_ref, fname, phys_lineno, attrs)
+                        if _n is not None:
+                            _short, _canonical = _extract_nn_short(_node_to_text(_arg0.elt.func), nn_import_aliases)
+                            if _short and _is_nn_leaf_stub(_short):
+                                attrs.setdefault(cont, _canonical)
+                                attr_def_loc.setdefault((cname, cont), (fname, phys_lineno))
+                                torch_native_module_classes.add(_canonical)
+                                for i in range(_n):
+                                    _ensure_elem(cont, cname, _elem_attr_list(cont, i), _canonical, fname, phys_lineno, attrs)
+                            elif _cls_ref in nn_module_classes:
+                                attrs.setdefault(cont, _cls_ref)
+                                attr_def_loc.setdefault((cname, cont), (fname, phys_lineno))
+                                for i in range(_n):
+                                    _ensure_elem(cont, cname, _elem_attr_list(cont, i), _cls_ref, fname, phys_lineno, attrs)
                     elif isinstance(_arg0, ast.List):
                         for i, _elt in enumerate(_arg0.elts):
                             if isinstance(_elt, ast.Call):
-                                cls_ref = _node_to_text(_elt.func).split('.')[-1]
-                                if cls_ref in nn_module_classes:
+                                cls_ref_full = _node_to_text(_elt.func)
+                                cls_ref = cls_ref_full.split('.')[-1]
+                                _short, _canonical = _extract_nn_short(cls_ref_full, nn_import_aliases)
+                                if _short and _is_nn_leaf_stub(_short):
+                                    attrs.setdefault(cont, _canonical)
+                                    attr_def_loc.setdefault((cname, cont), (fname, phys_lineno))
+                                    torch_native_module_classes.add(_canonical)
+                                    _ensure_elem(cont, cname, _elem_attr_list(cont, i), _canonical, fname, phys_lineno, attrs)
+                                elif cls_ref in nn_module_classes:
                                     attrs.setdefault(cont, cls_ref)
                                     attr_def_loc.setdefault((cname, cont), (fname, phys_lineno))
                                     _ensure_elem(cont, cname, _elem_attr_list(cont, i), cls_ref, fname, phys_lineno, attrs)
@@ -9229,12 +9458,20 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                                 attr_def_loc.setdefault((cname, cont), (fname, phys_lineno))
                                 _ensure_elem(cont, cname, _elem_attr_dict(cont, k), cls_ref, fname, phys_lineno, attrs)
                 # ModuleList append: self.xxx.append(ClassName(...))
-                _ast_append_ctor = _parse_local_append_ctor(_local_stmt)
+                _ast_append_ctor = _fe.parse_local_append_ctor(_local_stmt) if _fe else None
                 if _ast_append_ctor:
                     attr_name = _ast_append_ctor.get("attr")
                     cls_ref_full = _ast_append_ctor.get("class_full") or ""
                     cls_ref = cls_ref_full.split('.')[-1]
-                    if cls_ref in nn_module_classes:
+                    _short, _canonical = _extract_nn_short(cls_ref_full, nn_import_aliases)
+                    if _short and _is_nn_leaf_stub(_short):
+                        attrs[attr_name] = _canonical
+                        attr_def_loc.setdefault((cname, attr_name), (fname, phys_lineno))
+                        torch_native_module_classes.add(_canonical)
+                        idx = len(container_elems[cname][attr_name])
+                        _ensure_elem(attr_name, cname, _elem_attr_list(attr_name, idx), _canonical, fname, phys_lineno, attrs)
+                        _record_container_kind(cname, attr_name, "list")
+                    elif cls_ref in nn_module_classes:
                         # 保留基线：container 名仍映射到子类
                         attrs[attr_name] = cls_ref
                         attr_def_loc.setdefault((cname, attr_name), (fname, phys_lineno))
@@ -9245,7 +9482,7 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                         # this attr, fall back to ``list`` (could be plain list of Modules).
                         _record_container_kind(cname, attr_name, "list")
                 # ModuleDict / list assignment: self.xxx[key] = ClassName(...)
-                _ast_subscript_ctor = _parse_local_subscript_ctor(_local_stmt)
+                _ast_subscript_ctor = _fe.parse_local_subscript_ctor(_local_stmt) if _fe else None
                 if _ast_subscript_ctor:
                     attr_name = _ast_subscript_ctor.get("attr")
                     key_expr = _ast_subscript_ctor.get("key_expr") or ""
@@ -9304,7 +9541,7 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                 #     combine_tower = DenseTower(...)
                 #     setattr(self, f"combine_tower_mha_{name}", combine_tower)
                 # is treated as a direct setattr-with-ctor.
-                _ast_local_ctor = _parse_local_var_ctor(_local_stmt)
+                _ast_local_ctor = _fe.parse_local_var_ctor(_local_stmt) if _fe else None
                 if _ast_local_ctor:
                     _lv_name = _ast_local_ctor.get("name")
                     _lv_cls = (_ast_local_ctor.get("class_full") or "").split('.')[-1]
@@ -9326,7 +9563,7 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                 # Iter16: also support the two-step pattern where the third
                 # argument is a bare local variable previously assigned via
                 # `<var> = ClassName(...)` (see _local_var_ctor above).
-                _ast_setattr_ctor = _parse_local_setattr_ctor(_local_stmt)
+                _ast_setattr_ctor = _fe.parse_local_setattr_ctor(_local_stmt) if _fe else None
                 _is_two_step = False
                 if _ast_setattr_ctor:
                     name_expr = (_ast_setattr_ctor.get("name_expr") or "").strip()
@@ -9341,7 +9578,25 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                         cls_ref_full = _ast_setattr_ctor.get("class_full") or ""
                     if cls_ref_full:
                         cls_ref = cls_ref_full.split('.')[-1]
-                        if cls_ref in nn_module_classes:
+                        _native_short, _native_canonical = _extract_nn_short(cls_ref_full, nn_import_aliases)
+                        if _native_short and _is_nn_leaf_stub(_native_short):
+                            # name literal: 'xxx' / "xxx" / f'xxx'(no {}) / f"xxx"(no {})
+                            real_attr = None
+                            try:
+                                _name_node = ast.parse(name_expr, mode='eval').body
+                            except SyntaxError:
+                                _name_node = None
+                            if isinstance(_name_node, ast.Constant) and isinstance(_name_node.value, str):
+                                real_attr = _name_node.value
+                            elif isinstance(_name_node, ast.JoinedStr):
+                                if all(isinstance(v, ast.Constant) and isinstance(v.value, str)
+                                       for v in _name_node.values):
+                                    real_attr = ''.join(v.value for v in _name_node.values)
+                            if real_attr:
+                                attrs[real_attr] = _native_canonical
+                                attr_def_loc.setdefault((cname, real_attr), (fname, phys_lineno))
+                                torch_native_module_classes.add(_native_canonical)
+                        elif cls_ref in nn_module_classes:
                             # name literal: 'xxx' / "xxx" / f'xxx'(no {}) / f"xxx"(no {})
                             real_attr = None
                             _fstr_handled = False
