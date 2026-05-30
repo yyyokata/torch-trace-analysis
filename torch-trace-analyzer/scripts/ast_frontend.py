@@ -1,14 +1,30 @@
 import ast
+import warnings
 from collections import defaultdict
 
 try:
     from scripts.ast_constants import ConstantTable
     from scripts.ast_resolver import ConstantResolver
     from scripts.ast_types import Scope
+    from scripts.attr_types import CallLoc, InputAttr
 except ModuleNotFoundError:
     from ast_constants import ConstantTable
     from ast_resolver import ConstantResolver
     from ast_types import Scope
+    from attr_types import CallLoc, InputAttr
+
+
+LG_FUNC_KINDS = {
+    "LG.feature_column": "feature_column",
+    "LG.feature_vector": "feature_vector",
+    "LG.sequence_feature": "sequence_feature",
+    "LG.dense_feature": "dense_feature",
+    "LG.get_sample_rate": "get_sample_rate",
+    "LG.get_bias": "get_bias",
+    "LG.label": "label",
+    "LG.slot": "slot",
+    "LG.global_step": "global_step",
+}
 
 
 class ASTFrontend:
@@ -1003,11 +1019,19 @@ class ASTFrontend:
         if not attr:
             return None
         func_text = self._local_node_to_text(stmt.value.func)
-        if func_text in {
-            "LG.feature_column", "LG.dense_feature", "LG.get_sample_rate", "LG.get_bias"
-        }:
-            return {"attr": attr}
-        return None
+        kind = LG_FUNC_KINDS.get(func_text)
+        if not kind:
+            return None
+        return {
+            "attr": attr,
+            "kind": kind,
+            "source_expr": self._local_node_to_text(stmt.value),
+            "call_loc": CallLoc(
+                file=self.path or "",
+                line=getattr(stmt, "lineno", 0) or 0,
+                col=getattr(stmt, "col_offset", 0) or 0,
+            ),
+        }
 
     def parse_local_fc_get_vector_assign(self, stmt):
         if not isinstance(stmt, ast.Assign) or not isinstance(stmt.value, ast.Call):
@@ -1033,7 +1057,61 @@ class ASTFrontend:
             return None
         if not ("dict" in owner_attr or "fc" in owner_attr):
             return None
-        return {"attr": attr}
+        slot_expr = self._local_node_to_text(owner.slice)
+        if isinstance(owner.slice, ast.Constant) and isinstance(owner.slice.value, str):
+            slot_expr = owner.slice.value
+        return {
+            "attr": attr,
+            "kind": "fc_get_vector",
+            "source_expr": self._local_node_to_text(stmt.value),
+            "owner_expr": owner_attr,
+            "slot_expr": slot_expr,
+            "call_loc": CallLoc(
+                file=self.path or "",
+                line=getattr(stmt, "lineno", 0) or 0,
+                col=getattr(stmt, "col_offset", 0) or 0,
+            ),
+        }
+
+    def get_input_attrs(self, class_name: str) -> dict:
+        """Scan __init__ assignments and return {attr_name: InputAttr}."""
+        result = {}
+        init_node = self._get_method_node(class_name, "__init__")
+        if init_node is None:
+            return result
+        nodes = sorted(
+            ast.walk(init_node),
+            key=lambda node: (
+                getattr(node, "lineno", 10 ** 9),
+                getattr(node, "col_offset", 10 ** 9),
+            ),
+        )
+        for stmt in nodes:
+            parsed = self.parse_local_lg_assign(stmt) or self.parse_local_fc_get_vector_assign(stmt)
+            if parsed is None:
+                continue
+            attr_name = parsed["attr"]
+            first_loc = self.get_first_call_loc(class_name, attr_name)
+            if first_loc is not None:
+                forward_use_loc = CallLoc(file=first_loc[0], line=first_loc[1], col=0)
+            else:
+                warnings.warn(
+                    f"InputAttr '{attr_name}' in '{class_name}': forward_use_loc not found in forward() or reachable helpers",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                forward_use_loc = None
+            result[attr_name] = InputAttr(
+                attr_name=attr_name,
+                class_name=class_name,
+                call_loc=parsed["call_loc"],
+                forward_use_loc=forward_use_loc,
+                kind=parsed.get("kind", ""),
+                source_expr=parsed.get("source_expr"),
+                owner_expr=parsed.get("owner_expr"),
+                slot_expr=parsed.get("slot_expr"),
+            )
+        return result
 
     def parse_local_container_ctor(self, stmt):
         if not isinstance(stmt, ast.Assign) or not isinstance(stmt.value, ast.Call):
