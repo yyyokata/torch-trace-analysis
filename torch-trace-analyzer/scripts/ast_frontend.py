@@ -6,12 +6,12 @@ try:
     from scripts.ast_constants import ConstantTable
     from scripts.ast_resolver import ConstantResolver
     from scripts.ast_types import Scope
-    from scripts.attr_types import CallLoc, InputAttr
+    from scripts.attr_types import CallLoc, InputAttr, ResultAttr
 except ModuleNotFoundError:
     from ast_constants import ConstantTable
     from ast_resolver import ConstantResolver
     from ast_types import Scope
-    from attr_types import CallLoc, InputAttr
+    from attr_types import CallLoc, InputAttr, ResultAttr
 
 
 LG_FUNC_KINDS = {
@@ -1112,6 +1112,208 @@ class ASTFrontend:
                 slot_expr=parsed.get("slot_expr"),
             )
         return result
+
+    def _extract_call_args_kwargs(self, call):
+        """
+        从 ast.Call 节点提取位置参数和关键字参数的文本表达式。
+        返回 (args: list[str], kwargs: dict[str, str])。
+        """
+        def _expr_text(node):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                return node.value
+            try:
+                return ast.unparse(node)
+            except Exception:
+                return self._node_to_text(node)
+
+        args = [_expr_text(arg) for arg in call.args]
+        kwargs = {
+            kw.arg: _expr_text(kw.value)
+            for kw in call.keywords
+            if kw.arg is not None
+        }
+        return args, kwargs
+
+    def _infer_head_name(self, args, kwargs):
+        """
+        head_name 推导：kwargs["name"] 优先，否则 args[0]（如果是字符串字面量）。
+        两者都没有则返回 None + warnings.warn。
+        """
+        if kwargs.get("name"):
+            return kwargs["name"]
+        if args:
+            return args[0]
+        warnings.warn(
+            "ResultAttr head_name missing: neither kwargs['name'] nor args[0] found",
+            UserWarning,
+            stacklevel=2,
+        )
+        return None
+
+    def _iter_reachable_method_nodes(self, class_name, entry_method="forward"):
+        """
+        从 entry_method 出发，遍历 class_name 中所有可 reach 的 self.xxx() 调用，
+        yield (method_name: str, method_node: ast.FunctionDef)。
+        包含 entry_method 自身。最多递归深度 5 层，防止循环。
+        """
+        info = self.class_registry.get(class_name)
+        if not info:
+            return
+        method_map = info.get("method_map", {})
+        if entry_method not in method_map:
+            return
+
+        visited = set()
+        ordered = []
+
+        def _dfs(method_name, depth):
+            if depth > 5 or method_name in visited:
+                return
+            method_node = self._get_method_node(class_name, method_name)
+            if method_node is None:
+                return
+            visited.add(method_name)
+            ordered.append((method_name, method_node))
+            if depth == 5:
+                return
+            calls = sorted(
+                (node for node in ast.walk(method_node) if isinstance(node, ast.Call)),
+                key=lambda node: (
+                    getattr(node, "lineno", 10 ** 9),
+                    getattr(node, "col_offset", 10 ** 9),
+                ),
+            )
+            for call in calls:
+                helper_name = self._extract_self_method_name(call.func)
+                if helper_name and helper_name in method_map:
+                    _dfs(helper_name, depth + 1)
+
+        _dfs(entry_method, 0)
+        for item in ordered:
+            yield item
+
+    def parse_local_result_assign(self, stmt):
+        """
+        识别 `result_var = LG.result()` 赋值语句。
+        返回 {"var": var_name, "source_expr": "LG.result()", "call_loc": CallLoc}，
+        或 None（不匹配时）。
+        """
+        if not isinstance(stmt, ast.Assign) or not isinstance(stmt.value, ast.Call):
+            return None
+        if len(stmt.targets) != 1 or not isinstance(stmt.targets[0], ast.Name):
+            return None
+        func_text = self._local_node_to_text(stmt.value.func)
+        if func_text != "LG.result":
+            return None
+        return {
+            "var": stmt.targets[0].id,
+            "source_expr": self._local_node_to_text(stmt.value),
+            "call_loc": CallLoc(
+                file=self.path or "",
+                line=getattr(stmt, "lineno", 0) or 0,
+                col=getattr(stmt, "col_offset", 0) or 0,
+            ),
+        }
+
+    def parse_result_head_call(self, stmt, result_vars, class_name):
+        """
+        识别 `xxx = result_var.head(name=..., prediction=..., ...)` 语句。
+        result_vars: 当前方法中已识别的 LG.result() 变量名集合。
+        返回 ResultAttr 或 None。
+
+        解析规则：
+        - name= → head_name（kwargs 优先，否则 args[0]）
+        - prediction= → prediction_expr（必填，缺失 warn）
+        - label= → label_expr
+        - sample_rate= → sample_rate_expr
+        - loss= → loss_expr
+        - classifier_type= → classifier_type
+        """
+        call = None
+        if isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Call):
+            call = stmt.value
+        elif isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
+            call = stmt.value
+        if call is None:
+            return None
+        func = call.func
+        if not (isinstance(func, ast.Attribute) and func.attr == "head"):
+            return None
+        if not isinstance(func.value, ast.Name):
+            return None
+        result_var = func.value.id
+        if result_var not in result_vars:
+            return None
+
+        args, kwargs = self._extract_call_args_kwargs(call)
+
+        def _pick_expr(name, pos_index):
+            if name in kwargs:
+                return kwargs[name]
+            if len(args) > pos_index:
+                return args[pos_index]
+            return None
+
+        head_name = self._infer_head_name(args, kwargs)
+        prediction_expr = _pick_expr("prediction", 1)
+        if prediction_expr is None:
+            warnings.warn(
+                f"ResultAttr '{result_var}' in '{class_name}': prediction_expr missing for result.head()",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        return ResultAttr(
+            attr_name=result_var,
+            class_name=class_name,
+            call_loc=CallLoc(
+                file=self.path or "",
+                line=getattr(stmt, "lineno", 0) or 0,
+                col=getattr(stmt, "col_offset", 0) or 0,
+            ),
+            source_expr=self._local_node_to_text(call),
+            head_name=head_name,
+            classifier_type=_pick_expr("classifier_type", 5),
+            prediction_expr=prediction_expr,
+            label_expr=_pick_expr("label", 2),
+            sample_rate_expr=_pick_expr("sample_rate", 3),
+            loss_expr=_pick_expr("loss", 4),
+        )
+
+    def get_result_attrs(self, class_name):
+        """
+        扫描 class_name 的 forward + reachable helpers，
+        识别所有 LG.result() 变量和对应的 result.head(...) 调用。
+        返回 {result_var_name: [ResultAttr, ...]}。
+        找不到任何 LG.result() 时返回 {}。
+        """
+        grouped = defaultdict(list)
+        found_result_var = False
+        for _method_name, method_node in self._iter_reachable_method_nodes(class_name, entry_method="forward"):
+            nodes = sorted(
+                ast.walk(method_node),
+                key=lambda node: (
+                    getattr(node, "lineno", 10 ** 9),
+                    getattr(node, "col_offset", 10 ** 9),
+                ),
+            )
+            result_vars = set()
+            for stmt in nodes:
+                parsed = self.parse_local_result_assign(stmt)
+                if parsed is None:
+                    continue
+                found_result_var = True
+                result_vars.add(parsed["var"])
+            if not result_vars:
+                continue
+            for stmt in nodes:
+                parsed = self.parse_result_head_call(stmt, result_vars, class_name)
+                if parsed is None:
+                    continue
+                grouped[parsed.attr_name].append(parsed)
+        if not found_result_var:
+            return {}
+        return dict(grouped)
 
     def parse_local_container_ctor(self, stmt):
         if not isinstance(stmt, ast.Assign) or not isinstance(stmt.value, ast.Call):

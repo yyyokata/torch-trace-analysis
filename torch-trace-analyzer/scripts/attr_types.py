@@ -84,6 +84,13 @@ class InputAttr(Attr):
         self.slot_expr = slot_expr
 
 class ResultAttr(Attr):
+    """
+    result.head(name, prediction, label, sample_rate, loss, classifier_type) 的解析结果。
+    - head_name / classifier_type：属性类，描述 head 元信息
+    - *_expr：输出 tensor 表达式原文，各自独立走 var_lineage 追踪用于建 edge
+    - prediction_expr 必填（None 说明解析失败，已 warn）
+    """
+
     def __init__(
         self,
         attr_name: str,
@@ -92,14 +99,18 @@ class ResultAttr(Attr):
         parent: Optional["ContainerAttr"] = None,
         source_expr: Optional[str] = None,
         head_name: Optional[str] = None,
-        args=None,
-        kwargs=None,
-        carrier_expr: Optional[str] = None,
+        classifier_type: Optional[str] = None,
+        prediction_expr: Optional[str] = None,
+        label_expr: Optional[str] = None,
+        sample_rate_expr: Optional[str] = None,
+        loss_expr: Optional[str] = None,
     ):
         super().__init__(attr_name, class_name, call_loc, parent, source_expr=source_expr)
         self.head_name = head_name
-        self.args = list(args) if args is not None else []
-        self.kwargs = dict(kwargs) if kwargs is not None else {}
-        self.carrier_expr = carrier_expr
+        self.classifier_type = classifier_type
+        self.prediction_expr = prediction_expr
+        self.label_expr = label_expr
+        self.sample_rate_expr = sample_rate_expr
+        self.loss_expr = loss_expr
 
 AttrType = Union[ModuleAttr, ContainerAttr, InputAttr, ResultAttr]

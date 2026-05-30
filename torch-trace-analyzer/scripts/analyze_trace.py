@@ -8619,6 +8619,15 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
     # Stash input_source_attrs on the tree for downstream consumers
     for cname in tree:
         tree[cname]["input_source_attrs"] = input_source_attrs.get(cname, set())
+        for (fname, cm_name), _cm_info in class_map.items():
+            if cm_name != cname:
+                continue
+            _fe = _get_ast_frontend(fname)
+            if _fe:
+                result_attrs = _fe.get_result_attrs(cname)
+                if result_attrs:
+                    tree[cname]["result_attrs"] = result_attrs
+            break
         tree[cname]["static_diagnostics"] = list(_new_eval_diagnostics)
 
     # Iter14 container-group: stash recorded container kinds on the tree so the
