@@ -105,6 +105,10 @@ class ConstantTable:
         # Used by Pass 2 to converge to a globally-unique int.  Not part of
         # the 14 public tables.
         self._global_int_candidates: Dict[str, Set[int]] = {}
+        # Dataclass class-name occurrence count across files. Pass 4 only
+        # propagates dataclass field chains when the ctor name is globally
+        # unique; same-name cross-file definitions must conservatively fail.
+        self._dataclass_name_counts: Dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # Public build entry point
@@ -163,6 +167,7 @@ class ConstantTable:
                 self._record_file_const(fname, node.target.id, node.value)
             elif isinstance(node, ast.ClassDef):
                 if self._is_dataclass(node):
+                    self._dataclass_name_counts[node.name] = self._dataclass_name_counts.get(node.name, 0) + 1
                     self._scan_dataclass_defaults(fname, node)
 
     def _record_file_const(self, fname: str, name: str, value_node: ast.expr) -> None:
@@ -420,6 +425,10 @@ class ConstantTable:
                     value = sub.value
                 if target is None or value is None:
                     continue
+                if isinstance(value, ast.Call):
+                    cls_name = self._call_class_name(value.func)
+                    if cls_name is None or self._dataclass_name_counts.get(cls_name, 0) != 1:
+                        continue
                 fields = resolver.eval_dataclass_fields(value, scope)
                 if fields:
                     out[target.id] = fields
@@ -635,6 +644,9 @@ class ConstantTable:
                                        expr_node: ast.expr,
                                        scope_key: Tuple[str, str, str]) -> Optional[Dict[str, IntValue]]:
         if not isinstance(expr_node, ast.Call):
+            return None
+        cls_name = self._call_class_name(expr_node.func)
+        if cls_name is None or self._dataclass_name_counts.get(cls_name, 0) != 1:
             return None
         fname, cname, mname = scope_key
         from ast_resolver import ConstantResolver
