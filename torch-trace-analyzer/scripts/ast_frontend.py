@@ -1003,10 +1003,17 @@ class ASTFrontend:
         attr = self._extract_self_attr_name(target)
         if not attr:
             return None
+        class_full = self._local_node_to_text(stmt.value.func)
         return {
             "attr": attr,
-            "class_full": self._local_node_to_text(stmt.value.func),
+            "class_full": class_full,
             "kwargs": {kw.arg: self._local_node_to_text(kw.value) for kw in stmt.value.keywords if kw.arg is not None},
+            "def_loc": CallLoc(
+                file=self.path or "",
+                line=getattr(stmt, "lineno", 0) or 0,
+                col=getattr(stmt, "col_offset", 0) or 0,
+            ),
+            "is_native": class_full.startswith(("nn.", "torch.nn.")),
         }
 
     def parse_local_lg_assign(self, stmt):
@@ -1026,11 +1033,12 @@ class ASTFrontend:
             "attr": attr,
             "kind": kind,
             "source_expr": self._local_node_to_text(stmt.value),
-            "call_loc": CallLoc(
+            "def_loc": CallLoc(
                 file=self.path or "",
                 line=getattr(stmt, "lineno", 0) or 0,
                 col=getattr(stmt, "col_offset", 0) or 0,
             ),
+            "is_native": False,
         }
 
     def parse_local_fc_get_vector_assign(self, stmt):
@@ -1066,11 +1074,12 @@ class ASTFrontend:
             "source_expr": self._local_node_to_text(stmt.value),
             "owner_expr": owner_attr,
             "slot_expr": slot_expr,
-            "call_loc": CallLoc(
+            "def_loc": CallLoc(
                 file=self.path or "",
                 line=getattr(stmt, "lineno", 0) or 0,
                 col=getattr(stmt, "col_offset", 0) or 0,
             ),
+            "is_native": False,
         }
 
     def get_input_attrs(self, class_name: str) -> dict:
@@ -1104,12 +1113,13 @@ class ASTFrontend:
             result[attr_name] = InputAttr(
                 attr_name=attr_name,
                 class_name=class_name,
-                call_loc=parsed["call_loc"],
+                def_loc=parsed["def_loc"],
                 forward_use_loc=forward_use_loc,
                 kind=parsed.get("kind", ""),
                 source_expr=parsed.get("source_expr"),
                 owner_expr=parsed.get("owner_expr"),
                 slot_expr=parsed.get("slot_expr"),
+                is_native=parsed.get("is_native", False),
             )
         return result
 
@@ -1195,7 +1205,7 @@ class ASTFrontend:
     def parse_local_result_assign(self, stmt):
         """
         识别 `result_var = LG.result()` 赋值语句。
-        返回 {"var": var_name, "source_expr": "LG.result()", "call_loc": CallLoc}，
+        返回 {"var": var_name, "source_expr": "LG.result()", "def_loc": CallLoc}，
         或 None（不匹配时）。
         """
         if not isinstance(stmt, ast.Assign) or not isinstance(stmt.value, ast.Call):
@@ -1205,20 +1215,21 @@ class ASTFrontend:
         func_text = self._local_node_to_text(stmt.value.func)
         if func_text != "LG.result":
             return None
+        loc = CallLoc(
+            file=self.path or "",
+            line=getattr(stmt, "lineno", 0) or 0,
+            col=getattr(stmt, "col_offset", 0) or 0,
+        )
         return {
             "var": stmt.targets[0].id,
             "source_expr": self._local_node_to_text(stmt.value),
-            "call_loc": CallLoc(
-                file=self.path or "",
-                line=getattr(stmt, "lineno", 0) or 0,
-                col=getattr(stmt, "col_offset", 0) or 0,
-            ),
+            "def_loc": loc,
         }
 
-    def parse_result_head_call(self, stmt, result_vars, class_name):
+    def parse_result_head_call(self, stmt, result_defs, class_name):
         """
         识别 `xxx = result_var.head(name=..., prediction=..., ...)` 语句。
-        result_vars: 当前方法中已识别的 LG.result() 变量名集合。
+        result_defs: 当前方法中已识别的 LG.result() 变量名到 def_loc 的映射。
         返回 ResultAttr 或 None。
 
         解析规则：
@@ -1234,6 +1245,8 @@ class ASTFrontend:
             call = stmt.value
         elif isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
             call = stmt.value
+        elif isinstance(stmt, ast.Return) and isinstance(stmt.value, ast.Call):
+            call = stmt.value
         if call is None:
             return None
         func = call.func
@@ -1242,7 +1255,7 @@ class ASTFrontend:
         if not isinstance(func.value, ast.Name):
             return None
         result_var = func.value.id
-        if result_var not in result_vars:
+        if result_var not in result_defs:
             return None
 
         args, kwargs = self._extract_call_args_kwargs(call)
@@ -1263,14 +1276,20 @@ class ASTFrontend:
                 stacklevel=2,
             )
 
+        head_call_loc = CallLoc(
+            file=self.path or "",
+            line=getattr(stmt, "lineno", 0) or 0,
+            col=getattr(stmt, "col_offset", 0) or 0,
+        )
+        if isinstance(result_defs, dict):
+            def_loc = result_defs[result_var]
+        else:
+            def_loc = head_call_loc
         return ResultAttr(
             attr_name=result_var,
             class_name=class_name,
-            call_loc=CallLoc(
-                file=self.path or "",
-                line=getattr(stmt, "lineno", 0) or 0,
-                col=getattr(stmt, "col_offset", 0) or 0,
-            ),
+            def_loc=def_loc,
+            head_call_loc=head_call_loc,
             source_expr=self._local_node_to_text(call),
             head_name=head_name,
             classifier_type=_pick_expr("classifier_type", 5),
@@ -1297,17 +1316,17 @@ class ASTFrontend:
                     getattr(node, "col_offset", 10 ** 9),
                 ),
             )
-            result_vars = set()
+            result_defs = {}
             for stmt in nodes:
                 parsed = self.parse_local_result_assign(stmt)
                 if parsed is None:
                     continue
                 found_result_var = True
-                result_vars.add(parsed["var"])
-            if not result_vars:
+                result_defs[parsed["var"]] = parsed["def_loc"]
+            if not result_defs:
                 continue
             for stmt in nodes:
-                parsed = self.parse_result_head_call(stmt, result_vars, class_name)
+                parsed = self.parse_result_head_call(stmt, result_defs, class_name)
                 if parsed is None:
                     continue
                 grouped[parsed.attr_name].append(parsed)
@@ -1327,7 +1346,17 @@ class ASTFrontend:
         func_leaf = (self._expr_leaf_name(stmt.value.func) or "").split(".")[-1]
         if func_leaf not in {"ModuleList", "ModuleDict"}:
             return None
-        return {"attr": attr, "kind": func_leaf, "call": stmt.value}
+        return {
+            "attr": attr,
+            "kind": func_leaf,
+            "call": stmt.value,
+            "def_loc": CallLoc(
+                file=self.path or "",
+                line=getattr(stmt, "lineno", 0) or 0,
+                col=getattr(stmt, "col_offset", 0) or 0,
+            ),
+            "is_native": True,
+        }
 
     def parse_local_append_ctor(self, stmt):
         if not isinstance(stmt, ast.Expr) or not isinstance(stmt.value, ast.Call):
@@ -1340,9 +1369,16 @@ class ASTFrontend:
             return None
         if len(call.args) != 1 or not isinstance(call.args[0], ast.Call):
             return None
+        class_full = self._local_node_to_text(call.args[0].func)
         return {
             "attr": owner.attr,
-            "class_full": self._local_node_to_text(call.args[0].func),
+            "class_full": class_full,
+            "def_loc": CallLoc(
+                file=self.path or "",
+                line=getattr(stmt, "lineno", 0) or 0,
+                col=getattr(stmt, "col_offset", 0) or 0,
+            ),
+            "is_native": class_full.startswith(("nn.", "torch.nn.")),
         }
 
     def parse_local_subscript_ctor(self, stmt):
@@ -1354,10 +1390,23 @@ class ASTFrontend:
         owner = target.value
         if not (isinstance(owner, ast.Attribute) and isinstance(owner.value, ast.Name) and owner.value.id == "self"):
             return None
+        key_expr = self._local_node_to_text(target.slice)
+        if isinstance(target.slice, ast.Constant) and isinstance(target.slice.value, (str, int)):
+            container_index = target.slice.value
+        else:
+            container_index = key_expr
+        class_full = self._local_node_to_text(stmt.value.func)
         return {
             "attr": owner.attr,
-            "key_expr": self._local_node_to_text(target.slice),
-            "class_full": self._local_node_to_text(stmt.value.func),
+            "key_expr": key_expr,
+            "class_full": class_full,
+            "def_loc": CallLoc(
+                file=self.path or "",
+                line=getattr(stmt, "lineno", 0) or 0,
+                col=getattr(stmt, "col_offset", 0) or 0,
+            ),
+            "is_native": class_full.startswith(("nn.", "torch.nn.")),
+            "container_index": container_index,
         }
 
     def parse_local_var_ctor(self, stmt):
