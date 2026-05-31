@@ -110,6 +110,7 @@ class MatchResult:
     reason: str
     matched_frame: object
     candidates: list
+    node_id: object = None
 
 
 def extract_instance_suffix(event_name: str) -> str:
@@ -369,6 +370,16 @@ def build_loc_index(dag):
     return dict(loc_index)
 
 
+def _lookup_node_id_from_callsite(dag, frame):
+    callsite_index = getattr(dag, "callsite_index", None)
+    if not callsite_index or frame is None:
+        return None
+    file_path, line = _frame_file_line(frame)
+    if line is None:
+        return None
+    return callsite_index.get((os.path.basename(str(file_path or "")), line))
+
+
 def match_kernel_to_instance(chain, loc_index, dag) -> MatchResult:
     matched = []
     for depth, frame in enumerate(chain.frames or []):
@@ -387,22 +398,24 @@ def match_kernel_to_instance(chain, loc_index, dag) -> MatchResult:
     # depth is the deepest / innermost matched frame.
     depth, frame, candidates = max(matched, key=lambda item: item[0])
 
+    node_id = _lookup_node_id_from_callsite(dag, frame)
+
     for class_name, attr_name in candidates:
         if attr_name == "<self>":
             file_path, line = _frame_file_line(frame)
-            return MatchResult((class_name, "<self>", line or 0, ()), "matched_self_forward_frame", frame, candidates)
+            return MatchResult((class_name, "<self>", line or 0, ()), "matched_self_forward_frame", frame, candidates, node_id=node_id)
         parent_key = _resolve_attr_instance_key(dag, class_name, attr_name, frame, chain, depth)
         instance_suffix = getattr(chain, "instance_suffix", "") or ""
         if instance_suffix == "":
-            return MatchResult(parent_key, "matched_without_instance_suffix", frame, candidates)
+            return MatchResult(parent_key, "matched_without_instance_suffix", frame, candidates, node_id=node_id)
 
         index = _parse_instance_suffix(instance_suffix)
         if index is None:
-            return MatchResult(parent_key, "instance_suffix_index_missing_fallback_to_parent_group", frame, candidates)
+            return MatchResult(parent_key, "instance_suffix_index_missing_fallback_to_parent_group", frame, candidates, node_id=node_id)
         child_attr_name = _make_indexed_attr_name(attr_name, index)
         child_key = _resolve_attr_instance_key(dag, class_name, child_attr_name, frame, chain, depth)
         if child_key[0] != class_name or _lookup_child_class_from_static_tree(dag, class_name, child_attr_name):
-            return MatchResult(child_key, "matched_with_instance_suffix", frame, candidates)
+            return MatchResult(child_key, "matched_with_instance_suffix", frame, candidates, node_id=node_id)
 
         file_path, line = _frame_file_line(frame)
         LOG.error(
@@ -416,9 +429,9 @@ def match_kernel_to_instance(chain, loc_index, dag) -> MatchResult:
             os.path.basename(str(file_path or "")),
             line,
         )
-        return MatchResult(parent_key, "instance_suffix_index_missing_fallback_to_parent_group", frame, candidates)
+        return MatchResult(parent_key, "instance_suffix_index_missing_fallback_to_parent_group", frame, candidates, node_id=node_id)
 
-    return MatchResult("__unattributed__", "matched_frame_but_no_resolvable_candidate", frame, candidates)
+    return MatchResult("__unattributed__", "matched_frame_but_no_resolvable_candidate", frame, candidates, node_id=node_id)
 
 
 def _parse_user_frames(traces, source_files):
@@ -1156,6 +1169,7 @@ def build_kernel_attribution_table(events, source_files, class_map, step_infos, 
         # This makes 1 kernel × N traces equivalent to N kernels each
         # attributed once, as required by the timing contract.
         hit_counts = {}
+        node_ids = {}
         total_hits = 0
         for chain in chains:
             kernel_chain = KernelChain(
@@ -1168,6 +1182,8 @@ def build_kernel_attribution_table(events, source_files, class_map, step_infos, 
             if result.instance_key == "__unattributed__":
                 continue
             hit_counts[result.instance_key] = hit_counts.get(result.instance_key, 0) + 1
+            if result.node_id is not None:
+                node_ids.setdefault(result.instance_key, result.node_id)
             total_hits += 1
 
         if total_hits == 0:
@@ -1197,6 +1213,9 @@ def build_kernel_attribution_table(events, source_files, class_map, step_infos, 
 
         # Normalize hit counts to weights summing to 1.0.
         attribution[idx] = {k: cnt / total_hits for k, cnt in hit_counts.items()}
+        node_id_map = {k: node_ids.get(k) for k in hit_counts}
+        if any(nid is not None for nid in node_id_map.values()):
+            attribution.setdefault("_node_ids", {})[idx] = node_id_map
         if is_bwd:
             stats["bwd_attributed"] += 1
         else:
@@ -1219,10 +1238,12 @@ def rollup_instance_timing(kernel_attribution, events, step_infos, class_map, ro
         "self_us": {"forward","backward","optimize","other"},
         "inclusive_us": {"forward","backward","optimize","other"},
         "child_keys": set,
+        "node_id": optional DagContext node id,
     }
     """
     num_steps = max(1, len(step_infos))
     timings = {}
+    node_id_by_kernel = kernel_attribution.get("_node_ids", {}) if isinstance(kernel_attribution, dict) else {}
 
     def _ensure(key):
         if key not in timings:
@@ -1240,14 +1261,24 @@ def rollup_instance_timing(kernel_attribution, events, step_infos, class_map, ro
 
     # Phase A: self_us
     for idx, weights in kernel_attribution.items():
+        if idx == "_node_ids":
+            continue
         e = events[idx]
         dur = float(e.get("dur") or 0.0)
         ts = float(e.get("ts") or 0.0)
         phase = classify_kernel_phase(ts, ts + dur, step_infos)
         if phase not in ("forward", "backward", "optimize", "other"):
             phase = "other"
-        for key, w in weights.items():
+        for key, entry in weights.items():
+            if isinstance(entry, dict):
+                w = entry.get("weight", 0.0)
+                node_id = entry.get("node_id")
+            else:
+                w = entry
+                node_id = node_id_by_kernel.get(idx, {}).get(key)
             rec = _ensure(key)
+            if node_id is not None:
+                rec["node_id"] = node_id
             rec["self_us"][phase] += dur * w
 
     # Divide by num_steps for per-step average.
@@ -1322,6 +1353,18 @@ def rollup_instance_timing(kernel_attribution, events, step_infos, class_map, ro
                         timings[primary_root_key]["inclusive_us"][ph] += v
 
     return timings
+
+
+def write_timing_metadata_to_dag(dag, result_dict):
+    if not hasattr(dag, "registry"):
+        return
+    for _key, record in result_dict.items():
+        nid = record.get("node_id")
+        if nid is not None:
+            node = dag.registry.get(nid)
+            if node is not None:
+                node.metadata["self_us"] = record.get("self_us", {})
+                node.metadata["inclusive_us"] = record.get("inclusive_us", {})
 
 
 # --------------------------------------------------------------------------

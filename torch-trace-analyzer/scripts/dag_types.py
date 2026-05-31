@@ -10,6 +10,7 @@ DAG IR 数据结构定义。
 """
 
 from __future__ import annotations
+import os
 from dataclasses import dataclass, field
 from typing import Optional, TYPE_CHECKING
 
@@ -44,10 +45,11 @@ class VarEvidence:
 
 @dataclass
 class DagNode:
-    """DAG 节点基类（三字段，剃刀原则）。"""
+    """DAG 节点基类。"""
     node_id  : int
     call_loc : CallLoc
     attr     : Attr
+    metadata : dict = field(default_factory=dict)
 
 
 @dataclass
@@ -99,6 +101,14 @@ class DAG:
             self.out_edges.setdefault(e.src_id, []).append(e)
             self.in_edges.setdefault(e.dst_id, []).append(e)
 
+    def walk_bottom_up(self, registry: dict):
+        """后序遍历（叶子优先）当前层及所有嵌套 inner_dag 的 ModuleNode node_id。"""
+        for node_id in self.nodes:
+            node = registry[node_id]
+            if isinstance(node, ModuleNode) and node.inner_dag:
+                yield from node.inner_dag.walk_bottom_up(registry)
+            yield node_id
+
 
 # ── DagContext ─────────────────────────────────────────────────────────────────
 
@@ -117,3 +127,6 @@ class DagContext:
         for node_id, node in self.registry.items():
             key = (node.call_loc.file, node.call_loc.line, node.attr.attr_id)
             self.loc_attr_index[key] = node_id
+        self.callsite_index: dict = {}
+        for (file, line, _attr_id), node_id in self.loc_attr_index.items():
+            self.callsite_index[(os.path.basename(file), line)] = node_id
