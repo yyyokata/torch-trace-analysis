@@ -1,146 +1,238 @@
 import ast
-import os
-from typing import List, Dict, Optional
-from attr_types import CallLoc, InputAttr, ResultAttr
+from typing import Optional
+
+from attr_types import (
+    AttrType,
+    CallLoc,
+    ContainerAttr,
+    ForwardArgAttr,
+    InputAttr,
+    ModuleAttr,
+    ResultAttr,
+    ReturnValAttr,
+)
+from ast_frontend import ASTFrontend
 
 
-class AttrScanner(ast.NodeVisitor):
-    def __init__(self, file_path: str):
-        self.file_path = file_path
-        self.current_class: Optional[str] = None
-        self.inputs: Dict[str, InputAttr] = {}
-        self.results: List[ResultAttr] = []
+class AttrScanner:
+    _LG_PREFIXES = {"LG."}
+    _CONTAINER_LEAF_NAMES = {"ModuleList", "ModuleDict", "Sequential"}
+    _LG_RESULT_FUNC_NAME = "result"
+    _HEAD_METHOD = "head"
+    _NATIVE_MODULE_PREFIXES = ("nn.", "torch.nn.")
 
-        # (class_name, attr_name) -> (def_loc, kind)
-        self._potential_inputs: Dict[tuple[Optional[str], str], tuple[CallLoc, str]] = {}
-        # (class_name, var_name) -> def_loc
-        self._potential_results: Dict[tuple[Optional[str], str], CallLoc] = {}
+    def __init__(self):
+        self._attr_id_counter = 0
+        self.attrs_by_id: dict[int, AttrType] = {}
 
-        self.lg_funcs = {
-            "dense_feature", "feature_column", "label", "get_sample_rate",
-            "get_bias", "slot", "global_step", "get_sample_bias", "group_candidate_size"
+    def _next_id(self) -> int:
+        self._attr_id_counter += 1
+        return self._attr_id_counter
+
+    def _register(self, attr: AttrType) -> AttrType:
+        attr.attr_id = self._next_id()
+        self.attrs_by_id[attr.attr_id] = attr
+        return attr
+
+    def scan_class(self, class_name: str, fe: ASTFrontend) -> dict[str, list[AttrType]]:
+        return {
+            "inputs": self._scan_input_attrs(class_name, fe),
+            "modules": self._scan_module_attrs(class_name, fe),
+            "containers": self._scan_container_attrs(class_name, fe),
+            "results": self._scan_result_attrs(class_name, fe),
+            "forward_args": self._scan_forward_arg_attrs(class_name, fe),
+            "return_vals": self._scan_return_val_attrs(class_name, fe),
         }
 
-    def _get_def_loc(self, node: ast.AST) -> CallLoc:
-        return CallLoc(file=self.file_path, line=node.lineno, col=node.col_offset)
+    def _scan_input_attrs(self, class_name: str, fe: ASTFrontend) -> list[InputAttr]:
+        attrs: list[InputAttr] = []
+        for stmt in fe.iter_init_stmts(class_name) or []:
+            matched = fe.match_self_attr_call_assign(stmt, func_prefixes=self._LG_PREFIXES)
+            if matched is None:
+                continue
+            attr_name, call = matched
+            func_text = fe.match_call_by_func(call, func_prefixes=self._LG_PREFIXES)
+            if func_text is None:
+                continue
+            attrs.append(
+                self._register(
+                    InputAttr(
+                        attr_name=attr_name,
+                        class_name=class_name,
+                        def_loc=fe._node_loc(stmt),
+                        kind=func_text.split(".")[-1],
+                        source_expr=fe._local_node_to_text(call),
+                        is_native=False,
+                    )
+                )
+            )
+        return attrs
 
-    def visit_ClassDef(self, node: ast.ClassDef):
-        old_class = self.current_class
-        self.current_class = node.name
-        self.generic_visit(node)
-        self.current_class = old_class
+    def _scan_module_attrs(self, class_name: str, fe: ASTFrontend) -> list[ModuleAttr]:
+        attrs: list[ModuleAttr] = []
+        for stmt in fe.iter_init_stmts(class_name) or []:
+            matched = fe.match_self_attr_call_assign(stmt)
+            if matched is None:
+                continue
+            attr_name, call = matched
+            if fe.match_call_by_func(call, func_prefixes=self._LG_PREFIXES) is not None:
+                continue
+            leaf_name = (fe._expr_leaf_name(call.func) or "").split(".")[-1]
+            if leaf_name in self._CONTAINER_LEAF_NAMES:
+                continue
+            func_text = fe.call_func_text(call)
+            attrs.append(
+                self._register(
+                    ModuleAttr(
+                        attr_name=attr_name,
+                        class_name=class_name,
+                        def_loc=fe._node_loc(stmt),
+                        source_expr=fe._local_node_to_text(call),
+                        is_native=func_text.startswith(self._NATIVE_MODULE_PREFIXES),
+                    )
+                )
+            )
+        return attrs
 
-    def visit_Assign(self, node: ast.Assign):
-        if not isinstance(node.value, ast.Call):
-            self.generic_visit(node)
-            return
+    def _scan_container_attrs(self, class_name: str, fe: ASTFrontend) -> list[ContainerAttr]:
+        attrs: list[ContainerAttr] = []
+        for stmt in fe.iter_init_stmts(class_name) or []:
+            matched = fe.match_self_attr_call_assign(stmt, func_names=self._CONTAINER_LEAF_NAMES)
+            if matched is None:
+                continue
+            attr_name, call = matched
+            container_kind = (fe._expr_leaf_name(call.func) or "").split(".")[-1]
+            attrs.append(
+                self._register(
+                    ContainerAttr(
+                        attr_name=attr_name,
+                        class_name=class_name,
+                        def_loc=fe._node_loc(stmt),
+                        container_kind=container_kind,
+                        source_expr=fe._local_node_to_text(call),
+                    )
+                )
+            )
+        return attrs
 
-        call = node.value
-        kind = self._get_lg_func_kind(call)
-        if kind:
-            for target in node.targets:
-                attr_name = None
-                if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name) and target.value.id == "self":
-                    attr_name = target.attr
-                elif isinstance(target, ast.Name):
-                    attr_name = target.id
+    def _scan_result_attrs(self, class_name: str, fe: ASTFrontend) -> list[ResultAttr]:
+        method_node = fe._get_method_node(class_name, "forward")
+        if method_node is None:
+            return []
+        result_defs: dict[str, CallLoc] = {}
+        results: list[ResultAttr] = []
+        stmts = self._sorted_stmts(method_node)
+        for stmt in stmts:
+            target = fe.stmt_assign_target(stmt)
+            call = fe.stmt_assign_call_value(stmt)
+            if target is not None and call is not None and isinstance(target, ast.Name):
+                if fe.match_call_by_func(
+                    call,
+                    func_prefixes=self._LG_PREFIXES,
+                    func_names={self._LG_RESULT_FUNC_NAME},
+                ) is not None:
+                    result_defs[target.id] = fe._node_loc(stmt)
+                    continue
+            matched = fe.match_expr_or_stmt_call(stmt, func_attr=self._HEAD_METHOD)
+            if matched is None:
+                continue
+            owner_text, head_call = matched
+            if owner_text not in result_defs:
+                continue
+            args = fe.call_arg_texts(head_call)
+            kwargs = fe.call_kwarg_texts(head_call)
+            results.append(
+                self._register(
+                    ResultAttr(
+                        attr_name=owner_text,
+                        class_name=class_name,
+                        def_loc=result_defs[owner_text],
+                        source_expr=fe._local_node_to_text(head_call),
+                        head_name=kwargs.get("name") or self._arg_at(args, 0),
+                        classifier_type=kwargs.get("classifier_type") or self._arg_at(args, 5),
+                        prediction_expr=kwargs.get("prediction") or self._arg_at(args, 1),
+                        label_expr=kwargs.get("label") or self._arg_at(args, 2),
+                        sample_rate_expr=kwargs.get("sample_rate") or self._arg_at(args, 3),
+                        loss_expr=kwargs.get("loss") or self._arg_at(args, 4),
+                        is_native=False,
+                    )
+                )
+            )
+        return results
 
-                if attr_name:
-                    def_loc = self._get_def_loc(node)
-                    self._potential_inputs[(self.current_class, attr_name)] = (def_loc, kind)
-            self.generic_visit(node)
-            return
+    def _scan_forward_arg_attrs(self, class_name: str, fe: ASTFrontend) -> list[ForwardArgAttr]:
+        method_node = fe._get_method_node(class_name, "forward")
+        if method_node is None:
+            return []
+        args = list(method_node.args.args)
+        if args and args[0].arg == "self":
+            args = args[1:]
+        return [
+            self._register(
+                ForwardArgAttr(
+                    attr_name=arg.arg,
+                    class_name=class_name,
+                    def_loc=fe._node_loc(arg),
+                    arg_index=index,
+                )
+            )
+            for index, arg in enumerate(args)
+        ]
 
-        if self._is_lg_result_call(call):
-            for target in node.targets:
-                if isinstance(target, ast.Name):
-                    self._potential_results[(self.current_class, target.id)] = self._get_def_loc(node)
+    def _scan_return_val_attrs(self, class_name: str, fe: ASTFrontend) -> list[ReturnValAttr]:
+        method_node = fe._get_method_node(class_name, "forward")
+        if method_node is None:
+            return []
+        attrs: list[ReturnValAttr] = []
+        for return_node in self._sorted_returns(method_node):
+            if return_node.value is None:
+                continue
+            if isinstance(return_node.value, ast.Tuple):
+                for index, _elt in enumerate(return_node.value.elts):
+                    attrs.append(
+                        self._register(
+                            ReturnValAttr(
+                                attr_name=f"return_{index}",
+                                class_name=class_name,
+                                def_loc=fe._node_loc(return_node),
+                                ret_index=index,
+                            )
+                        )
+                    )
+                continue
+            attrs.append(
+                self._register(
+                    ReturnValAttr(
+                        attr_name="return_0",
+                        class_name=class_name,
+                        def_loc=fe._node_loc(return_node),
+                        ret_index=0,
+                    )
+                )
+            )
+        return attrs
 
-        self.generic_visit(node)
-
-    def _get_lg_func_kind(self, call: ast.Call) -> Optional[str]:
-        func = call.func
-        if isinstance(func, ast.Attribute):
-            if isinstance(func.value, ast.Name) and func.value.id == "LG":
-                if func.attr in self.lg_funcs:
-                    return func.attr
-        return None
-
-    def _is_lg_result_call(self, call: ast.Call) -> bool:
-        func = call.func
-        return (
-            isinstance(func, ast.Attribute)
-            and isinstance(func.value, ast.Name)
-            and func.value.id == "LG"
-            and func.attr == "result"
+    def _sorted_stmts(self, method_node: ast.AST) -> list[ast.stmt]:
+        stmts = [node for node in ast.walk(method_node) if isinstance(node, ast.stmt)]
+        return sorted(
+            stmts,
+            key=lambda node: (
+                getattr(node, "lineno", 10**9),
+                getattr(node, "col_offset", 10**9),
+            ),
         )
 
-    def visit_Call(self, node: ast.Call):
-        if self._is_lg_result_head(node):
-            result_var = "result"
-            head_call_loc = self._get_def_loc(node)
-            func = node.func
-            if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
-                result_var = func.value.id
-                def_loc = self._potential_results.get(
-                    (self.current_class, result_var),
-                    head_call_loc,
-                )
-            else:
-                def_loc = head_call_loc
-            self.results.append(ResultAttr(
-                attr_name=result_var,
-                class_name=self.current_class or "global",
-                def_loc=def_loc,
-            ))
+    def _sorted_returns(self, method_node: ast.AST) -> list[ast.Return]:
+        returns = [node for node in ast.walk(method_node) if isinstance(node, ast.Return)]
+        return sorted(
+            returns,
+            key=lambda node: (
+                getattr(node, "lineno", 10**9),
+                getattr(node, "col_offset", 10**9),
+            ),
+        )
 
-        attr_name = None
-        if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name) and node.func.value.id == "self":
-            attr_name = node.func.attr
-        elif isinstance(node.func, ast.Name):
-            attr_name = node.func.id
-
-        if attr_name:
-            key = (self.current_class, attr_name)
-            if key in self._potential_inputs and attr_name not in self.inputs:
-                def_loc, kind = self._potential_inputs[key]
-                self.inputs[attr_name] = InputAttr(
-                    attr_name=attr_name,
-                    class_name=self.current_class or "global",
-                    def_loc=def_loc,
-                    kind=kind,
-                )
-
-        self.generic_visit(node)
-
-    def _is_lg_result_head(self, node: ast.Call) -> bool:
-        func = node.func
-        if isinstance(func, ast.Attribute) and func.attr == "head":
-            if isinstance(func.value, ast.Call):
-                inner_func = func.value.func
-                if isinstance(inner_func, ast.Attribute):
-                    if isinstance(inner_func.value, ast.Name) and inner_func.value.id == "LG":
-                        if inner_func.attr == "result":
-                            return True
-            elif isinstance(func.value, ast.Name):
-                return True
-        return False
-
-
-def scan_project(root_dir: str) -> tuple[List[InputAttr], List[ResultAttr]]:
-    all_inputs = []
-    all_results = []
-    for root, _, files in os.walk(root_dir):
-        for file in files:
-            if file.endswith(".py"):
-                path = os.path.join(root, file)
-                try:
-                    with open(path, "r") as f:
-                        tree = ast.parse(f.read(), filename=path)
-                    scanner = AttrScanner(path)
-                    scanner.visit(tree)
-                    all_inputs.extend(scanner.inputs.values())
-                    all_results.extend(scanner.results)
-                except Exception as e:
-                    print(f"Error scanning {path}: {e}")
-    return all_inputs, all_results
+    def _arg_at(self, args: list[str], index: int) -> Optional[str]:
+        if 0 <= index < len(args):
+            return args[index]
+        return None

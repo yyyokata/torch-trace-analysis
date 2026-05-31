@@ -6,20 +6,7 @@ from typing import Iterator, Optional
 from ast_constants import ConstantTable
 from ast_resolver import ConstantResolver
 from ast_types import Scope
-from attr_types import CallLoc, InputAttr, ResultAttr
-
-
-LG_FUNC_KINDS = {
-    "LG.feature_column": "feature_column",
-    "LG.feature_vector": "feature_vector",
-    "LG.sequence_feature": "sequence_feature",
-    "LG.dense_feature": "dense_feature",
-    "LG.get_sample_rate": "get_sample_rate",
-    "LG.get_bias": "get_bias",
-    "LG.label": "label",
-    "LG.slot": "slot",
-    "LG.global_step": "global_step",
-}
+from attr_types import CallLoc
 
 
 class ASTFrontend:
@@ -1109,31 +1096,6 @@ class ASTFrontend:
             "is_native": class_full.startswith(("nn.", "torch.nn.")),
         }
 
-    def parse_local_lg_assign(self, stmt):
-        if not isinstance(stmt, ast.Assign) or not isinstance(stmt.value, ast.Call):
-            return None
-        target = stmt.targets[0] if len(stmt.targets) == 1 else None
-        if target is None:
-            return None
-        attr = self._extract_self_attr_name(target)
-        if not attr:
-            return None
-        func_text = self._local_node_to_text(stmt.value.func)
-        kind = LG_FUNC_KINDS.get(func_text)
-        if not kind:
-            return None
-        return {
-            "attr": attr,
-            "kind": kind,
-            "source_expr": self._local_node_to_text(stmt.value),
-            "def_loc": CallLoc(
-                file=self.path or "",
-                line=getattr(stmt, "lineno", 0) or 0,
-                col=getattr(stmt, "col_offset", 0) or 0,
-            ),
-            "is_native": False,
-        }
-
     def parse_local_fc_get_vector_assign(self, stmt):
         if not isinstance(stmt, ast.Assign) or not isinstance(stmt.value, ast.Call):
             return None
@@ -1174,36 +1136,6 @@ class ASTFrontend:
             ),
             "is_native": False,
         }
-
-    def get_input_attrs(self, class_name: str) -> dict:
-        """Scan __init__ assignments and return {attr_name: InputAttr}."""
-        result = {}
-        init_node = self._get_method_node(class_name, "__init__")
-        if init_node is None:
-            return result
-        nodes = sorted(
-            ast.walk(init_node),
-            key=lambda node: (
-                getattr(node, "lineno", 10 ** 9),
-                getattr(node, "col_offset", 10 ** 9),
-            ),
-        )
-        for stmt in nodes:
-            parsed = self.parse_local_lg_assign(stmt) or self.parse_local_fc_get_vector_assign(stmt)
-            if parsed is None:
-                continue
-            attr_name = parsed["attr"]
-            result[attr_name] = InputAttr(
-                attr_name=attr_name,
-                class_name=class_name,
-                def_loc=parsed["def_loc"],
-                kind=parsed.get("kind", ""),
-                source_expr=parsed.get("source_expr"),
-                owner_expr=parsed.get("owner_expr"),
-                slot_expr=parsed.get("slot_expr"),
-                is_native=parsed.get("is_native", False),
-            )
-        return result
 
     def _extract_call_args_kwargs(self, call):
         """
@@ -1306,136 +1238,6 @@ class ASTFrontend:
             "var": stmt.targets[0].id,
             "source_expr": self._local_node_to_text(stmt.value),
             "def_loc": loc,
-        }
-
-    def parse_result_head_call(self, stmt, result_defs, class_name):
-        """
-        识别 `xxx = result_var.head(name=..., prediction=..., ...)` 语句。
-        result_defs: 当前方法中已识别的 LG.result() 变量名到 def_loc 的映射。
-        返回 ResultAttr 或 None。
-
-        解析规则：
-        - name= → head_name（kwargs 优先，否则 args[0]）
-        - prediction= → prediction_expr（必填，缺失 warn）
-        - label= → label_expr
-        - sample_rate= → sample_rate_expr
-        - loss= → loss_expr
-        - classifier_type= → classifier_type
-        """
-        call = None
-        if isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Call):
-            call = stmt.value
-        elif isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
-            call = stmt.value
-        elif isinstance(stmt, ast.Return) and isinstance(stmt.value, ast.Call):
-            call = stmt.value
-        if call is None:
-            return None
-        func = call.func
-        if not (isinstance(func, ast.Attribute) and func.attr == "head"):
-            return None
-        if not isinstance(func.value, ast.Name):
-            return None
-        result_var = func.value.id
-        if result_var not in result_defs:
-            return None
-
-        args, kwargs = self._extract_call_args_kwargs(call)
-
-        def _pick_expr(name, pos_index):
-            if name in kwargs:
-                return kwargs[name]
-            if len(args) > pos_index:
-                return args[pos_index]
-            return None
-
-        head_name = self._infer_head_name(args, kwargs)
-        prediction_expr = _pick_expr("prediction", 1)
-        if prediction_expr is None:
-            warnings.warn(
-                f"ResultAttr '{result_var}' in '{class_name}': prediction_expr missing for result.head()",
-                UserWarning,
-                stacklevel=2,
-            )
-
-        if isinstance(result_defs, dict):
-            def_loc = result_defs[result_var]
-        else:
-            def_loc = CallLoc(
-                file=self.path or "",
-                line=getattr(stmt, "lineno", 0) or 0,
-                col=getattr(stmt, "col_offset", 0) or 0,
-            )
-        return ResultAttr(
-            attr_name=result_var,
-            class_name=class_name,
-            def_loc=def_loc,
-            source_expr=self._local_node_to_text(call),
-            head_name=head_name,
-            classifier_type=_pick_expr("classifier_type", 5),
-            prediction_expr=prediction_expr,
-            label_expr=_pick_expr("label", 2),
-            sample_rate_expr=_pick_expr("sample_rate", 3),
-            loss_expr=_pick_expr("loss", 4),
-        )
-
-    def get_result_attrs(self, class_name):
-        """
-        扫描 class_name 的 forward + reachable helpers，
-        识别所有 LG.result() 变量和对应的 result.head(...) 调用。
-        返回 {result_var_name: [ResultAttr, ...]}。
-        找不到任何 LG.result() 时返回 {}。
-        """
-        grouped = defaultdict(list)
-        found_result_var = False
-        for _method_name, method_node in self._iter_reachable_method_nodes(class_name, entry_method="forward"):
-            nodes = sorted(
-                ast.walk(method_node),
-                key=lambda node: (
-                    getattr(node, "lineno", 10 ** 9),
-                    getattr(node, "col_offset", 10 ** 9),
-                ),
-            )
-            result_defs = {}
-            for stmt in nodes:
-                parsed = self.parse_local_result_assign(stmt)
-                if parsed is None:
-                    continue
-                found_result_var = True
-                result_defs[parsed["var"]] = parsed["def_loc"]
-            if not result_defs:
-                continue
-            for stmt in nodes:
-                parsed = self.parse_result_head_call(stmt, result_defs, class_name)
-                if parsed is None:
-                    continue
-                grouped[parsed.attr_name].append(parsed)
-        if not found_result_var:
-            return {}
-        return dict(grouped)
-
-    def parse_local_container_ctor(self, stmt):
-        if not isinstance(stmt, ast.Assign) or not isinstance(stmt.value, ast.Call):
-            return None
-        target = stmt.targets[0] if len(stmt.targets) == 1 else None
-        if target is None:
-            return None
-        attr = self._extract_self_attr_name(target)
-        if not attr:
-            return None
-        func_leaf = (self._expr_leaf_name(stmt.value.func) or "").split(".")[-1]
-        if func_leaf not in {"ModuleList", "ModuleDict"}:
-            return None
-        return {
-            "attr": attr,
-            "kind": func_leaf,
-            "call": stmt.value,
-            "def_loc": CallLoc(
-                file=self.path or "",
-                line=getattr(stmt, "lineno", 0) or 0,
-                col=getattr(stmt, "col_offset", 0) or 0,
-            ),
-            "is_native": True,
         }
 
     def parse_local_append_ctor(self, stmt):

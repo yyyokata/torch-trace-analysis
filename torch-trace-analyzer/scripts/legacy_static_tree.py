@@ -708,9 +708,9 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                         attr_def_loc.setdefault((cname, attr_name), (fname, phys_lineno))
                         torch_native_module_classes.add(native_cls_ref)
                     else:
-                        _ast_lg = _fe.parse_local_lg_assign(_local_stmt) if _fe else None
-                        if _ast_lg:
-                            attr_name = _ast_lg.get("attr")
+                        _lg_match = _fe.match_self_attr_call_assign(_local_stmt, func_prefixes={"LG."}) if _fe else None
+                        if _lg_match:
+                            attr_name, _lg_call = _lg_match
                             attrs[attr_name] = "__LG_InputSource"
                             attr_def_loc.setdefault((cname, attr_name), (fname, phys_lineno))
                             input_source_attrs[cname].add(attr_name)
@@ -721,69 +721,70 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                         attrs[attr_name] = "__LG_InputSource"
                         attr_def_loc.setdefault((cname, attr_name), (fname, phys_lineno))
                         input_source_attrs[cname].add(attr_name)
-                _ast_container_ctor = _fe.parse_local_container_ctor(_local_stmt) if _fe else None
-                if _ast_container_ctor and _ast_container_ctor.get("kind") == "ModuleList":
-                    cont = _ast_container_ctor.get("attr")
-                    _record_container_kind(cname, cont, "ModuleList")
-                    _call = _ast_container_ctor.get("call")
+                _container_match = _fe.match_self_attr_call_assign(
+                    _local_stmt,
+                    func_names={"ModuleList", "ModuleDict", "Sequential"},
+                ) if _fe else None
+                if _container_match:
+                    cont, _call = _container_match
+                    _kind = (_fe._expr_leaf_name(_call.func) or "").split('.')[-1]
                     _arg0 = _call.args[0] if _call and _call.args else None
-                    if isinstance(_arg0, ast.ListComp) and isinstance(_arg0.elt, ast.Call):
-                        _generators = _arg0.generators or []
-                        _gen0 = _generators[0] if len(_generators) == 1 else None
-                        _cls_ref = _node_to_text(_arg0.elt.func).split('.')[-1]
-                        _n = None
-                        if _gen0 and isinstance(_gen0.iter, ast.Call) and (_fe._expr_leaf_name(_gen0.iter.func) == "range") and len(_gen0.iter.args) == 1:
-                            _n = _eval_int_node(_gen0.iter.args[0], fname, cname, mname, parent_cls=preferred_root, parent_attr='stack')
-                        if _n is None and _gen0 is not None and isinstance(_gen0.iter, ast.List):
-                            _n = len(_gen0.iter.elts)
-                        if _n is None and _gen0 is not None and isinstance(_gen0.iter, ast.Name):
-                            _len = _eval_list_len_node(_gen0.iter, fname, cname, mname)
-                            if _len is not None:
-                                _n = _len
-                        if _n is not None:
-                            _short, _canonical = _extract_nn_short(_node_to_text(_arg0.elt.func), nn_import_aliases)
-                            if _short and _is_nn_leaf_stub(_short):
-                                attrs.setdefault(cont, _canonical)
-                                attr_def_loc.setdefault((cname, cont), (fname, phys_lineno))
-                                torch_native_module_classes.add(_canonical)
-                                for i in range(_n):
-                                    _ensure_elem(cont, cname, _elem_attr_list(cont, i), _canonical, fname, phys_lineno, attrs)
-                            elif _cls_ref in nn_module_classes:
-                                attrs.setdefault(cont, _cls_ref)
-                                attr_def_loc.setdefault((cname, cont), (fname, phys_lineno))
-                                for i in range(_n):
-                                    _ensure_elem(cont, cname, _elem_attr_list(cont, i), _cls_ref, fname, phys_lineno, attrs)
-                    elif isinstance(_arg0, ast.List):
-                        for i, _elt in enumerate(_arg0.elts):
-                            if isinstance(_elt, ast.Call):
-                                cls_ref_full = _node_to_text(_elt.func)
-                                cls_ref = cls_ref_full.split('.')[-1]
-                                _short, _canonical = _extract_nn_short(cls_ref_full, nn_import_aliases)
+                    if _kind == "ModuleList":
+                        _record_container_kind(cname, cont, "ModuleList")
+                        if isinstance(_arg0, ast.ListComp) and isinstance(_arg0.elt, ast.Call):
+                            _generators = _arg0.generators or []
+                            _gen0 = _generators[0] if len(_generators) == 1 else None
+                            _cls_ref = _node_to_text(_arg0.elt.func).split('.')[-1]
+                            _n = None
+                            if _gen0 and isinstance(_gen0.iter, ast.Call) and (_fe._expr_leaf_name(_gen0.iter.func) == "range") and len(_gen0.iter.args) == 1:
+                                _n = _eval_int_node(_gen0.iter.args[0], fname, cname, mname, parent_cls=preferred_root, parent_attr='stack')
+                            if _n is None and _gen0 is not None and isinstance(_gen0.iter, ast.List):
+                                _n = len(_gen0.iter.elts)
+                            if _n is None and _gen0 is not None and isinstance(_gen0.iter, ast.Name):
+                                _len = _eval_list_len_node(_gen0.iter, fname, cname, mname)
+                                if _len is not None:
+                                    _n = _len
+                            if _n is not None:
+                                _short, _canonical = _extract_nn_short(_node_to_text(_arg0.elt.func), nn_import_aliases)
                                 if _short and _is_nn_leaf_stub(_short):
                                     attrs.setdefault(cont, _canonical)
                                     attr_def_loc.setdefault((cname, cont), (fname, phys_lineno))
                                     torch_native_module_classes.add(_canonical)
-                                    _ensure_elem(cont, cname, _elem_attr_list(cont, i), _canonical, fname, phys_lineno, attrs)
-                                elif cls_ref in nn_module_classes:
+                                    for i in range(_n):
+                                        _ensure_elem(cont, cname, _elem_attr_list(cont, i), _canonical, fname, phys_lineno, attrs)
+                                elif _cls_ref in nn_module_classes:
+                                    attrs.setdefault(cont, _cls_ref)
+                                    attr_def_loc.setdefault((cname, cont), (fname, phys_lineno))
+                                    for i in range(_n):
+                                        _ensure_elem(cont, cname, _elem_attr_list(cont, i), _cls_ref, fname, phys_lineno, attrs)
+                        elif isinstance(_arg0, ast.List):
+                            for i, _elt in enumerate(_arg0.elts):
+                                if isinstance(_elt, ast.Call):
+                                    cls_ref_full = _node_to_text(_elt.func)
+                                    cls_ref = cls_ref_full.split('.')[-1]
+                                    _short, _canonical = _extract_nn_short(cls_ref_full, nn_import_aliases)
+                                    if _short and _is_nn_leaf_stub(_short):
+                                        attrs.setdefault(cont, _canonical)
+                                        attr_def_loc.setdefault((cname, cont), (fname, phys_lineno))
+                                        torch_native_module_classes.add(_canonical)
+                                        _ensure_elem(cont, cname, _elem_attr_list(cont, i), _canonical, fname, phys_lineno, attrs)
+                                    elif cls_ref in nn_module_classes:
+                                        attrs.setdefault(cont, cls_ref)
+                                        attr_def_loc.setdefault((cname, cont), (fname, phys_lineno))
+                                        _ensure_elem(cont, cname, _elem_attr_list(cont, i), cls_ref, fname, phys_lineno, attrs)
+                    if _kind == "ModuleDict":
+                        _record_container_kind(cname, cont, "ModuleDict")
+                        if isinstance(_arg0, ast.Dict):
+                            for _k_node, _v_node in zip(_arg0.keys, _arg0.values):
+                                if not isinstance(_v_node, ast.Call):
+                                    continue
+                                _key_text = _node_to_text(_k_node)
+                                k = _normalize_str_key(_key_text)
+                                cls_ref = _node_to_text(_v_node.func).split('.')[-1]
+                                if k is not None and cls_ref in nn_module_classes:
                                     attrs.setdefault(cont, cls_ref)
                                     attr_def_loc.setdefault((cname, cont), (fname, phys_lineno))
-                                    _ensure_elem(cont, cname, _elem_attr_list(cont, i), cls_ref, fname, phys_lineno, attrs)
-                if _ast_container_ctor and _ast_container_ctor.get("kind") == "ModuleDict":
-                    cont = _ast_container_ctor.get("attr")
-                    _record_container_kind(cname, cont, "ModuleDict")
-                    _call = _ast_container_ctor.get("call")
-                    _arg0 = _call.args[0] if _call and _call.args else None
-                    if isinstance(_arg0, ast.Dict):
-                        for _k_node, _v_node in zip(_arg0.keys, _arg0.values):
-                            if not isinstance(_v_node, ast.Call):
-                                continue
-                            _key_text = _node_to_text(_k_node)
-                            k = _normalize_str_key(_key_text)
-                            cls_ref = _node_to_text(_v_node.func).split('.')[-1]
-                            if k is not None and cls_ref in nn_module_classes:
-                                attrs.setdefault(cont, cls_ref)
-                                attr_def_loc.setdefault((cname, cont), (fname, phys_lineno))
-                                _ensure_elem(cont, cname, _elem_attr_dict(cont, k), cls_ref, fname, phys_lineno, attrs)
+                                    _ensure_elem(cont, cname, _elem_attr_dict(cont, k), cls_ref, fname, phys_lineno, attrs)
                 _ast_append_ctor = _fe.parse_local_append_ctor(_local_stmt) if _fe else None
                 if _ast_append_ctor:
                     attr_name = _ast_append_ctor.get("attr")
@@ -1484,7 +1485,10 @@ def build_static_module_tree(source_files, preferred_root=None, conditional_mode
                 continue
             _fe = _get_ast_frontend(fname)
             if _fe:
-                result_attrs = _fe.get_result_attrs(cname)
+                from attr_scanner import AttrScanner as _AttrScanner
+                _scanner = _AttrScanner()
+                result_attrs_list = _scanner._scan_result_attrs(cname, _fe)
+                result_attrs = {ra.attr_name: ra for ra in result_attrs_list}
                 if result_attrs:
                     tree[cname]["result_attrs"] = result_attrs
             break
