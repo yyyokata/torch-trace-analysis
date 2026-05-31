@@ -4,15 +4,8 @@ import io
 import os
 import sys
 
-try:
-    from scripts.common_utils import format_duration, pct_str
-except ModuleNotFoundError:
-    from common_utils import format_duration, pct_str
-
-try:
-    from scripts.source_hotspot import LAGRANGE_TORCH_REPO
-except ModuleNotFoundError:
-    from source_hotspot import LAGRANGE_TORCH_REPO
+from common_utils import format_duration, pct_str
+from source_hotspot import LAGRANGE_TORCH_REPO
 
 
 def print_header(title):

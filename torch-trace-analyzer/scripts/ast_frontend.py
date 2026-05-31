@@ -2,16 +2,10 @@ import ast
 import warnings
 from collections import defaultdict
 
-try:
-    from scripts.ast_constants import ConstantTable
-    from scripts.ast_resolver import ConstantResolver
-    from scripts.ast_types import Scope
-    from scripts.attr_types import CallLoc, InputAttr, ResultAttr
-except ModuleNotFoundError:
-    from ast_constants import ConstantTable
-    from ast_resolver import ConstantResolver
-    from ast_types import Scope
-    from attr_types import CallLoc, InputAttr, ResultAttr
+from ast_constants import ConstantTable
+from ast_resolver import ConstantResolver
+from ast_types import Scope
+from attr_types import CallLoc, InputAttr, ResultAttr
 
 
 LG_FUNC_KINDS = {

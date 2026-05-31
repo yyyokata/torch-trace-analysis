@@ -4,15 +4,11 @@ import ast
 from collections import Counter, defaultdict
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
-try:
-    from scripts.ast_constants import ConstantTable
-    from scripts.ast_types import IntValue, Scope, _RECURSING
-except ModuleNotFoundError:
-    from ast_constants import ConstantTable
-    from ast_types import IntValue, Scope, _RECURSING
+from ast_constants import ConstantTable
+from ast_types import IntValue, Scope, _RECURSING
 
 if TYPE_CHECKING:
-    from scripts.ast_frontend import ASTFrontend
+    from ast_frontend import ASTFrontend
 
 
 class ConstantResolver:

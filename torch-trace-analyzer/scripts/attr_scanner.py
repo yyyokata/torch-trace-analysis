@@ -1,7 +1,7 @@
 import ast
 import os
 from typing import List, Dict, Optional
-from .attr_types import CallLoc, InputAttr, ResultAttr
+from attr_types import CallLoc, InputAttr, ResultAttr
 
 
 class AttrScanner(ast.NodeVisitor):

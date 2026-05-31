@@ -3,10 +3,7 @@
 import ast
 import sys
 
-try:
-    from scripts.ast_frontend import ASTFrontend
-except ModuleNotFoundError:
-    from ast_frontend import ASTFrontend
+from ast_frontend import ASTFrontend
 
 
 def _build_ast_frontends(source_files):

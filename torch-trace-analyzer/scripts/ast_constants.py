@@ -3,13 +3,10 @@ from __future__ import annotations
 import ast
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 
-try:
-    from scripts.ast_types import IntValue, ListValue, Scope
-except ModuleNotFoundError:
-    from ast_types import IntValue, ListValue, Scope
+from ast_types import IntValue, ListValue, Scope
 
 if TYPE_CHECKING:
-    from scripts.ast_frontend import ASTFrontend
+    from ast_frontend import ASTFrontend
 
 
 class ConstantTable:
@@ -402,10 +399,7 @@ class ConstantTable:
     def _scan_local_dataclass_instances(self, fname: str, cname: str,
                                         classdef: ast.ClassDef) -> None:
         """Materialize local ``var = DataclassCtor(...)`` bindings per method."""
-        try:
-            from scripts.ast_resolver import ConstantResolver
-        except ModuleNotFoundError:
-            from ast_resolver import ConstantResolver
+        from ast_resolver import ConstantResolver
 
         resolver = ConstantResolver(self)
         for stmt in classdef.body:
@@ -588,10 +582,7 @@ class ConstantTable:
     def _resolve_bound_int(self,
                            expr_node: ast.expr,
                            scope: Scope) -> Optional[IntValue]:
-        try:
-            from scripts.ast_resolver import ConstantResolver
-        except ModuleNotFoundError:
-            from ast_resolver import ConstantResolver
+        from ast_resolver import ConstantResolver
 
         resolver = ConstantResolver(self)
         iv = resolver.eval_int(expr_node, scope)
@@ -603,10 +594,7 @@ class ConstantTable:
                                   expr_node: ast.expr,
                                   scope_key: Tuple[str, str, str]) -> Optional[ListValue]:
         fname, cname, mname = scope_key
-        try:
-            from scripts.ast_resolver import ConstantResolver
-        except ModuleNotFoundError:
-            from ast_resolver import ConstantResolver
+        from ast_resolver import ConstantResolver
 
         resolver = ConstantResolver(self)
         list_node = resolver._resolve_to_list_literal(
@@ -632,10 +620,7 @@ class ConstantTable:
         local_inst = self.local_dataclass_inst.get(scope_key, {})
         if expr_node.id in local_inst:
             return dict(local_inst[expr_node.id])
-        try:
-            from scripts.ast_resolver import ConstantResolver
-        except ModuleNotFoundError:
-            from ast_resolver import ConstantResolver
+        from ast_resolver import ConstantResolver
 
         resolver = ConstantResolver(self)
         target_node = resolver._resolve_alias_chain(expr_node, scope_key)
@@ -652,10 +637,7 @@ class ConstantTable:
         if not isinstance(expr_node, ast.Call):
             return None
         fname, cname, mname = scope_key
-        try:
-            from scripts.ast_resolver import ConstantResolver
-        except ModuleNotFoundError:
-            from ast_resolver import ConstantResolver
+        from ast_resolver import ConstantResolver
 
         resolver = ConstantResolver(self)
         return resolver.eval_dataclass_fields(

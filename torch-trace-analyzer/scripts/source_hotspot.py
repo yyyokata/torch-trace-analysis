@@ -4,10 +4,7 @@ import os
 import re
 from collections import defaultdict
 
-try:
-    from scripts.source_index import _build_class_map, _find_class_for_line
-except ModuleNotFoundError:
-    from source_index import _build_class_map, _find_class_for_line
+from source_index import _build_class_map, _find_class_for_line
 
 
 def analyze_source_hotspots(events, source_files):
