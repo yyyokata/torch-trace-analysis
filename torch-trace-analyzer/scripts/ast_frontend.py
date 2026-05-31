@@ -1,6 +1,7 @@
 import ast
 import warnings
 from collections import defaultdict
+from typing import Iterator, Optional
 
 from ast_constants import ConstantTable
 from ast_resolver import ConstantResolver
@@ -631,6 +632,104 @@ class ASTFrontend:
             if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name == method_name:
                 return item
         return None
+
+    def _node_loc(self, node) -> CallLoc:
+        line = getattr(node, "lineno", 0) or 0
+        col = getattr(node, "col_offset", 0) or 0
+        end_line = getattr(node, "end_lineno", None)
+        end_col = getattr(node, "end_col_offset", None)
+        if end_line is None or end_col is None:
+            return CallLoc(file=self.path or "", line=line, col=col)
+        return CallLoc(file=self.path or "", line=line, col=col)
+
+    def iter_init_stmts(self, class_name: str) -> Iterator[ast.stmt]:
+        method_node = self._get_method_node(class_name, "__init__")
+        if method_node is None:
+            return
+
+        def _walk(body):
+            for stmt in body or []:
+                if isinstance(stmt, (ast.For, ast.AsyncFor, ast.While)):
+                    yield from _walk(stmt.body)
+                    yield from _walk(stmt.orelse)
+                    continue
+                if isinstance(stmt, ast.If):
+                    yield from _walk(stmt.body)
+                    yield from _walk(stmt.orelse)
+                    continue
+                if isinstance(stmt, (ast.With, ast.AsyncWith)):
+                    yield from _walk(stmt.body)
+                    continue
+                if isinstance(stmt, ast.Try):
+                    yield from _walk(stmt.body)
+                    for handler in stmt.handlers:
+                        yield from _walk(handler.body)
+                    yield from _walk(stmt.orelse)
+                    yield from _walk(stmt.finalbody)
+                    continue
+                if isinstance(stmt, ast.Pass):
+                    continue
+                yield stmt
+
+        yield from _walk(method_node.body)
+
+    def stmt_assign_target(self, stmt) -> Optional[ast.expr]:
+        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
+            return stmt.targets[0]
+        return None
+
+    def stmt_assign_call_value(self, stmt) -> Optional[ast.Call]:
+        if isinstance(stmt, (ast.Assign, ast.Expr, ast.Return)) and isinstance(stmt.value, ast.Call):
+            return stmt.value
+        return None
+
+    def call_func_text(self, call: ast.Call) -> str:
+        return self._local_node_to_text(call.func)
+
+    def call_kwarg_texts(self, call: ast.Call) -> dict[str, str]:
+        return {
+            kw.arg: self._local_node_to_text(kw.value)
+            for kw in call.keywords
+            if kw.arg is not None
+        }
+
+    def call_arg_texts(self, call: ast.Call) -> list[str]:
+        return [self._local_node_to_text(arg) for arg in call.args]
+
+    def match_call_by_func(self, call: ast.Call, *, func_prefixes=None, func_names=None) -> Optional[str]:
+        func_text = self.call_func_text(call)
+        func_leaf = (self._expr_leaf_name(call.func) or "").split(".")[-1]
+        prefix_ok = True if func_prefixes is None else any(func_text.startswith(prefix) for prefix in func_prefixes)
+        name_ok = True if func_names is None else func_leaf in func_names
+        if func_prefixes is not None and func_names is not None:
+            return func_text if prefix_ok and name_ok else None
+        if func_prefixes is not None:
+            return func_text if prefix_ok else None
+        if func_names is not None:
+            return func_text if name_ok else None
+        return func_text
+
+    def match_self_attr_call_assign(self, stmt, *, func_prefixes=None, func_names=None) -> Optional[tuple[str, ast.Call]]:
+        target = self.stmt_assign_target(stmt)
+        call = self.stmt_assign_call_value(stmt)
+        if target is None or call is None:
+            return None
+        attr_name = self._extract_self_attr_name(target)
+        if attr_name is None:
+            return None
+        if self.match_call_by_func(call, func_prefixes=func_prefixes, func_names=func_names) is None:
+            return None
+        return attr_name, call
+
+    def match_expr_or_stmt_call(self, node, *, func_attr: Optional[str] = None) -> Optional[tuple[str, ast.Call]]:
+        call = self.stmt_assign_call_value(node)
+        if call is None:
+            return None
+        if not isinstance(call.func, ast.Attribute):
+            return None
+        if func_attr is not None and call.func.attr != func_attr:
+            return None
+        return self._local_node_to_text(call.func.value), call
 
     def _get_stmt_infos(self, class_name, method_name):
         cache = getattr(self, "_stmt_info_cache", None)
