@@ -97,17 +97,6 @@ if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
 
-# ---------------------------------------------------------------------------
-# PR3 — ConstantResolver is now the only production evaluator path.
-# Keep the module-level switch for compatibility with older tests / scripts,
-# but default it to ``True`` and no longer maintain a legacy fallback path.
-# ---------------------------------------------------------------------------
-USE_NEW_EVAL: bool = True
-
-# Retain the report hook for diagnostics compatibility. PR3 no longer records
-# legacy/new diffs, so the log stays empty unless future instrumentation adds
-# explicit entries.
-_AB_EVAL_DIFFS: list = []
 try:
     from scripts.ast_types import Scope, IntValue, ListValue, _RECURSING
     from scripts.ast_constants import ConstantTable
@@ -8986,16 +8975,7 @@ def main():
     parser.add_argument("--code-path", type=str, default=None, help="模型源码路径（目录或 .tar.gz）")
     parser.add_argument("--screenshot", action="store_true", help="生成 Chrome Tracing 可视化截图")
     parser.add_argument("--html-flowchart", type=str, default=None, help="生成 HTML 模块流程图路径")
-    parser.add_argument("--use-new-eval", action="store_true",
-                        help="兼容旧脚本参数；PR3 起 ConstantResolver 已默认启用")
-    parser.add_argument("--ab-eval-report", type=str, default=None,
-                        help="写入当前求值器状态摘要 JSON（PR3 起不再产出 legacy/new diff）")
     args = parser.parse_args()
-
-    global USE_NEW_EVAL
-    USE_NEW_EVAL = True
-    if args.use_new_eval:
-        print("  [PR3] --use-new-eval 已是默认行为；当前仍使用 ConstantResolver")
 
     # Mode 1: Source-code only flowchart (no trace required)
     if args.html_flowchart and args.code_path and not args.trace_file:
@@ -9006,7 +8986,6 @@ def main():
         result = generate_html_flowchart_dual(source_files, timing_data=None, meta=None, output_path=args.html_flowchart)
         if result:
             print(f"  HTML 流程图已保存到: {args.html_flowchart}")
-        _emit_ab_summary_if_enabled(args)
         return
 
     # Mode 2: Full trace analysis (trace_file required)
@@ -9268,43 +9247,6 @@ def main():
             result = generate_html_flowchart_dual(source_files, timing_data=timing_data, meta=meta, output_path=args.html_flowchart, trace_events=events)
             if result:
                 print(f"  HTML 流程图已保存到: {args.html_flowchart}")
-
-    # PR2: print A/B diff summary at the very end so the user can see it
-    # alongside the regular analysis output.
-    _emit_ab_summary_if_enabled(args)
-
-
-def _emit_ab_summary_if_enabled(args):
-    """PR3: optionally persist the current evaluator status for debugging."""
-    report = getattr(args, "ab_eval_report", None)
-    if not report:
-        return
-    payload = {
-        "mode": "constant_resolver_only",
-        "use_new_eval": True,
-        "total": len(_AB_EVAL_DIFFS),
-        "matches": 0,
-        "mismatches": 0,
-        "all": _AB_EVAL_DIFFS,
-    }
-    try:
-        with open(report, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-        print(f"  [PR3] evaluator status saved to: {report}")
-    except Exception as e:
-        print(f"  ⚠️ failed to write evaluator status report: {e}")
-
-
-def _ast_frontend_smoke_test():
-    target = "testset/extracted/5698781/modelcode/cvr.py"
-    fe = ASTFrontend(path=target)
-    nn_classes = [c for c in fe.class_registry if fe.is_nn_module(c)]
-    print(f"[ASTFrontend smoke test] file={target}")
-    print(f"nn.Module classes: {len(nn_classes)}")
-    for class_name in nn_classes:
-        assigns = fe.get_init_assignments_ast(class_name)
-        print(f"  {class_name}: {len(assigns)} init assignments")
-
 
 if __name__ == "__main__":
     main()
