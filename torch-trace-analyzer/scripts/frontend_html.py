@@ -42,18 +42,14 @@ if _SCRIPT_DIR not in sys.path:
 # Explicit, unambiguous imports of all shared helpers from analyze_trace.
 # Any rename or removal of these names in analyze_trace.py will surface here
 # as an ImportError instead of silently degrading at runtime.
-from analyze_trace import (  # noqa: E402  (sys.path tweak above is intentional)
-    ASTFrontend,
-    _build_class_map,
-    _build_source_dependency_order,
-    _strip_inline_comment,
-    _validate_timeline_modules,
-    build_instance_timing_pipeline,
-    build_main_thread_hierarchy,
-    build_static_module_tree,
-    extract_step_phase_intervals,
-    format_duration,
-)
+from ast_frontend import ASTFrontend  # noqa: E402
+from common_utils import _strip_inline_comment, format_duration  # noqa: E402
+from legacy_dataflow_support import _build_source_dependency_order  # noqa: E402
+from legacy_static_tree import build_static_module_tree  # noqa: E402
+from source_index import _build_class_map  # noqa: E402
+from timing_attribution import build_instance_timing_pipeline  # noqa: E402
+from trace_analysis import build_main_thread_hierarchy, extract_step_phase_intervals  # noqa: E402
+from analyze_trace import _validate_timeline_modules  # noqa: E402
 
 
 FLOWCHART_HTML_TEMPLATE = r"""<!DOCTYPE html>
