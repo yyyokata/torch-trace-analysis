@@ -114,6 +114,23 @@ except ModuleNotFoundError:
     from trace_io import load_model_code, load_trace
 
 try:
+    from scripts.source_index import (
+        _build_ast_frontends,
+        _build_class_map,
+        _build_class_map_ast,
+        _find_class_for_line,
+        build_module_like_set,
+    )
+except ModuleNotFoundError:
+    from source_index import (
+        _build_ast_frontends,
+        _build_class_map,
+        _build_class_map_ast,
+        _find_class_for_line,
+        build_module_like_set,
+    )
+
+try:
     from scripts.common_utils import (
         _dedup_consecutive_frames,
         _extract_frame_class_name,
@@ -227,69 +244,6 @@ def detect_enhanced_trace(events):
                 has_stack_traces = True
                 break
     return has_code_location, has_stack_traces
-
-
-def _build_ast_frontends(source_files):
-    ast_frontends = {}
-    for fname in source_files.keys():
-        try:
-            ast_frontends[fname] = ASTFrontend(
-                source='\n'.join(source_files.get(fname, [])),
-                path=fname,
-            )
-        except Exception:
-            ast_frontends[fname] = None
-    return ast_frontends
-
-
-def build_module_like_set(source_files, ast_frontends=None):
-    class_defs = {}
-    if ast_frontends is None:
-        ast_frontends = _build_ast_frontends(source_files)
-    for fname, lines in source_files.items():
-        fe = ast_frontends.get(fname)
-        if fe is not None:
-            for node in fe.tree.body:
-                if isinstance(node, ast.ClassDef):
-                    bases = []
-                    for base in node.bases:
-                        try:
-                            bases.append(fe._node_to_text(base))
-                        except Exception:
-                            bases.append(getattr(base, "id", getattr(base, "attr", "")))
-                    class_defs[(fname, node.name)] = bases
-            continue
-        try:
-            tree = ast.parse("\n".join(lines), filename=fname)
-        except Exception:
-            continue
-        for node in tree.body:
-            if isinstance(node, ast.ClassDef):
-                bases = []
-                for base in node.bases:
-                    try:
-                        bases.append(ast.unparse(base))
-                    except Exception:
-                        bases.append(getattr(base, "id", getattr(base, "attr", "")))
-                class_defs[(fname, node.name)] = bases
-
-    module_like = set()
-    changed = True
-    while changed:
-        changed = False
-        known_names = {c for _, c in module_like}
-        for key, bases in class_defs.items():
-            if key in module_like:
-                continue
-            if any(
-                b in {"nn.Module", "torch.nn.Module", "Module"}
-                or b.endswith(".Module")
-                or b in known_names
-                for b in bases
-            ):
-                module_like.add(key)
-                changed = True
-    return module_like
 
 
 # ---------------------------------------------------------------------------
@@ -2442,50 +2396,6 @@ def analyze_source_hotspots(events, source_files):
         "class_map": class_map,
     }
 
-
-
-def _build_class_map_ast(source_files, ast_frontends=None):
-    class_map = {}
-    failed_files = set()
-    if ast_frontends is None:
-        ast_frontends = _build_ast_frontends(source_files)
-    for fname, lines in source_files.items():
-        fe = ast_frontends.get(fname)
-        if fe is None:
-            failed_files.add(fname)
-            continue
-        file_failed = False
-        for cname, info in fe.class_registry.items():
-            cls_node = info.get("node")
-            start = getattr(cls_node, "lineno", None)
-            end = getattr(cls_node, "end_lineno", None)
-            if start is None or end is None:
-                file_failed = True
-                break
-            methods = {}
-            for method in info.get("methods", []):
-                mstart = method.get("lineno")
-                mend = method.get("end_lineno")
-                mname = method.get("name")
-                if not mname or mstart is None or mend is None:
-                    file_failed = True
-                    break
-                methods[mname] = (mstart, mend)
-            if file_failed:
-                break
-            class_map[(fname, cname)] = {"start": start, "end": end, "methods": methods}
-        if file_failed:
-            failed_files.add(fname)
-            for key in [k for k in class_map if k[0] == fname]:
-                class_map.pop(key, None)
-    return class_map, failed_files
-
-
-def _build_class_map(source_files, ast_frontends=None):
-    ast_map, failed_files = _build_class_map_ast(source_files, ast_frontends=ast_frontends)
-    if failed_files:
-        print(f"[WARN] AST parse failed for {len(failed_files)} file(s): {sorted(failed_files)}", file=sys.stderr)
-    return ast_map
 
 
 def _build_source_dependency_order(source_files, class_map, ast_frontends=None):
@@ -4734,16 +4644,6 @@ def _build_data_dependency_edges(source_files, class_map, module_attrs, class_st
                 class_split_info[cname] = dict(split_node_map)
 
     return class_dep_edges, class_edge_locs, class_split_info
-
-
-def _find_class_for_line(fname, lineno, class_map):
-    for (f, cname), info in class_map.items():
-        if f == fname and info["start"] <= lineno <= info["end"]:
-            for mname, (ms, me) in info["methods"].items():
-                if ms <= lineno <= me:
-                    return cname, mname
-            return cname, None
-    return None, None
 
 
 def enrich_kernel_modules_with_source(events, gpu_info, src_info):
