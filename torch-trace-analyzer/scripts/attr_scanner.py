@@ -92,7 +92,6 @@ class AttrScanner(ast.NodeVisitor):
                 attr_name=result_var,
                 class_name=self.current_class or "global",
                 def_loc=def_loc,
-                head_call_loc=head_call_loc,
             ))
 
         attr_name = None
@@ -109,8 +108,7 @@ class AttrScanner(ast.NodeVisitor):
                     attr_name=attr_name,
                     class_name=self.current_class or "global",
                     def_loc=def_loc,
-                    forward_use_loc=self._get_def_loc(node),
-                    lg_source_kind=kind,
+                    kind=kind,
                 )
 
         self.generic_visit(node)

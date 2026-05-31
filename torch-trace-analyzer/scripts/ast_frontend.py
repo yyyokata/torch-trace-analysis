@@ -1100,21 +1100,10 @@ class ASTFrontend:
             if parsed is None:
                 continue
             attr_name = parsed["attr"]
-            first_loc = self.get_first_call_loc(class_name, attr_name)
-            if first_loc is not None:
-                forward_use_loc = CallLoc(file=first_loc[0], line=first_loc[1], col=0)
-            else:
-                warnings.warn(
-                    f"InputAttr '{attr_name}' in '{class_name}': forward_use_loc not found in forward() or reachable helpers",
-                    UserWarning,
-                    stacklevel=2,
-                )
-                forward_use_loc = None
             result[attr_name] = InputAttr(
                 attr_name=attr_name,
                 class_name=class_name,
                 def_loc=parsed["def_loc"],
-                forward_use_loc=forward_use_loc,
                 kind=parsed.get("kind", ""),
                 source_expr=parsed.get("source_expr"),
                 owner_expr=parsed.get("owner_expr"),
@@ -1276,20 +1265,18 @@ class ASTFrontend:
                 stacklevel=2,
             )
 
-        head_call_loc = CallLoc(
-            file=self.path or "",
-            line=getattr(stmt, "lineno", 0) or 0,
-            col=getattr(stmt, "col_offset", 0) or 0,
-        )
         if isinstance(result_defs, dict):
             def_loc = result_defs[result_var]
         else:
-            def_loc = head_call_loc
+            def_loc = CallLoc(
+                file=self.path or "",
+                line=getattr(stmt, "lineno", 0) or 0,
+                col=getattr(stmt, "col_offset", 0) or 0,
+            )
         return ResultAttr(
             attr_name=result_var,
             class_name=class_name,
             def_loc=def_loc,
-            head_call_loc=head_call_loc,
             source_expr=self._local_node_to_text(call),
             head_name=head_name,
             classifier_type=_pick_expr("classifier_type", 5),

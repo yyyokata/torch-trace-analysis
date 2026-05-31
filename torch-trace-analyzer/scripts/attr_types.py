@@ -99,8 +99,6 @@ class InputAttr(Attr):
         attr_name: str,
         class_name: str,
         def_loc: CallLoc,
-        forward_use_loc: Optional[CallLoc] = None,
-        lg_source_kind: str = "",
         parent: Optional["ContainerAttr"] = None,
         kind: str = "",
         owner_expr: Optional[str] = None,
@@ -118,10 +116,8 @@ class InputAttr(Attr):
             is_native=is_native,
             container_index=container_index,
         )
-        resolved_kind = kind or lg_source_kind or ""
-        self.forward_use_loc = forward_use_loc
+        resolved_kind = kind or ""
         self.kind = resolved_kind
-        self.lg_source_kind = resolved_kind
         self.owner_expr = owner_expr
         self.slot_expr = slot_expr
 
@@ -147,7 +143,6 @@ class ResultAttr(Attr):
         label_expr: Optional[str] = None,
         sample_rate_expr: Optional[str] = None,
         loss_expr: Optional[str] = None,
-        head_call_loc: Optional[CallLoc] = None,
         is_native: bool = False,
         container_index: Optional[Union[int, str]] = None,
     ):
@@ -166,7 +161,32 @@ class ResultAttr(Attr):
         self.label_expr = label_expr
         self.sample_rate_expr = sample_rate_expr
         self.loss_expr = loss_expr
-        self.head_call_loc = head_call_loc
 
 
-AttrType = Union[ModuleAttr, ContainerAttr, InputAttr, ResultAttr]
+class ForwardArgAttr(Attr):
+    """inner_dag InputNode 的 attr：对应 forward 形参"""
+    def __init__(
+        self,
+        attr_name: str,
+        class_name: str = "__arg__",
+        def_loc: Optional[CallLoc] = None,
+        arg_index: int = 0,
+    ):
+        super().__init__(attr_name=attr_name, class_name=class_name, def_loc=def_loc)
+        self.arg_index = arg_index
+
+
+class ReturnValAttr(Attr):
+    """inner_dag ResultNode 的 attr：对应 forward 返回值"""
+    def __init__(
+        self,
+        attr_name: str,
+        class_name: str = "__ret__",
+        def_loc: Optional[CallLoc] = None,
+        ret_index: int = 0,
+    ):
+        super().__init__(attr_name=attr_name, class_name=class_name, def_loc=def_loc)
+        self.ret_index = ret_index
+
+
+AttrType = Union[ModuleAttr, ContainerAttr, InputAttr, ResultAttr, ForwardArgAttr, ReturnValAttr]
