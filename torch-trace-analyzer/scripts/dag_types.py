@@ -14,14 +14,11 @@ from dataclasses import dataclass, field
 from typing import Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    pass
+    from ast_constants import ConstantTable
 
 from attr_types import (
     CallLoc,
     Attr,
-    ModuleAttr, ContainerAttr,
-    InputAttr, ResultAttr,
-    ForwardArgAttr, ReturnValAttr,
 )
 
 
@@ -111,6 +108,8 @@ class DagContext:
     registry       : dict   # dict[int, DagNode]
     root           : DAG
     loc_attr_index : dict = field(default_factory=dict)
+    const_table    : Optional["ConstantTable"] = None
+    attr_registry  : dict = field(default_factory=dict)
     # key: (file: str, line: int, attr_id: int) → node_id: int
     # col 不参与 key（timeline event 不携带 col）
 

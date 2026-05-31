@@ -629,8 +629,8 @@ class ASTFrontend:
             return CallLoc(file=self.path or "", line=line, col=col)
         return CallLoc(file=self.path or "", line=line, col=col)
 
-    def iter_init_stmts(self, class_name: str) -> Iterator[ast.stmt]:
-        method_node = self._get_method_node(class_name, "__init__")
+    def _iter_method_stmts(self, class_name: str, method_name: str, *, flatten_if: bool = True) -> Iterator[ast.stmt]:
+        method_node = self._get_method_node(class_name, method_name)
         if method_node is None:
             return
 
@@ -641,8 +641,11 @@ class ASTFrontend:
                     yield from _walk(stmt.orelse)
                     continue
                 if isinstance(stmt, ast.If):
-                    yield from _walk(stmt.body)
-                    yield from _walk(stmt.orelse)
+                    if flatten_if:
+                        yield from _walk(stmt.body)
+                        yield from _walk(stmt.orelse)
+                    else:
+                        yield stmt
                     continue
                 if isinstance(stmt, (ast.With, ast.AsyncWith)):
                     yield from _walk(stmt.body)
@@ -659,6 +662,15 @@ class ASTFrontend:
                 yield stmt
 
         yield from _walk(method_node.body)
+
+    def iter_init_stmts(self, class_name: str) -> Iterator[ast.stmt]:
+        yield from self._iter_method_stmts(class_name, "__init__", flatten_if=True)
+
+    def iter_init_stmts_with_branches(self, class_name: str) -> Iterator[ast.stmt]:
+        yield from self._iter_method_stmts(class_name, "__init__", flatten_if=False)
+
+    def iter_forward_stmts(self, class_name: str) -> Iterator[ast.stmt]:
+        yield from self._iter_method_stmts(class_name, "forward", flatten_if=True)
 
     def stmt_assign_target(self, stmt) -> Optional[ast.expr]:
         if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
@@ -707,6 +719,14 @@ class ASTFrontend:
         if self.match_call_by_func(call, func_prefixes=func_prefixes, func_names=func_names) is None:
             return None
         return attr_name, call
+
+    def match_simple_alias(self, stmt) -> Optional[tuple[str, str]]:
+        target = self.stmt_assign_target(stmt)
+        if not isinstance(stmt, ast.Assign) or target is None:
+            return None
+        if not isinstance(target, ast.Name) or not isinstance(stmt.value, ast.Name):
+            return None
+        return target.id, stmt.value.id
 
     def match_expr_or_stmt_call(self, node, *, func_attr: Optional[str] = None) -> Optional[tuple[str, ast.Call]]:
         call = self.stmt_assign_call_value(node)
