@@ -4,3 +4,4 @@ __pycache__/
 tmp_*
 testset/extracted/
 testset/models/
+output/
