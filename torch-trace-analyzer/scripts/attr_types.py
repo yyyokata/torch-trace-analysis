@@ -24,11 +24,13 @@ class Attr(ABC):
         attr_name: str,
         class_name: str,
         def_loc: CallLoc,
+        attr_id: int = 0,
         parent: Optional["ContainerAttr"] = None,
         source_expr: Optional[str] = None,
         is_native: Optional[bool] = None,
         container_index: Optional[Union[int, str]] = None,
     ):
+        self.attr_id = attr_id
         self.attr_name = attr_name
         self.class_name = class_name
         self.def_loc = def_loc
@@ -48,7 +50,27 @@ class Attr(ABC):
 
 
 class ModuleAttr(Attr):
-    pass
+    def __init__(
+        self,
+        attr_name: str,
+        class_name: str,
+        def_loc: CallLoc,
+        attr_id: int = 0,
+        parent: Optional["ContainerAttr"] = None,
+        source_expr: Optional[str] = None,
+        is_native: Optional[bool] = None,
+        container_index: Optional[Union[int, str]] = None,
+    ):
+        super().__init__(
+            attr_name=attr_name,
+            class_name=class_name,
+            def_loc=def_loc,
+            attr_id=attr_id,
+            parent=parent,
+            source_expr=source_expr,
+            is_native=is_native,
+            container_index=container_index,
+        )
 
 
 class ContainerAttr(Attr):
@@ -58,6 +80,7 @@ class ContainerAttr(Attr):
         class_name: str,
         def_loc: CallLoc,
         container_kind: str,
+        attr_id: int = 0,
         parent: Optional["ContainerAttr"] = None,
         items: Optional[Dict[Union[int, str], Attr]] = None,
         source_expr: Optional[str] = None,
@@ -73,7 +96,8 @@ class ContainerAttr(Attr):
             attr_name,
             class_name,
             def_loc,
-            parent,
+            attr_id=attr_id,
+            parent=parent,
             source_expr=source_expr,
             is_native=resolved_is_native,
             container_index=container_index,
@@ -99,6 +123,7 @@ class InputAttr(Attr):
         attr_name: str,
         class_name: str,
         def_loc: CallLoc,
+        attr_id: int = 0,
         parent: Optional["ContainerAttr"] = None,
         kind: str = "",
         owner_expr: Optional[str] = None,
@@ -111,7 +136,8 @@ class InputAttr(Attr):
             attr_name,
             class_name,
             def_loc,
-            parent,
+            attr_id=attr_id,
+            parent=parent,
             source_expr=source_expr,
             is_native=is_native,
             container_index=container_index,
@@ -135,6 +161,7 @@ class ResultAttr(Attr):
         attr_name: str,
         class_name: str,
         def_loc: CallLoc,
+        attr_id: int = 0,
         parent: Optional["ContainerAttr"] = None,
         source_expr: Optional[str] = None,
         head_name: Optional[str] = None,
@@ -150,7 +177,8 @@ class ResultAttr(Attr):
             attr_name,
             class_name,
             def_loc,
-            parent,
+            attr_id=attr_id,
+            parent=parent,
             source_expr=source_expr,
             is_native=is_native,
             container_index=container_index,
@@ -170,9 +198,10 @@ class ForwardArgAttr(Attr):
         attr_name: str,
         class_name: str = "__arg__",
         def_loc: Optional[CallLoc] = None,
+        attr_id: int = 0,
         arg_index: int = 0,
     ):
-        super().__init__(attr_name=attr_name, class_name=class_name, def_loc=def_loc)
+        super().__init__(attr_name=attr_name, class_name=class_name, def_loc=def_loc, attr_id=attr_id)
         self.arg_index = arg_index
 
 
@@ -183,9 +212,10 @@ class ReturnValAttr(Attr):
         attr_name: str,
         class_name: str = "__ret__",
         def_loc: Optional[CallLoc] = None,
+        attr_id: int = 0,
         ret_index: int = 0,
     ):
-        super().__init__(attr_name=attr_name, class_name=class_name, def_loc=def_loc)
+        super().__init__(attr_name=attr_name, class_name=class_name, def_loc=def_loc, attr_id=attr_id)
         self.ret_index = ret_index
 
 
