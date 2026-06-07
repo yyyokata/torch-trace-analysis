@@ -44,6 +44,7 @@ class ForwardArgAttr(Attr):
 @dataclass
 class ReturnValAttr(Attr):
     ret_index: int = 0
+    ret_key: str | None = None
 
 
 @dataclass
