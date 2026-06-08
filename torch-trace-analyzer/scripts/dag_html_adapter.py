@@ -172,7 +172,8 @@ def _build_structured_node(
 
 
 def _is_group_node(entry: dict) -> bool:
-    return entry.get("inner_dag") is not None or entry.get("children_nodes") is not None
+    children = entry.get("children_nodes")
+    return entry.get("inner_dag") is not None or (children is not None and len(children) > 0)
 
 
 def _build_group_node(
