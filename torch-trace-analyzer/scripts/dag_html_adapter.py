@@ -47,7 +47,7 @@ class _BuiltNode:
 def adapt_serialized_dag(serialized: dict, model_id: str, mode: str) -> dict:
     _validate_serialized_top_level(serialized)
     state = _AdapterState()
-    root_groups, _top_level_leaves = _walk_serialized_level(serialized, depth=0, state=state)
+    root_groups, _top_level_leaves, _ = _walk_serialized_level(serialized, depth=0, state=state)
     if not root_groups:
         raise RuntimeError("serialized DAG has no root groups")
 
@@ -87,18 +87,24 @@ def _extract_io_node_ids(entries: list[dict]) -> list[int]:
     return node_ids
 
 
-def _walk_serialized_level(serialized: dict, depth: int, state: _AdapterState) -> tuple[list[dict], list[dict]]:
+def _walk_serialized_level(
+    serialized: dict,
+    depth: int,
+    state: _AdapterState,
+) -> tuple[list[dict], list[dict], list[dict]]:
     _validate_serialized_top_level(serialized)
     state.raw_edges.extend(serialized["edges"])
 
     direct_groups: list[dict] = []
     direct_leaves: list[dict] = []
+    call_order: list[dict] = []
 
     for section_name, io_subtype in _IO_SECTION_TO_SUBTYPE.items():
         for entry in serialized[section_name]:
             leaf = _build_io_leaf(entry, io_subtype=io_subtype, depth=depth)
             _register_leaf_node(state, leaf)
             direct_leaves.append(leaf)
+            call_order.append({"id": leaf["id"], "type": "node"})
 
     node_entries = serialized["nodes"]
     node_entry_by_id: dict[int, dict] = {}
@@ -130,9 +136,11 @@ def _walk_serialized_level(serialized: dict, depth: int, state: _AdapterState) -
         )
         if built.kind == "group":
             direct_groups.append(built.payload)
+            call_order.append({"id": built.payload["id"], "type": "group"})
         else:
             direct_leaves.append(built.payload)
-    return direct_groups, direct_leaves
+            call_order.append({"id": built.payload["id"], "type": "node"})
+    return direct_groups, direct_leaves, call_order
 
 
 def _build_structured_node(
@@ -180,6 +188,7 @@ def _build_group_node(
 
     children_nodes: list[int] = []
     children_groups: list[dict] = []
+    call_order: list[dict] = []
     if entry.get("children_nodes") is not None:
         for child_id in entry["children_nodes"]:
             if child_id not in node_entry_by_id:
@@ -195,14 +204,16 @@ def _build_group_node(
             _assign_parent_group(state, child_id, node_id)
             if built.kind == "group":
                 children_groups.append(built.payload)
+                call_order.append({"id": built.payload["id"], "type": "group"})
             else:
                 children_nodes.append(built.payload["id"])
+                call_order.append({"id": built.payload["id"], "type": "node"})
         node_type = "container_group"
     else:
         inner_dag = entry.get("inner_dag")
         if inner_dag is None:
             raise RuntimeError(f"group node {node_id} missing inner_dag")
-        child_groups, child_leaves = _walk_serialized_level(inner_dag, depth=depth + 1, state=state)
+        child_groups, child_leaves, call_order = _walk_serialized_level(inner_dag, depth=depth + 1, state=state)
         for group in child_groups:
             _assign_parent_group(state, group["id"], node_id)
         for leaf in child_leaves:
@@ -218,6 +229,7 @@ def _build_group_node(
         "node_type": node_type,
         "children_nodes": children_nodes,
         "children_groups": children_groups,
+        "call_order": call_order,
         "internal_edges": [],
         **location_fields,
         **_timing_defaults(),

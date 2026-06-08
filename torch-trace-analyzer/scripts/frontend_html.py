@@ -776,17 +776,19 @@ function render() {
     const ioW = 140, ioH = 40;
     const ioGap = 36;
     const pillGap = 18;
-    const topIORows = [
-        { nodeIds: DATA.input_node_ids || [], label: 'Input', defaultSublabel: 'network input', fillColor: 'rgba(46,204,113,0.55)' },
-        { nodeIds: DATA.param_node_ids || [], label: 'Param', defaultSublabel: 'model param', fillColor: 'rgba(155,89,182,0.55)' },
-        { nodeIds: DATA.const_node_ids || [], label: 'Const', defaultSublabel: 'const value', fillColor: 'rgba(241,196,15,0.55)' },
-    ].filter(row => row.nodeIds.length > 0);
-    const bottomIORows = [
-        { nodeIds: DATA.output_node_ids || [], label: 'Result', defaultSublabel: 'result output', fillColor: 'rgba(231,76,60,0.55)' },
-    ].filter(row => row.nodeIds.length > 0);
+    const topIOItems = [
+        ...(DATA.input_node_ids || []).map(id => ({ id, label: 'Input', defaultSublabel: 'network input', fillColor: 'rgba(46,204,113,0.55)' })),
+        ...(DATA.param_node_ids || []).map(id => ({ id, label: 'Param', defaultSublabel: 'model param', fillColor: 'rgba(155,89,182,0.55)' })),
+        ...(DATA.const_node_ids || []).map(id => ({ id, label: 'Const', defaultSublabel: 'const value', fillColor: 'rgba(241,196,15,0.55)' })),
+    ];
+    const bottomIOItems = [
+        ...(DATA.output_node_ids || []).map(id => ({ id, label: 'Result', defaultSublabel: 'result output', fillColor: 'rgba(231,76,60,0.55)' })),
+    ];
+    const topIORows = topIOItems.length > 0 ? [{ items: topIOItems }] : [];
+    const bottomIORows = bottomIOItems.length > 0 ? [{ items: bottomIOItems }] : [];
     const allIORows = topIORows.concat(bottomIORows);
-    const calcIORowWidth = (row) => row.nodeIds.length > 0
-        ? row.nodeIds.length * ioW + (row.nodeIds.length - 1) * pillGap
+    const calcIORowWidth = (row) => row.items.length > 0
+        ? row.items.length * ioW + (row.items.length - 1) * pillGap
         : 0;
     const maxIORowW = allIORows.length > 0 ? Math.max(...allIORows.map(calcIORowWidth)) : 0;
     const topIOHeight = topIORows.length > 0 ? topIORows.length * ioH + (topIORows.length - 1) * ioGap : 0;
@@ -1273,17 +1275,18 @@ function render() {
     }
 
     function renderIOPillRow(row, startY) {
-        if (!row || !row.nodeIds || row.nodeIds.length === 0) return;
+        if (!row || !row.items || row.items.length === 0) return;
         const rowWidth = calcIORowWidth(row);
         let left = (svgW - rowWidth) / 2;
         const cy = startY + ioH / 2;
-        for (const nid of row.nodeIds) {
+        for (const item of row.items) {
+            const nid = item.id;
             const node = nodeMap[nid];
-            const baseText = node ? (node.class_name || node.label || row.defaultSublabel) : row.defaultSublabel;
+            const baseText = node ? (node.class_name || node.label || item.defaultSublabel) : item.defaultSublabel;
             const sublabel = (node && node.has_timing)
                 ? `${baseText} · ${node.pct.toFixed(1)}%`
                 : baseText;
-            renderIOPill(nid, left + ioW / 2, cy, ioW, ioH, row.label, sublabel, row.fillColor);
+            renderIOPill(nid, left + ioW / 2, cy, ioW, ioH, item.label, sublabel, item.fillColor);
             left += ioW + pillGap;
         }
     }
