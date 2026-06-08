@@ -1,7 +1,7 @@
 # DAG-to-HTML 接入设计
 
 ## 1. 目标
-在不重写 `frontend_html.py` 前端模板的前提下，为动态 DAG 构图链路增加一层后端 adapter，把 `serialize_dag(dag, registry)` 产出的 `SerializedDAG` 转成 `render_flowchart_to_file()` 可直接消费的 `flowchart_data`，从而让 `run_dag_session.py` 在输出文本报告之外同步产出 HTML DAG。
+前端做 **最小必要改动**，仅修改 IO 字段识别逻辑（旧单值 → 四分类集合）。`has_timing` / `pct` / `dur_us` / `kernel_us` / `role` 等 timing 字段保留供后续补实现，不在本次删除；本次通过后端 adapter 显式填默认值。动态 DAG 构图链路增加一层后端 adapter，把 `serialize_dag(dag, registry)` 产出的 `SerializedDAG` 转成 `render_flowchart_to_file()` 可直接消费的 `flowchart_data`，从而让 `run_dag_session.py` 在输出文本报告之外同步产出 HTML DAG。
 
 ## 2. 总体方案
 采用 **adapter 层** 方案，不直接改写现有前端模板，也不把旧 schema 兼容逻辑散落到 `run_dag_session.py` 或 `frontend_html.py` 中。
@@ -63,11 +63,7 @@ adapter 放在新文件：
 1. 旧模板目前仍写死使用单值字段 `DATA.input_node_id` / `DATA.loss_node_id`：
    - `isIONodeId()`：`frontend_html.py:335-337`
    - 顶层 IO pill 渲染：`frontend_html.py:1254-1268`
-2. 本次接入不再回填旧字段，而是严格采用 NaN 已确认的 IO 四分类：
-   - `input_node_ids`
-   - `param_node_ids`
-   - `const_node_ids`
-   - `output_node_ids`
+2. 本次接入严格采用 IO 四分类，旧字段 `input_node_id` / `loss_node_id` 从 `frontend_html.py` 里删除；timing 字段保留（adapter 填默认值），evidence/src 字段保留有实际语义。
 3. 因此前端必须同步修改为按四个集合识别 IO；adapter 不应再造 `input_node_id` / `loss_node_id` 这种 shim。
 4. `meta.time` 由 adapter 用当前时间写入；`meta.model_id` / `meta.mode` 由 `run_dag_session.py` 调用 adapter 时显式传参。
 5. `meta.num_modules` 建议定义为 `len(groups) + len(nodes)`，直接复用 header / summary 展示逻辑（`frontend_html.py:1282-1324`）。
@@ -382,9 +378,9 @@ emit(f"[HTML] {html_latest_path}")
 
 ## 6. frontend_html.py 改动点
 
-本次不是重写模板，而是做 **最小必要改动**，让旧模板理解新的 IO 四分类顶层字段。
+本次不是重写模板，而是做 **最小必要改动**，让旧模板理解新的 IO 四分类顶层字段。前端改动范围只包括 6.1 ~ 6.3；其余模板结构、evidence panel、timing 展示字段均不在本次范围内。
 
-### 6.1 `isIONodeId()`：`335-337`
+### 6.1 `isIONodeId()`：`335-337`（本次做）
 当前实现：
 - 只识别 `DATA.input_node_id`
 - 只识别 `DATA.loss_node_id`
@@ -395,19 +391,19 @@ emit(f"[HTML] {html_latest_path}")
 - `DATA.const_node_ids`
 - `DATA.output_node_ids`
 
-建议改法：初始化四个 `Set`，`isIONodeId(nodeId)` 判断是否属于任一集合。
+建议改法：初始化四个 `Set`，`isIONodeId(nodeId)` 判断是否属于任一集合。旧的 `DATA.input_node_id` / `DATA.loss_node_id` 单值读取必须删除，不保留 shim / alias。
 
-### 6.2 IO hover 逻辑：`335-401`
+### 6.2 IO hover 逻辑：`335-401`（本次做）
 `applyEdgeFocusState()` 当前通过 `isIONodeId()` 决定：
 - hovered 节点是否进入 `ioFocusedNodes`
 - active edge 两端是否有 IO 端点
 
-因此这里不需要额外重写算法，但要确保：
+因此这里不需要额外重写算法，只随 6.1 更新 IO 判定来源，并确保：
 1. `isIONodeId()` 已经基于四集合实现
 2. IO 相关节点都能在 `nodeDomRegistry` / `nodeMap` 中找到
 3. output 不再专门绑定到旧的 `loss_node_id`
 
-### 6.3 顶层 render 里的 IO pill：`1212-1268`
+### 6.3 顶层 render 里的 IO pill：`1212-1268`（本次做）
 当前只有两颗 pill：
 - `Input`
 - `Result`
@@ -426,8 +422,9 @@ emit(f"[HTML] {html_latest_path}")
    - const: `Const`
    - output: `Result`
 4. sublabel 从对应 `nodeMap[nid]` 读取 `class_name` 或 `label`
+5. 删除旧的 `DATA.input_node_id` / `DATA.loss_node_id` 单值读取
 
-### 6.4 group/node map 初始化：`456-503`
+### 6.4 group/node map 初始化：`456-503`（not in scope）
 这里现有逻辑仍然可复用：
 - `DATA.groups.forEach(g => groupMap[g.id] = g)`
 - `DATA.nodes.forEach(n => nodeMap[n.id] = n)`
@@ -439,13 +436,13 @@ emit(f"[HTML] {html_latest_path}")
 - `nodes` 含 IO 节点与普通 leaf
 这里就不需要结构性重写。
 
-### 6.5 group 渲染主逻辑：`755-879`
+### 6.5 group 渲染主逻辑：`755-879`（not in scope）
 这里不需要大改模板算法，但 adapter 输出必须满足它的约束：
 - root layout 基于 `DATA.root_groups`
 - 每个 group 需要 `children_nodes` / `children_groups`
 - timing 字段虽然当前无值，但字段必须存在
 
-### 6.6 edge 映射：`971-983`
+### 6.6 edge 映射：`971-983`（not in scope）
 当前 group 内部 edge 读取字段：
 - `from_child`
 - `to_child`
@@ -457,19 +454,17 @@ emit(f"[HTML] {html_latest_path}")
 
 因此 adapter 的 `internal_edges` 必须严格提供这套字段，不能只给 `from` / `to`。
 
-### 6.7 顶层 render / meta / has_timing：`1212-1325`
-这里的 header、legend、summary 基本可复用；关键是 adapter 必须补齐：
+### 6.7 顶层 render / meta / has_timing：`1212-1325`（not in scope）
+这里的 header、legend、summary 基本可复用；本次不删除 timing 字段，adapter 必须补齐默认值：
 - `meta.num_modules`
 - `meta.roots`
 - `has_timing=False`
+- node/group 上的 `pct=0`、`dur_us=0`、`kernel_us=0`、`role=null`
 
-### 6.8 edge panel / evidence：`1517-1614`
-第一阶段不重写 edge panel 结构，但要注意：
-- 当前 `showEdgePanel()` 偏向处理旧 evidence 对象
-- adapter 第一阶段只透传 list 型 evidence，不伪造旧字段
-- 因此前端后续可能需要补一小段“如果 `edge.evidence` 是 list，则按 step 列表展示”的兼容逻辑
+### 6.8 edge panel / evidence：`1517-1614`（not in scope）
+evidence panel 重写不在本次范围内。本次保持现有 panel 结构，adapter 只保留 evidence 的实际语义，不伪造旧 evidence 对象，也不在前端引入结构性重写。
 
-### 6.9 JSON 注入：`1885-1986`
+### 6.9 JSON 注入：`1885-1986`（not in scope）
 这里不需要改 Python 端注入机制；只要 adapter 生成的 `flowchart_data` 字段完整，`_generate_flowchart_html()` 仍可直接用 `const DATA = ...` 注入。
 
 ## 7. dag_serializer.py 改动点（如有）
