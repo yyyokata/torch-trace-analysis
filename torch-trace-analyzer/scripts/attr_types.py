@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+
+_NATIVE_CONTAINER_KINDS = {"ModuleList", "ModuleDict", "Sequential"}
 
 
 @dataclass(frozen=True)
@@ -18,6 +21,7 @@ class Attr:
     class_name: str = ""
     def_loc: CallLoc | None = None
     attr_id: int = 0
+    container_index: int | str | None = None
 
 
 @dataclass
@@ -62,6 +66,25 @@ class ParamAttr(Attr):
     param_name: str = ""
 
 
+@dataclass
+class ContainerAttr(Attr):
+    container_kind: str = ""
+    items: dict[int | str, Attr] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        for key, child in self.items.items():
+            child.parent = self
+            child.container_index = key
+
+    def add_child(self, key: int | str, child: Attr) -> None:
+        child.parent = self
+        child.container_index = key
+        self.items[key] = child
+
+    def get(self, key: int | str) -> Attr | None:
+        return self.items.get(key)
+
+
 __all__ = [
     "CallLoc",
     "Attr",
@@ -73,4 +96,5 @@ __all__ = [
     "FunctionalAttr",
     "ConstantAttr",
     "ParamAttr",
+    "ContainerAttr",
 ]
