@@ -982,7 +982,6 @@ function render() {
                 if (ax < cMinX) cMinX = ax;
                 if (ax + child.w > cMaxX) cMaxX = ax + child.w;
             }
-            const rowBands = pos.rowLayouts.map(r => ({ rank: r.rank, top: oy + r.y, bot: oy + r.y + r.h }));
             // Lanes must live OUTSIDE the children band (cMinX..cMaxX) but
             // INSIDE the group rect (ox..ox+pos.w). Pick a comfortable inset.
             const groupRight = Math.min(ox + pos.w - 6, cMaxX + LAYOUT.laneGutter);
@@ -991,6 +990,7 @@ function render() {
             // before cMinX on the left, never in between.
             const childRightEdge = cMaxX;
             const childLeftEdge = cMinX;
+            const skipLaneCounter = { left: 0, right: 0 };
             for (const ed of g.internal_edges) {
                 const fr = childAbsRect[ed.from_child];
                 const to = childAbsRect[ed.to_child];
@@ -1007,9 +1007,14 @@ function render() {
                     evidence: ed.evidence,
                 };
                 if (!isEdgeVisible(routedEdge)) continue;
-                drawRoutedEdge(fr, to, ed.type, rowBands,
-                               groupLeft, groupRight,
-                               childLeftEdge, childRightEdge, routedEdge);
+                renderEdge({
+                    routingMode: 'intra_group',
+                    fr,
+                    to,
+                    type: ed.type,
+                    edgeData: routedEdge,
+                    routeCtx: { groupLeft, groupRight, childLeftEdge, childRightEdge, skipLaneCounter },
+                });
             }
         }
 
@@ -1087,16 +1092,15 @@ function render() {
         path.setAttribute('stroke-dasharray', path.dataset.truncatedDasharray);
     }
 
-    function drawEdge(x1, y1, x2, y2, type, edgeData, routeMeta=null) {
+    function buildDirectEdgePath(x1, y1, x2, y2, routeMeta) {
         const dy = y2 - y1;
         const dx = x2 - x1;
-        if (Math.abs(dy) < 3 && Math.abs(dx) < 3) return;
+        if (Math.abs(dy) < 3 && Math.abs(dx) < 3) return null;
         const meta = routeMeta || {};
         const offset = meta.bundleOffset || 0;
         const sourceFanout = meta.sourceFanout || 1;
         const targetFanin = meta.targetFanin || 1;
         const sideBias = offset === 0 ? (dx >= 0 ? 1 : -1) : (offset > 0 ? 1 : -1);
-        const curvature = Math.max(16, Math.min(90, Math.abs(offset) * 1.25 + Math.max(sourceFanout, targetFanin) * 3));
         let d;
         if (dy > 8) {
             const cp = Math.max(24, Math.min(Math.abs(dy) * 0.34 + Math.abs(offset) * 0.7, 96));
@@ -1112,15 +1116,7 @@ function render() {
             const midY = (y1 + y2) / 2 + 14 + Math.abs(offset) * 0.28;
             d = `M${x1},${y1} Q${midX},${midY} ${x2},${y2}`;
         }
-
-        const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-        path.setAttribute('d', d);
-        applyEdgeStyle(path, type);
-        if (edgeData) {
-            attachEdgeClick(path, edgeData);
-        }
-        svg.appendChild(path);
-        configureLongEdgeDisplay(path);
+        return { d };
     }
 
     // Rank-aware edge routing for intra-group edges.
@@ -1130,8 +1126,8 @@ function render() {
     // - Skip-rank edges (span > 1 row) are routed around the intermediate
     //   rows by bending sideways, choosing the side closest to the source/dest
     //   x. Each skip edge gets its own lane offset to avoid overlap.
-    const skipLaneCounter = { left: 0, right: 0 };
-    function drawRoutedEdge(fr, to, type, rowBands, groupLeft, groupRight, childLeftEdge, childRightEdge, edgeData) {
+    function buildIntraGroupEdgePath(fr, to, routeCtx, edgeData) {
+        const { groupLeft, groupRight, childLeftEdge, childRightEdge, skipLaneCounter } = routeCtx;
         // Source: bottom-center of the from rect; Dest: top-center of the to rect
         const x1 = fr.x + fr.w / 2, y1 = fr.y + fr.h;
         const x2 = to.x + to.w / 2, y2 = to.y;
@@ -1139,18 +1135,12 @@ function render() {
         const span = Math.abs(toRank - fromRank);
 
         if (span <= 1 && y2 > y1) {
-            drawEdge(x1, y1, x2, y2, type, edgeData, EDGE_BUNDLE_META.get(edgeKey(edgeData)) || null);
-            return;
+            return buildDirectEdgePath(x1, y1, x2, y2, EDGE_BUNDLE_META.get(edgeKey(edgeData)) || null);
         }
         if (span === 0) {
-            const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-            path.setAttribute('d', `M${x1},${y1} C${x1},${y1+14} ${x2},${y2+14} ${x2},${y2}`);
-            path.setAttribute('class', `edge-path ${type || ''}`);
-            path.setAttribute('marker-end', type === 'dep' ? 'url(#arrowhead-dep)' : 'url(#arrowhead)');
-            if (edgeData) attachEdgeClick(path, edgeData);
-            svg.appendChild(path);
-            configureLongEdgeDisplay(path);
-            return;
+            return {
+                d: `M${x1},${y1} C${x1},${y1+14} ${x2},${y2+14} ${x2},${y2}`,
+            };
         }
 
         const groupMidX = (childLeftEdge + childRightEdge) / 2;
@@ -1168,20 +1158,40 @@ function render() {
             : Math.max(groupLeft + 4, childLeftEdge - 14 - (laneIndex % 4) * laneStep);
 
         const verticalApproach = 18;
-        const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
         const d = [
             `M${x1},${y1}`,
             `C${x1},${y1 + verticalApproach} ${laneX},${y1 + verticalApproach} ${laneX},${y1 + verticalApproach + 10}`,
             `L${laneX},${y2 - verticalApproach - 10}`,
             `C${laneX},${y2 - verticalApproach} ${x2},${y2 - verticalApproach} ${x2},${y2}`
         ].join(' ');
+        return { d, opacity: '0.7' };
+    }
+
+    function createEdgePathElement(d) {
+        const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
         path.setAttribute('d', d);
-        path.setAttribute('class', `edge-path ${type || ''}`);
-        path.setAttribute('marker-end', type === 'dep' ? 'url(#arrowhead-dep)' : 'url(#arrowhead)');
-        path.setAttribute('opacity', '0.7');
-        if (edgeData) attachEdgeClick(path, edgeData);
+        return path;
+    }
+
+    function finalizeEdgeRendering(path) {
         svg.appendChild(path);
         configureLongEdgeDisplay(path);
+    }
+
+    function renderEdge(edgeSpec) {
+        let pathSpec = null;
+        if (edgeSpec.routingMode === 'direct') {
+            pathSpec = buildDirectEdgePath(edgeSpec.x1, edgeSpec.y1, edgeSpec.x2, edgeSpec.y2, edgeSpec.routeMeta);
+        } else if (edgeSpec.routingMode === 'intra_group') {
+            pathSpec = buildIntraGroupEdgePath(edgeSpec.fr, edgeSpec.to, edgeSpec.routeCtx, edgeSpec.edgeData);
+        } else {
+            throw new Error(`Unknown edge routing mode: ${edgeSpec.routingMode}`);
+        }
+        if (!pathSpec) return;
+        const path = createEdgePathElement(pathSpec.d);
+        applyEdgePresentation(path, edgeSpec.type, pathSpec.opacity ?? null);
+        bindEdgeInteractions(path, edgeSpec.edgeData);
+        finalizeEdgeRendering(path);
     }
 
     function registerEdgeDom(path, edgeData) {
@@ -1189,7 +1199,7 @@ function render() {
         edgeDomRegistry.push({ path, edge: edgeData, key: edgeKey(edgeData) });
     }
 
-    function applyEdgeStyle(path, type) {
+    function applyEdgePresentation(path, type, opacity=null) {
         path.setAttribute('class', `edge-path ${type || ''}`);
         if (type === 'dep') {
             path.setAttribute('marker-end', 'url(#arrowhead-dep)');
@@ -1198,9 +1208,12 @@ function render() {
         } else {
             path.setAttribute('marker-end', 'url(#arrowhead)');
         }
+        if (opacity !== null) {
+            path.setAttribute('opacity', opacity);
+        }
     }
 
-    function attachEdgeClick(path, edgeData) {
+    function bindEdgeInteractions(path, edgeData) {
         if (!path || !edgeData) return;
         const key = edgeKey(edgeData);
         path.style.cursor = 'pointer';
@@ -1311,7 +1324,14 @@ function render() {
         const fromPos = positions[edge.from + '__out'] || positions[edge.from];
         const toPos = positions[edge.to + '__in'] || positions[edge.to];
         if (fromPos && toPos) {
-            drawEdge(fromPos.cx, fromPos.cy, toPos.cx, toPos.cy, edge.type || 'dep', edge, EDGE_BUNDLE_META.get(edgeKey(edge)) || null);
+            renderEdge({
+                routingMode: 'direct',
+                x1: fromPos.cx, y1: fromPos.cy,
+                x2: toPos.cx, y2: toPos.cy,
+                type: edge.type || 'dep',
+                edgeData: edge,
+                routeMeta: EDGE_BUNDLE_META.get(edgeKey(edge)) || null,
+            });
         }
     }
 
