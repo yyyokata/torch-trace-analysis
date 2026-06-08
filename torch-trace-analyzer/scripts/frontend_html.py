@@ -184,7 +184,8 @@ const DATA = __FLOWCHART_DATA_PLACEHOLDER__;
 const groupMap = {};
 const nodeMap = {};
 const collapsedState = {};
-let positions = {};
+let groupLayout = {};
+let nodePortMap = {};
 let edgeDomRegistry = [];
 let focusedEdgePath = null;
 let hoveredEdgeKey = null;
@@ -651,7 +652,7 @@ function layoutGroup(gid) {
         // Collapsed: render as a single node-like box
         const w = LAYOUT.nodeW + 20;
         const h = LAYOUT.nodeH + 8;
-        positions[gid] = { w, h, collapsed: true };
+        groupLayout[gid] = { w, h, collapsed: true };
         return { w, h };
     }
 
@@ -660,7 +661,7 @@ function layoutGroup(gid) {
     if (callOrder.length === 0) {
         const w = LAYOUT.nodeW + 40;
         const h = LAYOUT.nodeH + LAYOUT.groupPadTop + LAYOUT.groupPadBottom;
-        positions[gid] = { w, h, collapsed: false, childPositions: [] };
+        groupLayout[gid] = { w, h, collapsed: false, childPositions: [] };
         return { w, h };
     }
 
@@ -749,7 +750,7 @@ function layoutGroup(gid) {
         }
     }
 
-    positions[gid] = {
+    groupLayout[gid] = {
         w: groupW, h: groupH, collapsed: false, childPositions,
         rowLayouts, rankInfo
     };
@@ -758,14 +759,14 @@ function layoutGroup(gid) {
 
 function render() {
     // Clear and rebuild positions / edge registry on every render
-    positions = {};
+    groupLayout = {};
+    nodePortMap = {};
     edgeDomRegistry = [];
     nodeDomRegistry = new Map();
     focusedEdgePath = null;
     hoveredEdgeKey = null;
     hoveredGroupId = null;
     hoveredNodeId = null;
-    positions = {};
     // Layout root groups (RootModule)
     const rootSizes = DATA.root_groups.map(rid => {
         const sz = layoutGroup(rid);
@@ -856,7 +857,7 @@ function render() {
 
     function renderGroupAt(gid, ox, oy) {
         const g = groupMap[gid];
-        const pos = positions[gid];
+        const pos = groupLayout[gid];
         if (!pos) return;
 
         if (pos.collapsed) {
@@ -903,9 +904,9 @@ function render() {
             }
 
             // Register port positions for edges
-            positions[gid + '__in'] = { cx: ox + pos.w/2, cy: oy };
-            positions[gid + '__out'] = { cx: ox + pos.w/2, cy: oy + pos.h };
-            positions[gid + '__center'] = { cx: ox + pos.w/2, cy: oy + pos.h/2 };
+            nodePortMap[gid + '__in'] = { cx: ox + pos.w/2, cy: oy };
+            nodePortMap[gid + '__out'] = { cx: ox + pos.w/2, cy: oy + pos.h };
+            nodePortMap[gid + '__center'] = { cx: ox + pos.w/2, cy: oy + pos.h/2 };
             return;
         }
 
@@ -1019,8 +1020,8 @@ function render() {
         }
 
         // Register port positions
-        positions[gid + '__in'] = { cx: ox + pos.w/2, cy: oy };
-        positions[gid + '__out'] = { cx: ox + pos.w/2, cy: oy + pos.h };
+        nodePortMap[gid + '__in'] = { cx: ox + pos.w/2, cy: oy };
+        nodePortMap[gid + '__out'] = { cx: ox + pos.w/2, cy: oy + pos.h };
     }
 
     function renderNodeAt(nid, nx, ny, w, h) {
@@ -1063,9 +1064,9 @@ function render() {
         }
 
         // Register positions for edges
-        positions[nid] = { cx: nx + w/2, cy: ny + h/2 };
-        positions[nid + '__in'] = { cx: nx + w/2, cy: ny };
-        positions[nid + '__out'] = { cx: nx + w/2, cy: ny + h };
+        nodePortMap[nid] = { cx: nx + w/2, cy: ny + h/2 };
+        nodePortMap[nid + '__in'] = { cx: nx + w/2, cy: ny };
+        nodePortMap[nid + '__out'] = { cx: nx + w/2, cy: ny + h };
     }
 
     function configureLongEdgeDisplay(path) {
@@ -1282,9 +1283,9 @@ function render() {
             svg.appendChild(sub);
         }
 
-        positions[nid] = { cx, cy };
-        positions[nid + '__in'] = { cx, cy: y };
-        positions[nid + '__out'] = { cx, cy: y + h };
+        nodePortMap[nid] = { cx, cy };
+        nodePortMap[nid + '__in'] = { cx, cy: y };
+        nodePortMap[nid + '__out'] = { cx, cy: y + h };
     }
 
     function renderIOPillRow(row, startY) {
@@ -1321,8 +1322,8 @@ function render() {
     // Global edge pass: draw all data dependency edges using registered positions
     for (const edge of DATA.edges) {
         if (!isEdgeVisible(edge)) continue;
-        const fromPos = positions[edge.from + '__out'] || positions[edge.from];
-        const toPos = positions[edge.to + '__in'] || positions[edge.to];
+        const fromPos = nodePortMap[edge.from + '__out'] || nodePortMap[edge.from];
+        const toPos = nodePortMap[edge.to + '__in'] || nodePortMap[edge.to];
         if (fromPos && toPos) {
             renderEdge({
                 routingMode: 'direct',
@@ -1893,7 +1894,8 @@ def _generate_flowchart_html_dual(data_train, data_infer):
         '    try { if (typeof nodeAncestorGroups !== "undefined" && nodeAncestorGroups && nodeAncestorGroups.clear) nodeAncestorGroups.clear(); } catch(e){}\n'
         '    try { if (typeof nodeDomRegistry !== "undefined" && nodeDomRegistry && nodeDomRegistry.clear) nodeDomRegistry.clear(); } catch(e){}\n'
         '    try { if (typeof edgeDomRegistry !== "undefined") edgeDomRegistry.length = 0; } catch(e){}\n'
-        '    try { if (typeof positions !== "undefined") { Object.keys(positions).forEach(k => delete positions[k]); } } catch(e){}\n'
+        '    try { if (typeof groupLayout !== "undefined") { Object.keys(groupLayout).forEach(k => delete groupLayout[k]); } } catch(e){}\n'
+        '    try { if (typeof nodePortMap !== "undefined") { Object.keys(nodePortMap).forEach(k => delete nodePortMap[k]); } } catch(e){}\n'
         '    try { hoveredEdgeKey = null; hoveredNodeId = null; hoveredGroupId = null; focusedEdgeKey = null; } catch(e){}\n'
         '    // Close any open side panel from the previous tab.\n'
         '    try { var sp = document.getElementById("side-panel"); if (sp) sp.classList.remove("open"); } catch(e){}\n'
