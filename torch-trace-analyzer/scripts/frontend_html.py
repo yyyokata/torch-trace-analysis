@@ -972,15 +972,51 @@ function render() {
         // the row layout to bend edges around obstacles.
         if (g.internal_edges && pos.rowLayouts) {
             const childAbsRect = {};
+            const childGroupRects = {};
             let cMinX = Infinity, cMaxX = -Infinity;
             for (const child of cp) {
                 const ax = ox + child.x;
-                childAbsRect[child.id] = {
+                const absRect = {
                     x: ax, y: oy + child.y,
                     w: child.w, h: child.h, rank: child.rank
                 };
+                childAbsRect[child.id] = absRect;
+                if (child.type === 'group') {
+                    childGroupRects[child.id] = absRect;
+                }
                 if (ax < cMinX) cMinX = ax;
                 if (ax + child.w > cMaxX) cMaxX = ax + child.w;
+            }
+            function resolveChildEndpointRect(childId) {
+                if (typeof childId === 'string') {
+                    if (childId.endsWith('__out')) {
+                        const groupId = childId.slice(0, -'__out'.length);
+                        const groupRect = childGroupRects[groupId];
+                        if (groupRect) {
+                            return {
+                                x: groupRect.x + groupRect.w,
+                                y: groupRect.y + groupRect.h / 2,
+                                w: 0,
+                                h: 0,
+                                rank: groupRect.rank,
+                            };
+                        }
+                    }
+                    if (childId.endsWith('__in')) {
+                        const groupId = childId.slice(0, -'__in'.length);
+                        const groupRect = childGroupRects[groupId];
+                        if (groupRect) {
+                            return {
+                                x: groupRect.x,
+                                y: groupRect.y + groupRect.h / 2,
+                                w: 0,
+                                h: 0,
+                                rank: groupRect.rank,
+                            };
+                        }
+                    }
+                }
+                return childAbsRect[childId];
             }
             const rowBands = pos.rowLayouts.map(r => ({ rank: r.rank, top: oy + r.y, bot: oy + r.y + r.h }));
             // Lanes must live OUTSIDE the children band (cMinX..cMaxX) but
@@ -992,8 +1028,8 @@ function render() {
             const childRightEdge = cMaxX;
             const childLeftEdge = cMinX;
             for (const ed of g.internal_edges) {
-                const fr = childAbsRect[ed.from_child];
-                const to = childAbsRect[ed.to_child];
+                const fr = resolveChildEndpointRect(ed.from_child);
+                const to = resolveChildEndpointRect(ed.to_child);
                 if (!fr || !to) continue;
                 const routedEdge = {
                     __internal: true,
