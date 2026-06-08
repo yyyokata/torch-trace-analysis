@@ -328,7 +328,7 @@ def _edge_type_from_flag(is_containment: bool | None) -> str:
     if is_containment is True:
         return "containment"
     if is_containment is False:
-        return "data"
+        return "dep"
     raise RuntimeError(f"unsupported is_containment value: {is_containment!r}")
 
 
