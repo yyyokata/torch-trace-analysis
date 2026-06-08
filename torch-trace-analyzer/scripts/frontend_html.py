@@ -333,7 +333,11 @@ function getAncestorGroups(nodeId) {
 }
 
 function isIONodeId(nodeId) {
-    return !!nodeId && (nodeId === DATA.input_node_id || nodeId === DATA.loss_node_id);
+    if (nodeId === null || nodeId === undefined) return false;
+    return (DATA.input_node_ids || []).includes(nodeId)
+        || (DATA.param_node_ids || []).includes(nodeId)
+        || (DATA.const_node_ids || []).includes(nodeId)
+        || (DATA.output_node_ids || []).includes(nodeId);
 }
 
 function applyEdgeFocusState() {
@@ -768,14 +772,31 @@ function render() {
         return { id: rid, ...sz };
     });
 
-    // Top-level layout is a strict vertical chain: Input → RootModule → Result
+    // Top-level layout reserves dedicated rows for 4-class IO pills and root groups.
     const ioW = 140, ioH = 40;
-    const ioGap = 36;  // vertical gap between Input/Root/Result
+    const ioGap = 36;
+    const pillGap = 18;
+    const topIORows = [
+        { nodeIds: DATA.input_node_ids || [], label: 'Input', defaultSublabel: 'network input', fillColor: 'rgba(46,204,113,0.55)' },
+        { nodeIds: DATA.param_node_ids || [], label: 'Param', defaultSublabel: 'model param', fillColor: 'rgba(155,89,182,0.55)' },
+        { nodeIds: DATA.const_node_ids || [], label: 'Const', defaultSublabel: 'const value', fillColor: 'rgba(241,196,15,0.55)' },
+    ].filter(row => row.nodeIds.length > 0);
+    const bottomIORows = [
+        { nodeIds: DATA.output_node_ids || [], label: 'Result', defaultSublabel: 'result output', fillColor: 'rgba(231,76,60,0.55)' },
+    ].filter(row => row.nodeIds.length > 0);
+    const allIORows = topIORows.concat(bottomIORows);
+    const calcIORowWidth = (row) => row.nodeIds.length > 0
+        ? row.nodeIds.length * ioW + (row.nodeIds.length - 1) * pillGap
+        : 0;
+    const maxIORowW = allIORows.length > 0 ? Math.max(...allIORows.map(calcIORowWidth)) : 0;
+    const topIOHeight = topIORows.length > 0 ? topIORows.length * ioH + (topIORows.length - 1) * ioGap : 0;
+    const bottomIOHeight = bottomIORows.length > 0 ? bottomIORows.length * ioH + (bottomIORows.length - 1) * ioGap : 0;
     const maxRootW = rootSizes.length ? Math.max(...rootSizes.map(r => r.w)) : LAYOUT.nodeW;
     const maxRootH = rootSizes.length ? Math.max(...rootSizes.map(r => r.h)) : LAYOUT.nodeH;
 
-    const svgW = Math.max(maxRootW + 80, 480);
-    const svgH = ioH * 2 + ioGap * 2 + maxRootH + 80;
+    const svgW = Math.max(maxRootW + 80, maxIORowW + 80, 480);
+    const rootStartY = 30 + (topIOHeight > 0 ? topIOHeight + ioGap : 0);
+    const svgH = 30 + topIOHeight + (topIOHeight > 0 ? ioGap : 0) + maxRootH + (bottomIOHeight > 0 ? ioGap + bottomIOHeight : 0) + 40;
 
     const svg = document.getElementById('dag-svg');
     svg.addEventListener('click', () => clearEdgeFocus());
@@ -798,7 +819,7 @@ function render() {
     if (rootSizes.length > 0) {
         const rs = rootSizes[0];
         const rx = (svgW - rs.w) / 2;
-        const ry = 30 + ioH + ioGap;
+        const ry = rootStartY;
         rootPositions.push({ id: rs.id, x: rx, y: ry, w: rs.w, h: rs.h });
     }
 
@@ -1209,7 +1230,7 @@ function render() {
         renderGroupAt(rp.id, rp.x, rp.y);
     }
 
-    // Render top-level synthetic Input / Result pill nodes
+    // Render top-level synthetic IO pill nodes
     function renderIOPill(nid, cx, cy, w, h, label, sublabel, fillColor) {
         const n = nodeMap[nid];
         const x = cx - w/2;
@@ -1251,21 +1272,33 @@ function render() {
         positions[nid + '__out'] = { cx, cy: y + h };
     }
 
-    if (DATA.input_node_id) {
-        const cx = svgW / 2;
-        const cy = 30 + ioH / 2;
-        renderIOPill(DATA.input_node_id, cx, cy, ioW, ioH, 'Input', 'network input', 'rgba(46,204,113,0.55)');
+    function renderIOPillRow(row, startY) {
+        if (!row || !row.nodeIds || row.nodeIds.length === 0) return;
+        const rowWidth = calcIORowWidth(row);
+        let left = (svgW - rowWidth) / 2;
+        const cy = startY + ioH / 2;
+        for (const nid of row.nodeIds) {
+            const node = nodeMap[nid];
+            const baseText = node ? (node.class_name || node.label || row.defaultSublabel) : row.defaultSublabel;
+            const sublabel = (node && node.has_timing)
+                ? `${baseText} · ${node.pct.toFixed(1)}%`
+                : baseText;
+            renderIOPill(nid, left + ioW / 2, cy, ioW, ioH, row.label, sublabel, row.fillColor);
+            left += ioW + pillGap;
+        }
     }
-    if (DATA.loss_node_id) {
-        const lossNode = nodeMap[DATA.loss_node_id];
-        const cx = svgW / 2;
-        const rootEntry = rootPositions[0];
-        const baseY = rootEntry ? (rootEntry.y + rootEntry.h) : (30 + ioH + ioGap + maxRootH);
-        const cy = baseY + ioGap + ioH / 2;
-        const sub = (lossNode && lossNode.has_timing)
-            ? `${lossNode.class_name} · ${lossNode.pct.toFixed(1)}%`
-            : (lossNode ? lossNode.class_name : 'result output');
-        renderIOPill(DATA.loss_node_id, cx, cy, ioW, ioH, 'Result', sub, 'rgba(231,76,60,0.55)');
+
+    let topIOY = 30;
+    for (const row of topIORows) {
+        renderIOPillRow(row, topIOY);
+        topIOY += ioH + ioGap;
+    }
+
+    const rootEntry = rootPositions[0];
+    let bottomIOY = rootEntry ? (rootEntry.y + rootEntry.h + ioGap) : (rootStartY + maxRootH + ioGap);
+    for (const row of bottomIORows) {
+        renderIOPillRow(row, bottomIOY);
+        bottomIOY += ioH + ioGap;
     }
 
 
