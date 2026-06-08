@@ -758,7 +758,7 @@ function layoutGroup(gid) {
 }
 
 function render() {
-    // Clear and rebuild positions / edge registry on every render
+    // Clear and rebuild groupLayout / edge registry on every render
     groupLayout = {};
     nodePortMap = {};
     edgeDomRegistry = [];
@@ -903,7 +903,7 @@ function render() {
                 );
             }
 
-            // Register port positions for edges
+            // Register nodePortMap port coordinates for edges
             nodePortMap[gid + '__in'] = { cx: ox + pos.w/2, cy: oy };
             nodePortMap[gid + '__out'] = { cx: ox + pos.w/2, cy: oy + pos.h };
             nodePortMap[gid + '__center'] = { cx: ox + pos.w/2, cy: oy + pos.h/2 };
@@ -1019,7 +1019,7 @@ function render() {
             }
         }
 
-        // Register port positions
+        // Register nodePortMap port coordinates
         nodePortMap[gid + '__in'] = { cx: ox + pos.w/2, cy: oy };
         nodePortMap[gid + '__out'] = { cx: ox + pos.w/2, cy: oy + pos.h };
     }
@@ -1063,7 +1063,7 @@ function render() {
             svg.appendChild(sub);
         }
 
-        // Register positions for edges
+        // Register nodePortMap coordinates for edges
         nodePortMap[nid] = { cx: nx + w/2, cy: ny + h/2 };
         nodePortMap[nid + '__in'] = { cx: nx + w/2, cy: ny };
         nodePortMap[nid + '__out'] = { cx: nx + w/2, cy: ny + h };
@@ -1319,7 +1319,7 @@ function render() {
     }
 
 
-    // Global edge pass: draw all data dependency edges using registered positions
+    // Global edge pass: draw all data dependency edges using registered nodePortMap coordinates
     for (const edge of DATA.edges) {
         if (!isEdgeVisible(edge)) continue;
         const fromPos = nodePortMap[edge.from + '__out'] || nodePortMap[edge.from];
