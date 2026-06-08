@@ -1,186 +1,168 @@
-/* global groupMap, groupLayout, nodePortMap, svg, LAYOUT, bindGroupHover, registerNodeDom, toggleGroup, showSourcePanel, getGroupBorderColor, formatDur, isEdgeVisible, renderEdge, renderNodeAt */
-/*
- * render_group.js
- *
- * Closure dependencies injected by frontend_html.py inline <script> scope:
- * - state: groupMap, groupLayout, nodePortMap, svg, LAYOUT
- * - DOM helpers: bindGroupHover, registerNodeDom, toggleGroup, showSourcePanel
- * - style/data helpers: getGroupBorderColor, formatDur, isEdgeVisible, renderEdge
- * - renderers: renderNodeAt, renderGroupAt (recursive self-call)
- */
+/* global svg, groupMap, groupLayout, nodePortMap, LAYOUT, registerNodeDom, bindGroupHover, toggleGroup, appendGroupInfoButton, formatDur, getGroupBorderColor, isEdgeVisible, renderEdge, renderNodeAt */
+// render_group.js
+// Depends on closure variables from the main template:
+//   svg, groupMap, groupLayout, nodePortMap, LAYOUT,
+//   registerNodeDom, bindGroupHover, toggleGroup,
+//   appendGroupInfoButton, formatDur, getGroupBorderColor,
+//   isEdgeVisible, renderEdge, renderNodeAt, renderGroupAt
+
 const RENDER_GROUP_SVG_NS = 'http://www.w3.org/2000/svg';
+const RENDER_GROUP_EXPORTS = {};
 
-function appendGroupInfoButton(g, cx, cy, titleText = '') {
-    if (!g || !g.src_file) return null;
-    const hit = document.createElementNS(RENDER_GROUP_SVG_NS, 'circle');
-    hit.setAttribute('cx', cx);
-    hit.setAttribute('cy', cy - 1);
-    hit.setAttribute('r', 9);
-    hit.setAttribute('class', 'group-info-hit');
-    hit.addEventListener('click', (e) => {
-        e.stopPropagation();
-        showSourcePanel(g);
-    });
-    svg.appendChild(hit);
-
-    const info = document.createElementNS(RENDER_GROUP_SVG_NS, 'text');
-    info.setAttribute('x', cx);
-    info.setAttribute('y', cy - 1);
-    info.setAttribute('class', 'group-toggle group-info-text');
-    info.textContent = 'i';
-    if (titleText) {
-        const titleEl = document.createElementNS(RENDER_GROUP_SVG_NS, 'title');
-        titleEl.textContent = titleText;
-        info.appendChild(titleEl);
+function getGroupRenderContext(gid, ox, oy) {
+    const g = groupMap[gid];
+    if (!g) {
+        throw new Error(`renderGroupAt group not found: ${gid}`);
     }
-    svg.appendChild(info);
-    return { hit, info };
+    const pos = Object.prototype.hasOwnProperty.call(groupLayout, gid) ? groupLayout[gid] : null;
+    return { gid, g, pos, ox, oy };
 }
 
-function registerGroupPorts(gid, ox, oy, pos, includeCenter = false) {
-    nodePortMap[gid + '__in'] = { cx: ox + pos.w / 2, cy: oy };
-    nodePortMap[gid + '__out'] = { cx: ox + pos.w / 2, cy: oy + pos.h };
-    if (includeCenter) {
-        nodePortMap[gid + '__center'] = { cx: ox + pos.w / 2, cy: oy + pos.h / 2 };
-    }
-    return includeCenter ? nodePortMap[gid + '__center'] : null;
-}
-
-function renderCollapsedGroupBox(gid, g, pos, ox, oy) {
+function renderCollapsedGroupBox(ctx) {
     const rect = document.createElementNS(RENDER_GROUP_SVG_NS, 'rect');
-    rect.setAttribute('x', ox);
-    rect.setAttribute('y', oy);
-    rect.setAttribute('width', pos.w);
-    rect.setAttribute('height', pos.h);
+    rect.setAttribute('x', ctx.ox);
+    rect.setAttribute('y', ctx.oy);
+    rect.setAttribute('width', ctx.pos.w);
+    rect.setAttribute('height', ctx.pos.h);
     rect.setAttribute('class', 'group-box collapsed');
-    rect.setAttribute('style', `stroke: ${getGroupBorderColor(g)}`);
-    rect.dataset.gid = gid;
-    rect.addEventListener('dblclick', () => toggleGroup(gid));
-    bindGroupHover(rect, gid);
+    rect.setAttribute('style', `stroke: ${getGroupBorderColor(ctx.g)}`);
+    rect.dataset.gid = ctx.gid;
+    rect.addEventListener('dblclick', () => toggleGroup(ctx.gid));
+    bindGroupHover(rect, ctx.gid);
     svg.appendChild(rect);
-    registerNodeDom(gid, rect);
+    registerNodeDom(ctx.gid, rect);
     return rect;
 }
 
-function renderCollapsedGroupLabel(gid, g, pos, ox, oy) {
-    const label = document.createElementNS(RENDER_GROUP_SVG_NS, 'text');
-    label.setAttribute('x', ox + pos.w / 2);
-    label.setAttribute('y', oy + pos.h / 2 - 2);
-    label.setAttribute('text-anchor', 'middle');
-    label.setAttribute('class', 'group-label');
-    label.textContent = `▶ ${g.label}`;
-    bindGroupHover(label, gid);
-    svg.appendChild(label);
-    return label;
+function renderCollapsedGroupLabel(ctx) {
+    const labelText = `▶ ${ctx.g.label}`;
+    const labelEl = document.createElementNS(RENDER_GROUP_SVG_NS, 'text');
+    labelEl.setAttribute('x', ctx.ox + ctx.pos.w / 2);
+    labelEl.setAttribute('y', ctx.oy + ctx.pos.h / 2 - 2);
+    labelEl.setAttribute('text-anchor', 'middle');
+    labelEl.setAttribute('class', 'group-label');
+    labelEl.textContent = labelText;
+    bindGroupHover(labelEl, ctx.gid);
+    svg.appendChild(labelEl);
+    return { labelText, labelEl };
 }
 
-function renderCollapsedGroupTiming(gid, g, pos, ox, oy) {
-    if (!g.has_timing) return null;
-    const timing = document.createElementNS(RENDER_GROUP_SVG_NS, 'text');
-    timing.setAttribute('x', ox + pos.w / 2);
-    timing.setAttribute('y', oy + pos.h / 2 + 12);
-    timing.setAttribute('text-anchor', 'middle');
-    timing.setAttribute('class', 'group-timing');
-    timing.textContent = `Kernel ${g.pct.toFixed(1)}% · ${formatDur(g.dur_us)}`;
-    bindGroupHover(timing, gid);
-    svg.appendChild(timing);
-    return timing;
+function renderCollapsedGroupTiming(ctx) {
+    if (!ctx.g.has_timing) return null;
+    const timingEl = document.createElementNS(RENDER_GROUP_SVG_NS, 'text');
+    timingEl.setAttribute('x', ctx.ox + ctx.pos.w / 2);
+    timingEl.setAttribute('y', ctx.oy + ctx.pos.h / 2 + 12);
+    timingEl.setAttribute('text-anchor', 'middle');
+    timingEl.setAttribute('class', 'group-timing');
+    timingEl.textContent = `Kernel ${ctx.g.pct.toFixed(1)}% · ${formatDur(ctx.g.dur_us)}`;
+    bindGroupHover(timingEl, ctx.gid);
+    svg.appendChild(timingEl);
+    return timingEl;
 }
 
-function renderCollapsedGroupInfoButton(g, pos, ox, oy) {
-    if (!g.src_file) return null;
-    return appendGroupInfoButton(
-        g,
-        ox + pos.w - 13,
-        oy + 10,
-        `View ${g.label} class definition (${g.src_file}:${g.src_start_line}-${g.src_end_line})`
+function renderCollapsedGroupInfoButton(ctx) {
+    if (!ctx.g.src_file) return;
+    appendGroupInfoButton(
+        ctx.g,
+        ctx.ox + ctx.pos.w - 13,
+        ctx.oy + 10,
+        `View ${ctx.g.label} class definition (${ctx.g.src_file}:${ctx.g.src_start_line}-${ctx.g.src_end_line})`
     );
 }
 
-function renderCollapsedGroup(gid, g, pos, ox, oy) {
-    const rect = renderCollapsedGroupBox(gid, g, pos, ox, oy);
-    const label = renderCollapsedGroupLabel(gid, g, pos, ox, oy);
-    const timing = renderCollapsedGroupTiming(gid, g, pos, ox, oy);
-    const info = renderCollapsedGroupInfoButton(g, pos, ox, oy);
-    registerGroupPorts(gid, ox, oy, pos, true);
-    return { rect, label, timing, info };
+function registerCollapsedGroupPorts(ctx) {
+    nodePortMap[ctx.gid + '__in'] = { cx: ctx.ox + ctx.pos.w / 2, cy: ctx.oy };
+    nodePortMap[ctx.gid + '__out'] = { cx: ctx.ox + ctx.pos.w / 2, cy: ctx.oy + ctx.pos.h };
+    nodePortMap[ctx.gid + '__center'] = { cx: ctx.ox + ctx.pos.w / 2, cy: ctx.oy + ctx.pos.h / 2 };
 }
 
-function renderExpandedGroupBox(gid, g, pos, ox, oy) {
+function renderExpandedGroupBox(ctx) {
     const rect = document.createElementNS(RENDER_GROUP_SVG_NS, 'rect');
-    rect.setAttribute('x', ox);
-    rect.setAttribute('y', oy);
-    rect.setAttribute('width', pos.w);
-    rect.setAttribute('height', pos.h);
+    rect.setAttribute('x', ctx.ox);
+    rect.setAttribute('y', ctx.oy);
+    rect.setAttribute('width', ctx.pos.w);
+    rect.setAttribute('height', ctx.pos.h);
     rect.setAttribute('class', 'group-box');
-    rect.setAttribute('style', `stroke: ${getGroupBorderColor(g)}`);
-    rect.dataset.gid = gid;
+    rect.setAttribute('style', `stroke: ${getGroupBorderColor(ctx.g)}`);
+    rect.dataset.gid = ctx.gid;
     rect.addEventListener('dblclick', (e) => {
-        if (e.target === rect) toggleGroup(gid);
+        if (e.target === rect) toggleGroup(ctx.gid);
     });
-    bindGroupHover(rect, gid);
+    bindGroupHover(rect, ctx.gid);
     svg.appendChild(rect);
-    registerNodeDom(gid, rect);
+    registerNodeDom(ctx.gid, rect);
     return rect;
 }
 
-function renderExpandedGroupHeader(gid, g, ox, oy) {
-    const headerText = `▼ ${g.label}`;
-    const label = document.createElementNS(RENDER_GROUP_SVG_NS, 'text');
-    label.setAttribute('x', ox + 12);
-    label.setAttribute('y', oy + 18);
-    label.setAttribute('class', 'group-label');
-    label.setAttribute('style', 'cursor: pointer;');
-    label.textContent = headerText;
-    label.addEventListener('dblclick', () => toggleGroup(gid));
-    bindGroupHover(label, gid);
-    svg.appendChild(label);
-    if (g.src_file) {
-        const labelLen = (headerText.length * 6.6) + 8;
-        appendGroupInfoButton(
-            g,
-            ox + 12 + labelLen + 6,
-            oy + 15,
-            `View ${g.label} class definition (${g.src_file}:${g.src_start_line}-${g.src_end_line})`
-        );
-    }
-    return { headerText, label };
+function renderExpandedGroupHeaderLabel(ctx) {
+    const headerText = `▼ ${ctx.g.label}`;
+    const labelEl = document.createElementNS(RENDER_GROUP_SVG_NS, 'text');
+    labelEl.setAttribute('x', ctx.ox + 12);
+    labelEl.setAttribute('y', ctx.oy + 18);
+    labelEl.setAttribute('class', 'group-label');
+    labelEl.setAttribute('style', 'cursor: pointer;');
+    labelEl.textContent = headerText;
+    labelEl.addEventListener('dblclick', () => toggleGroup(ctx.gid));
+    bindGroupHover(labelEl, ctx.gid);
+    svg.appendChild(labelEl);
+    return { headerText, labelEl };
 }
 
-function renderExpandedGroupTiming(gid, g, pos, ox, oy) {
-    if (!g.has_timing) return null;
-    const timing = document.createElementNS(RENDER_GROUP_SVG_NS, 'text');
-    timing.setAttribute('x', ox + pos.w - 10);
-    timing.setAttribute('y', oy + 18);
-    timing.setAttribute('text-anchor', 'end');
-    timing.setAttribute('class', 'group-timing');
-    timing.textContent = `Kernel ${g.pct.toFixed(1)}% · ${formatDur(g.dur_us)}`;
-    bindGroupHover(timing, gid);
-    svg.appendChild(timing);
-    return timing;
+function renderExpandedGroupInfoButton(ctx, headerText) {
+    if (!ctx.g.src_file) return;
+    const labelLen = (headerText.length * 6.6) + 8;
+    appendGroupInfoButton(
+        ctx.g,
+        ctx.ox + 12 + labelLen + 6,
+        ctx.oy + 15,
+        `View ${ctx.g.label} class definition (${ctx.g.src_file}:${ctx.g.src_start_line}-${ctx.g.src_end_line})`
+    );
 }
 
-function renderExpandedGroupChildren(childPositions, ox, oy) {
-    for (const child of (childPositions || [])) {
+function renderExpandedGroupTiming(ctx) {
+    if (!ctx.g.has_timing) return null;
+    const timingEl = document.createElementNS(RENDER_GROUP_SVG_NS, 'text');
+    timingEl.setAttribute('x', ctx.ox + ctx.pos.w - 10);
+    timingEl.setAttribute('y', ctx.oy + 18);
+    timingEl.setAttribute('text-anchor', 'end');
+    timingEl.setAttribute('class', 'group-timing');
+    timingEl.textContent = `Kernel ${ctx.g.pct.toFixed(1)}% · ${formatDur(ctx.g.dur_us)}`;
+    bindGroupHover(timingEl, ctx.gid);
+    svg.appendChild(timingEl);
+    return timingEl;
+}
+
+function renderGroupChildren(ctx) {
+    for (const child of (ctx.pos.childPositions || [])) {
         if (child.type === 'node') {
-            renderNodeAt(child.id, ox + child.x, oy + child.y, child.w, child.h);
+            renderNodeAt(child.id, ctx.ox + child.x, ctx.oy + child.y, child.w, child.h);
         } else {
-            renderGroupAt(child.id, ox + child.x, oy + child.y);
+            renderGroupAt(child.id, ctx.ox + child.x, ctx.oy + child.y);
         }
     }
-    return (childPositions || []).length;
 }
 
-function renderGroupInternalEdges(gid, g, pos, childPositions, ox, oy) {
-    if (!(g.internal_edges && pos.rowLayouts)) return 0;
+function buildInternalEdgeRoutingContext(ctx) {
+    const childPositions = ctx.pos.childPositions || [];
+    if (childPositions.length === 0) {
+        return {
+            childAbsRect: {},
+            groupLeft: null,
+            groupRight: null,
+            childLeftEdge: null,
+            childRightEdge: null,
+            skipLaneCounter: {},
+        };
+    }
+
     const childAbsRect = {};
     let cMinX = Infinity;
     let cMaxX = -Infinity;
     for (const child of childPositions) {
-        const ax = ox + child.x;
+        const ax = ctx.ox + child.x;
         childAbsRect[child.id] = {
             x: ax,
-            y: oy + child.y,
+            y: ctx.oy + child.y,
             w: child.w,
             h: child.h,
             rank: child.rank,
@@ -188,33 +170,34 @@ function renderGroupInternalEdges(gid, g, pos, childPositions, ox, oy) {
         if (ax < cMinX) cMinX = ax;
         if (ax + child.w > cMaxX) cMaxX = ax + child.w;
     }
-    const groupRight = Math.min(ox + pos.w - 6, cMaxX + LAYOUT.laneGutter);
-    const groupLeft = Math.max(ox + 6, cMinX - LAYOUT.laneGutter);
-    const childRightEdge = cMaxX;
-    const childLeftEdge = cMinX;
-    const skipLaneCounter = { left: 0, right: 0 };
-    let renderedCount = 0;
-    for (const ed of g.internal_edges) {
-        const fr = childAbsRect[ed.from_child];
-        const to = childAbsRect[ed.to_child];
+    return {
+        childAbsRect,
+        groupLeft: Math.max(ctx.ox + 6, cMinX - LAYOUT.laneGutter),
+        groupRight: Math.min(ctx.ox + ctx.pos.w - 6, cMaxX + LAYOUT.laneGutter),
+        childLeftEdge: cMinX,
+        childRightEdge: cMaxX,
+        skipLaneCounter: { left: 0, right: 0 },
+    };
+}
+
+function renderGroupInternalEdges(ctx, routeCtx) {
+    if (!(ctx.g.internal_edges && ctx.pos.rowLayouts)) return;
+    for (const ed of ctx.g.internal_edges) {
+        const fr = routeCtx.childAbsRect[ed.from_child];
+        const to = routeCtx.childAbsRect[ed.to_child];
         if (!fr || !to) {
-            console.warn('[renderGroupInternalEdges] missing child rect, skip edge', {
-                gid,
-                edge: ed,
-                hasFrom: Boolean(fr),
-                hasTo: Boolean(to),
-            });
+            console.warn('[renderGroupInternalEdges] missing child rect for edge:', ed);
             continue;
         }
         const routedEdge = {
             __internal: true,
-            __gid: gid,
+            __gid: ctx.gid,
             from: ed.from_child,
             to: ed.to_child,
             type: ed.type || 'internal',
             from_attr: ed.from_attr,
             to_attr: ed.to_attr,
-            parent_class: ed.parent_class || g.label,
+            parent_class: ed.parent_class || ctx.g.label,
             evidence: ed.evidence,
         };
         if (!isEdgeVisible(routedEdge)) continue;
@@ -225,60 +208,64 @@ function renderGroupInternalEdges(gid, g, pos, childPositions, ox, oy) {
             type: ed.type,
             edgeData: routedEdge,
             routeCtx: {
-                groupLeft,
-                groupRight,
-                childLeftEdge,
-                childRightEdge,
-                skipLaneCounter,
+                groupLeft: routeCtx.groupLeft,
+                groupRight: routeCtx.groupRight,
+                childLeftEdge: routeCtx.childLeftEdge,
+                childRightEdge: routeCtx.childRightEdge,
+                skipLaneCounter: routeCtx.skipLaneCounter,
             },
         });
-        renderedCount += 1;
     }
-    return renderedCount;
 }
 
-function renderExpandedGroup(gid, g, pos, ox, oy) {
-    const rect = renderExpandedGroupBox(gid, g, pos, ox, oy);
-    const header = renderExpandedGroupHeader(gid, g, ox, oy);
-    const timing = renderExpandedGroupTiming(gid, g, pos, ox, oy);
-    const childPositions = pos.childPositions || [];
-    const childCount = renderExpandedGroupChildren(childPositions, ox, oy);
-    const edgeCount = renderGroupInternalEdges(gid, g, pos, childPositions, ox, oy);
-    registerGroupPorts(gid, ox, oy, pos, false);
-    return { rect, header, timing, childCount, edgeCount };
+function registerExpandedGroupPorts(ctx) {
+    nodePortMap[ctx.gid + '__in'] = { cx: ctx.ox + ctx.pos.w / 2, cy: ctx.oy };
+    nodePortMap[ctx.gid + '__out'] = { cx: ctx.ox + ctx.pos.w / 2, cy: ctx.oy + ctx.pos.h };
 }
 
 function renderGroupAt(gid, ox, oy) {
-    const g = groupMap[gid];
-    const pos = groupLayout[gid];
-    if (!pos) return;
-    if (pos.collapsed) {
-        renderCollapsedGroup(gid, g, pos, ox, oy);
+    const ctx = RENDER_GROUP_EXPORTS.getGroupRenderContext(gid, ox, oy);
+    if (!ctx.pos) return;
+    if (ctx.pos.collapsed) {
+        RENDER_GROUP_EXPORTS.renderCollapsedGroupBox(ctx);
+        RENDER_GROUP_EXPORTS.renderCollapsedGroupLabel(ctx);
+        RENDER_GROUP_EXPORTS.renderCollapsedGroupTiming(ctx);
+        RENDER_GROUP_EXPORTS.renderCollapsedGroupInfoButton(ctx);
+        RENDER_GROUP_EXPORTS.registerCollapsedGroupPorts(ctx);
         return;
     }
-    renderExpandedGroup(gid, g, pos, ox, oy);
+    RENDER_GROUP_EXPORTS.renderExpandedGroupBox(ctx);
+    const { headerText } = RENDER_GROUP_EXPORTS.renderExpandedGroupHeaderLabel(ctx);
+    RENDER_GROUP_EXPORTS.renderExpandedGroupInfoButton(ctx, headerText);
+    RENDER_GROUP_EXPORTS.renderExpandedGroupTiming(ctx);
+    RENDER_GROUP_EXPORTS.renderGroupChildren(ctx);
+    const routeCtx = RENDER_GROUP_EXPORTS.buildInternalEdgeRoutingContext(ctx);
+    RENDER_GROUP_EXPORTS.renderGroupInternalEdges(ctx, routeCtx);
+    RENDER_GROUP_EXPORTS.registerExpandedGroupPorts(ctx);
 }
 
-const RENDER_GROUP_EXPORTS = {
-    appendGroupInfoButton,
-    registerGroupPorts,
+Object.assign(RENDER_GROUP_EXPORTS, {
+    getGroupRenderContext,
     renderCollapsedGroupBox,
     renderCollapsedGroupLabel,
     renderCollapsedGroupTiming,
     renderCollapsedGroupInfoButton,
-    renderCollapsedGroup,
+    registerCollapsedGroupPorts,
     renderExpandedGroupBox,
-    renderExpandedGroupHeader,
+    renderExpandedGroupHeaderLabel,
+    renderExpandedGroupInfoButton,
     renderExpandedGroupTiming,
-    renderExpandedGroupChildren,
+    renderGroupChildren,
+    buildInternalEdgeRoutingContext,
     renderGroupInternalEdges,
-    renderExpandedGroup,
+    registerExpandedGroupPorts,
     renderGroupAt,
-};
+});
 
 if (typeof globalThis !== 'undefined') {
     Object.assign(globalThis, RENDER_GROUP_EXPORTS);
 }
+
 if (typeof module !== 'undefined' && module.exports) {
     module.exports = RENDER_GROUP_EXPORTS;
 }
