@@ -34,6 +34,8 @@ from pathlib import Path
 # imports cleanly when loaded standalone (e.g. ``python -c "import
 # frontend_html"`` from the scripts/ directory or from a tooling harness).
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_RENDER_GROUP_JS_PATH = Path(_SCRIPT_DIR) / "render_group.js"
+_RENDER_GROUP_JS_PLACEHOLDER = "__RENDER_GROUP_JS_PLACEHOLDER__"
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
@@ -829,200 +831,7 @@ function render() {
     // Render groups recursively
     const edgeList = [];
 
-    function appendGroupInfoButton(g, cx, cy, titleText = '') {
-        if (!g || !g.src_file) return;
-        const hit = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
-        hit.setAttribute('cx', cx);
-        hit.setAttribute('cy', cy - 1);
-        hit.setAttribute('r', 9);
-        hit.setAttribute('class', 'group-info-hit');
-        hit.addEventListener('click', (e) => {
-            e.stopPropagation();
-            showSourcePanel(g);
-        });
-        svg.appendChild(hit);
-
-        const info = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-        info.setAttribute('x', cx);
-        info.setAttribute('y', cy - 1);
-        info.setAttribute('class', 'group-toggle group-info-text');
-        info.textContent = 'i';
-        if (titleText) {
-            const titleEl = document.createElementNS('http://www.w3.org/2000/svg', 'title');
-            titleEl.textContent = titleText;
-            info.appendChild(titleEl);
-        }
-        svg.appendChild(info);
-    }
-
-    function renderGroupAt(gid, ox, oy) {
-        const g = groupMap[gid];
-        const pos = groupLayout[gid];
-        if (!pos) return;
-
-        if (pos.collapsed) {
-            // Draw collapsed group as a rounded rect with label
-            const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-            rect.setAttribute('x', ox); rect.setAttribute('y', oy);
-            rect.setAttribute('width', pos.w); rect.setAttribute('height', pos.h);
-            rect.setAttribute('class', 'group-box collapsed');
-            rect.setAttribute('style', `stroke: ${getGroupBorderColor(g)}`);
-            rect.dataset.gid = gid;
-            rect.addEventListener('dblclick', () => toggleGroup(gid));
-            bindGroupHover(rect, gid);
-            svg.appendChild(rect);
-            registerNodeDom(gid, rect);
-
-            let labelText = `▶ ${g.label}`;
-            const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-            label.setAttribute('x', ox + pos.w/2); label.setAttribute('y', oy + pos.h/2 - 2);
-            label.setAttribute('text-anchor', 'middle');
-            label.setAttribute('class', 'group-label');
-            label.textContent = labelText;
-            bindGroupHover(label, gid);
-            svg.appendChild(label);
-
-            if (g.has_timing) {
-                const tl = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-                tl.setAttribute('x', ox + pos.w/2); tl.setAttribute('y', oy + pos.h/2 + 12);
-                tl.setAttribute('text-anchor', 'middle');
-                tl.setAttribute('class', 'group-timing');
-                // Kernel-only contract: g.dur_us already mirrors kernel_us.
-                tl.textContent = `Kernel ${g.pct.toFixed(1)}% · ${formatDur(g.dur_us)}`;
-                bindGroupHover(tl, gid);
-                svg.appendChild(tl);
-            }
-
-            // Source-info icon for collapsed groups (top-right corner)
-            if (g.src_file) {
-                appendGroupInfoButton(
-                    g,
-                    ox + pos.w - 13,
-                    oy + 10,
-                    `View ${g.label} class definition (${g.src_file}:${g.src_start_line}-${g.src_end_line})`
-                );
-            }
-
-            // Register nodePortMap port coordinates for edges
-            nodePortMap[gid + '__in'] = { cx: ox + pos.w/2, cy: oy };
-            nodePortMap[gid + '__out'] = { cx: ox + pos.w/2, cy: oy + pos.h };
-            nodePortMap[gid + '__center'] = { cx: ox + pos.w/2, cy: oy + pos.h/2 };
-            return;
-        }
-
-        // Expanded group box
-        const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-        rect.setAttribute('x', ox); rect.setAttribute('y', oy);
-        rect.setAttribute('width', pos.w); rect.setAttribute('height', pos.h);
-        rect.setAttribute('class', 'group-box');
-        rect.setAttribute('style', `stroke: ${getGroupBorderColor(g)}`);
-        rect.dataset.gid = gid;
-        rect.addEventListener('dblclick', (e) => {
-            if (e.target === rect) toggleGroup(gid);
-        });
-        bindGroupHover(rect, gid);
-        svg.appendChild(rect);
-        registerNodeDom(gid, rect);
-
-        // Group header label
-        let headerText = `▼ ${g.label}`;
-        const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-        label.setAttribute('x', ox + 12); label.setAttribute('y', oy + 18);
-        label.setAttribute('class', 'group-label');
-        label.setAttribute('style', 'cursor: pointer;');
-        label.textContent = headerText;
-        label.addEventListener('dblclick', () => toggleGroup(gid));
-        bindGroupHover(label, gid);
-        svg.appendChild(label);
-
-        // Info icon next to label - opens source panel for this group's class
-        if (g.src_file) {
-            // Approximate label width to position the icon to the right of the text
-            const labelLen = (headerText.length * 6.6) + 8;
-            appendGroupInfoButton(
-                g,
-                ox + 12 + labelLen + 6,
-                oy + 15,
-                `View ${g.label} class definition (${g.src_file}:${g.src_start_line}-${g.src_end_line})`
-            );
-        }
-
-        if (g.has_timing) {
-            const tl = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-            tl.setAttribute('x', ox + pos.w - 10); tl.setAttribute('y', oy + 18);
-            tl.setAttribute('text-anchor', 'end');
-            tl.setAttribute('class', 'group-timing');
-            // Kernel-only contract: g.dur_us already mirrors kernel_us.
-            tl.textContent = `Kernel ${g.pct.toFixed(1)}% · ${formatDur(g.dur_us)}`;
-            bindGroupHover(tl, gid);
-            svg.appendChild(tl);
-        }
-
-        // Render children
-        const cp = pos.childPositions || [];
-        for (const child of cp) {
-            if (child.type === 'node') {
-                renderNodeAt(child.id, ox + child.x, oy + child.y, child.w, child.h);
-            } else {
-                renderGroupAt(child.id, ox + child.x, oy + child.y);
-            }
-        }
-
-        // Draw internal data dependency edges between children with
-        // rank-aware routing. This pass is local to the group so we can use
-        // the row layout to bend edges around obstacles.
-        if (g.internal_edges && pos.rowLayouts) {
-            const childAbsRect = {};
-            let cMinX = Infinity, cMaxX = -Infinity;
-            for (const child of cp) {
-                const ax = ox + child.x;
-                childAbsRect[child.id] = {
-                    x: ax, y: oy + child.y,
-                    w: child.w, h: child.h, rank: child.rank
-                };
-                if (ax < cMinX) cMinX = ax;
-                if (ax + child.w > cMaxX) cMaxX = ax + child.w;
-            }
-            // Lanes must live OUTSIDE the children band (cMinX..cMaxX) but
-            // INSIDE the group rect (ox..ox+pos.w). Pick a comfortable inset.
-            const groupRight = Math.min(ox + pos.w - 6, cMaxX + LAYOUT.laneGutter);
-            const groupLeft = Math.max(ox + 6, cMinX - LAYOUT.laneGutter);
-            // Lane bands: edges should always go past cMaxX on the right, or
-            // before cMinX on the left, never in between.
-            const childRightEdge = cMaxX;
-            const childLeftEdge = cMinX;
-            const skipLaneCounter = { left: 0, right: 0 };
-            for (const ed of g.internal_edges) {
-                const fr = childAbsRect[ed.from_child];
-                const to = childAbsRect[ed.to_child];
-                if (!fr || !to) continue;
-                const routedEdge = {
-                    __internal: true,
-                    __gid: gid,
-                    from: ed.from_child,
-                    to: ed.to_child,
-                    type: ed.type || 'internal',
-                    from_attr: ed.from_attr,
-                    to_attr: ed.to_attr,
-                    parent_class: ed.parent_class || g.label,
-                    evidence: ed.evidence,
-                };
-                if (!isEdgeVisible(routedEdge)) continue;
-                renderEdge({
-                    routingMode: 'intra_group',
-                    fr,
-                    to,
-                    type: ed.type,
-                    edgeData: routedEdge,
-                    routeCtx: { groupLeft, groupRight, childLeftEdge, childRightEdge, skipLaneCounter },
-                });
-            }
-        }
-
-        // Register nodePortMap port coordinates
-        nodePortMap[gid + '__in'] = { cx: ox + pos.w/2, cy: oy };
-        nodePortMap[gid + '__out'] = { cx: ox + pos.w/2, cy: oy + pos.h };
-    }
+    __RENDER_GROUP_JS_PLACEHOLDER__
 
     function renderNodeAt(nid, nx, ny, w, h) {
         const n = nodeMap[nid];
@@ -1944,6 +1753,10 @@ def _generate_flowchart_html(data):
     # ensure_ascii=True is safer for character handling
     data_json = _json.dumps(data, ensure_ascii=True)
     html_template = FLOWCHART_HTML_TEMPLATE
+    render_group_js = _RENDER_GROUP_JS_PATH.read_text(encoding="utf-8")
+    if _RENDER_GROUP_JS_PLACEHOLDER not in html_template:
+        raise RuntimeError("render_group.js placeholder is missing from FLOWCHART_HTML_TEMPLATE")
+    html_template = html_template.replace(_RENDER_GROUP_JS_PLACEHOLDER, render_group_js, 1)
     # NOTE: The legacy "Total X% · Y" → totalUs reflow patch that previously
     # lived here is gone.  After the kernel-field migration the in-template
     # SVG label already reads `Kernel ${g.pct.toFixed(1)}% · ${formatDur(g.dur_us)}`
