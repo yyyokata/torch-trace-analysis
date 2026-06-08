@@ -296,12 +296,10 @@ def _route_edges(state: _AdapterState) -> list[dict]:
 
         if parent_src is not None and parent_src == parent_dst:
             group = state.group_by_id[parent_src]
-            from_child = f"{src_id}__out" if src_id in state.group_by_id else src_id
-            to_child = f"{dst_id}__in" if dst_id in state.group_by_id else dst_id
             group["internal_edges"].append(
                 {
-                    "from_child": from_child,
-                    "to_child": to_child,
+                    "from_child": src_id,
+                    "to_child": dst_id,
                     "type": edge_type,
                     "from_attr": src_label,
                     "to_attr": dst_label,
