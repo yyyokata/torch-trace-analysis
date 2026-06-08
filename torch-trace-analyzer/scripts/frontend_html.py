@@ -831,6 +831,32 @@ function render() {
     // Render groups recursively
     const edgeList = [];
 
+    function appendGroupInfoButton(g, cx, cy, titleText = '') {
+        if (!g || !g.src_file) return;
+        const hit = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+        hit.setAttribute('cx', cx);
+        hit.setAttribute('cy', cy - 1);
+        hit.setAttribute('r', 9);
+        hit.setAttribute('class', 'group-info-hit');
+        hit.addEventListener('click', (e) => {
+            e.stopPropagation();
+            showSourcePanel(g);
+        });
+        svg.appendChild(hit);
+
+        const info = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+        info.setAttribute('x', cx);
+        info.setAttribute('y', cy - 1);
+        info.setAttribute('class', 'group-toggle group-info-text');
+        info.textContent = 'i';
+        if (titleText) {
+            const titleEl = document.createElementNS('http://www.w3.org/2000/svg', 'title');
+            titleEl.textContent = titleText;
+            info.appendChild(titleEl);
+        }
+        svg.appendChild(info);
+    }
+
     __RENDER_GROUP_JS_PLACEHOLDER__
 
     function renderNodeAt(nid, nx, ny, w, h) {
