@@ -994,8 +994,8 @@ function render() {
                         const groupRect = childGroupRects[groupId];
                         if (groupRect) {
                             return {
-                                x: groupRect.x + groupRect.w / 2,
-                                y: groupRect.y + groupRect.h,
+                                x: groupRect.x + groupRect.w,
+                                y: groupRect.y + groupRect.h / 2,
                                 w: 0,
                                 h: 0,
                                 rank: groupRect.rank,
@@ -1007,8 +1007,8 @@ function render() {
                         const groupRect = childGroupRects[groupId];
                         if (groupRect) {
                             return {
-                                x: groupRect.x + groupRect.w / 2,
-                                y: groupRect.y,
+                                x: groupRect.x,
+                                y: groupRect.y + groupRect.h / 2,
                                 w: 0,
                                 h: 0,
                                 rank: groupRect.rank,
