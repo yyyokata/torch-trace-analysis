@@ -284,6 +284,8 @@ def _route_edges(state: _AdapterState) -> list[dict]:
             raise RuntimeError(f"edge src_id {src_id} not found in node index")
         if dst_id not in known_ids:
             raise RuntimeError(f"edge dst_id {dst_id} not found in node index")
+        if edge.get("is_containment") is True:
+            continue
 
         edge_type = _edge_type_from_flag(edge.get("is_containment"))
         src_label = state.label_by_id[src_id]
