@@ -27,6 +27,10 @@ class DataFlowEdge:
     is_containment: bool
     evidence: list[VarEvidence] = field(default_factory=list)
     tensor_info: dict[int, dict[str, Any]] = field(default_factory=dict)
+    # 顶层边消费的是 src 的第几个输出 slot：
+    # None 表示单输出不需区分；整数 i 表示消费的是 src.inner_dag.outputs 里
+    # ReturnValAttr.ret_index == i 的那个端口。
+    src_output_index: int | None = None
 
 
 @dataclass
