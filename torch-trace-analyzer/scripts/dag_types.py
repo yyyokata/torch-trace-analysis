@@ -64,6 +64,13 @@ class DAG:
     outputs: list[int]
     nodes: list[int]
     edges: list[DataFlowEdge]
+    # 当前层直属 node 列表（per-layer）。
+    # `nodes` 是全量 flatten（含所有层级子孙，用于 registry / DCE / validate）；
+    # `direct_nodes` 只含本层直属的 ModuleNode，用于序列化逐层下钻，避免顶层与
+    # inner_dag 重复输出同一个 node_id。
+    # 注意：受 dataclass 字段排序约束（默认值字段不能排在无默认值的 `edges` 之前），
+    # 该字段紧跟 `edges` 之后声明，语义上属于 `nodes` 的配套字段。
+    direct_nodes: list[int] = field(default_factory=list)
     params: list = field(default_factory=list)
     consts: list = field(default_factory=list)
     in_edges: dict[int, list[DataFlowEdge]] = field(init=False, default_factory=dict)
@@ -84,7 +91,7 @@ class DAG:
         def walk(node_id: int) -> Iterator[int]:
             node = registry[node_id]
             if isinstance(node, ModuleNode) and node.inner_dag is not None:
-                for child_id in node.inner_dag.nodes:
+                for child_id in node.inner_dag.direct_nodes:
                     yield from walk(child_id)
                 for child_id in node.inner_dag.outputs:
                     if child_id in registry:
@@ -92,7 +99,7 @@ class DAG:
             yield node_id
 
         excluded = set(self.inputs) | set(self.outputs)
-        for nid in self.nodes:
+        for nid in self.direct_nodes:
             if nid in excluded:
                 continue
             yield from walk(nid)

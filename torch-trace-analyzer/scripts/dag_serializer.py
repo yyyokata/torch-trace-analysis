@@ -164,7 +164,7 @@ def serialize_dag(dag: DAG, registry: dict[int, DagNode]) -> dict:
         "output_nodes": [
             _serialize_io_node(_get_registry_node(node_id, registry), "output") for node_id in dag.outputs
         ],
-        "nodes": [_serialize_dag_node(node_id, dag, registry) for node_id in dag.nodes],
+        "nodes": [_serialize_dag_node(node_id, dag, registry) for node_id in dag.direct_nodes],
         "edges": [_serialize_edge(edge) for edge in dag.edges],
     }
 
@@ -172,7 +172,7 @@ def serialize_dag(dag: DAG, registry: dict[int, DagNode]) -> dict:
 def _serialize_dag_node(node_id: int, dag: DAG, registry: dict[int, DagNode]) -> dict:
     node = _get_registry_node(node_id, registry)
     if not isinstance(node, ModuleNode):
-        raise RuntimeError(f"dag.nodes contains non-ModuleNode {node_id}")
+        raise RuntimeError(f"dag.direct_nodes contains non-ModuleNode {node_id}")
     return _serialize_module_node(node, dag, registry)
 
 
