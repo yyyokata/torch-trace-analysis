@@ -129,6 +129,7 @@ def _rewrite_boundary_edge(
         is_containment=False,
         evidence=list(edge.evidence),
         tensor_info=dict(edge.tensor_info),
+        src_output_indices=list(edge.src_output_indices),
     )
 
 
