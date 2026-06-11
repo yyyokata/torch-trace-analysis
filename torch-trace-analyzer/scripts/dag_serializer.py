@@ -114,7 +114,11 @@ def _serialize_module_node(node: ModuleNode, dag: DAG, registry: dict[int, DagNo
         "label": label,
         "call_loc": _serialize_call_loc(node.call_loc),
         "attr_type": attr_type,
-        "inner_dag": serialize_dag(node.inner_dag, registry) if node.inner_dag is not None else None,
+        "inner_dag": (
+            serialize_dag(node.inner_dag, registry)
+            if node.inner_dag is not None and not node.is_native
+            else None
+        ),
     }
 
 
@@ -165,7 +169,10 @@ def serialize_dag(dag: DAG, registry: dict[int, DagNode]) -> dict:
             _serialize_io_node(_get_registry_node(node_id, registry), "output") for node_id in dag.outputs
         ],
         "nodes": [_serialize_dag_node(node_id, dag, registry) for node_id in dag.direct_nodes],
-        "edges": [_serialize_edge(edge) for edge in dag.edges],
+        "edges": [
+            _serialize_edge(edge) for edge in dag.edges
+            if not edge.is_native_internal
+        ],
     }
 
 
