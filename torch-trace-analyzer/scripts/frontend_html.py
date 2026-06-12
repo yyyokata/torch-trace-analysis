@@ -276,9 +276,9 @@ function isEdgeVisible(edge) {
 
 function resolveCollapsedAncestor(nodeId) {
     // nodeAncestorGroups 存储顺序：从根到近（外层 group 在前）
-    // 从后往前遍历找最近的已折叠祖先
+    // 从前往后遍历找最外层的已折叠祖先
     const ancestors = nodeAncestorGroups.get(nodeId) || [];
-    for (let i = ancestors.length - 1; i >= 0; i--) {
+    for (let i = 0; i < ancestors.length; i++) {
         if (collapsedState[ancestors[i]]) return ancestors[i];
     }
     return nodeId;
