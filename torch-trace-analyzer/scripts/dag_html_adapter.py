@@ -107,13 +107,10 @@ def _walk_serialized_level(
             call_order.append({"id": leaf["id"], "type": "node"})
 
     node_entries = serialized["nodes"]
-    node_entry_by_id: dict[int, dict] = {}
+    node_entry_by_id = _collect_node_entry_index(serialized)
     container_child_ids: set[int] = set()
     for entry in node_entries:
         node_id = _require_field(entry, "node_id")
-        if node_id in node_entry_by_id:
-            raise RuntimeError(f"duplicate node id in serialized nodes: {node_id}")
-        node_entry_by_id[node_id] = entry
         if entry.get("children_nodes") is not None:
             children = entry["children_nodes"]
             if not isinstance(children, list):
@@ -141,6 +138,24 @@ def _walk_serialized_level(
             direct_leaves.append(built.payload)
             call_order.append({"id": built.payload["id"], "type": "node"})
     return direct_groups, direct_leaves, call_order
+
+
+def _collect_node_entry_index(serialized: dict) -> dict[int, dict]:
+    node_entry_by_id: dict[int, dict] = {}
+    _collect_node_entries(serialized["nodes"], node_entry_by_id)
+    return node_entry_by_id
+
+
+def _collect_node_entries(entries: list[dict], node_entry_by_id: dict[int, dict]) -> None:
+    for entry in entries:
+        node_id = _require_field(entry, "node_id")
+        if node_id in node_entry_by_id:
+            raise RuntimeError(f"duplicate node id in serialized nodes: {node_id}")
+        node_entry_by_id[node_id] = entry
+        inner_dag = entry.get("inner_dag")
+        if inner_dag is not None:
+            _validate_serialized_top_level(inner_dag)
+            _collect_node_entries(inner_dag["nodes"], node_entry_by_id)
 
 
 def _build_structured_node(
@@ -285,10 +300,7 @@ def _route_edges(state: _AdapterState) -> list[dict]:
             raise RuntimeError(f"edge src_id {src_id} not found in node index")
         if dst_id not in known_ids:
             raise RuntimeError(f"edge dst_id {dst_id} not found in node index")
-        if edge.get("is_containment") is True:
-            continue
-
-        edge_type = _edge_type_from_flag(edge.get("is_containment"))
+        edge_type = "dep"
         src_label = state.label_by_id[src_id]
         dst_label = state.label_by_id[dst_id]
         parent_src = state.parent_group_of_child.get(src_id)
@@ -323,14 +335,6 @@ def _route_edges(state: _AdapterState) -> list[dict]:
             }
         )
     return global_edges
-
-
-def _edge_type_from_flag(is_containment: bool | None) -> str:
-    if is_containment is True:
-        return "containment"
-    if is_containment is False:
-        return "dep"
-    raise RuntimeError(f"unsupported is_containment value: {is_containment!r}")
 
 
 def _assign_parent_group(state: _AdapterState, child_id: int, parent_id: int) -> None:
