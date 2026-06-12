@@ -135,59 +135,11 @@ def _rewrite_boundary_edge(
     )
 
 
-def _attach_container_attrs_from_model(
-    dag: DAG,
-    registry: dict[int, DagNode],
-    attr_to_node_ids: dict[int, list[int]],
-) -> None:
-    model = getattr(dag, "model", None)
-    if model is None or not hasattr(model, "named_modules"):
-        return
-
-    path_to_node = {
-        node.metadata.get("module_path"): node
-        for node in registry.values()
-        if isinstance(node, ModuleNode) and "module_path" in node.metadata
-    }
-    path_to_attr = {path: node.attr for path, node in path_to_node.items()}
-    container_attrs: dict[str, ContainerAttr] = {}
-
-    for path, module in model.named_modules():
-        class_name = type(module).__name__
-        if not path or class_name not in _NATIVE_CONTAINER_KINDS:
-            continue
-        existing_node = path_to_node.get(path)
-        if existing_node is not None:
-            if not isinstance(existing_node.attr, ContainerAttr):
-                raise RuntimeError(f"Container module path {path} already has non-container ModuleNode")
-            container_attr = existing_node.attr
-        else:
-            container_attr = ContainerAttr(
-                attr_name=path.rsplit(".", 1)[-1],
-                class_name=class_name,
-                def_loc=CallLoc(file="<container>", line=0, col=0),
-                container_kind=class_name,
-            )
-        container_attrs[path] = container_attr
-        path_to_attr[path] = container_attr
-
-    for path, container_attr in sorted(container_attrs.items(), key=lambda item: item[0].count("."), reverse=True):
-        module = dict(model.named_modules())[path]
-        for key, child_module in module._modules.items():
-            child_path = f"{path}.{key}"
-            child_attr = path_to_attr.get(child_path)
-            if child_attr is None:
-                continue
-            container_key: int | str = int(key) if key.isdigit() else key
-            container_attr.add_child(container_key, child_attr)
-
-
 def _ensure_missing_container_nodes(
     dag: DAG,
     registry: dict[int, DagNode],
     attr_to_node_ids: dict[int, list[int]],
 ) -> None:
-    _attach_container_attrs_from_model(dag, registry, attr_to_node_ids)
     attr_to_node_ids = _build_attr_to_node_ids(registry)
     missing_container_attrs: list[ContainerAttr] = []
     seen_attr_ids: set[int] = set()

@@ -22,6 +22,7 @@ class Attr:
     def_loc: CallLoc | None = None
     attr_id: int = 0
     container_index: int | str | None = None
+    parent: "ContainerAttr | None" = field(default=None, repr=False, compare=False)
 
 
 @dataclass
