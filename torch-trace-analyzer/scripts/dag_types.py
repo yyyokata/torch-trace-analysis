@@ -24,7 +24,6 @@ class VarEvidence:
 class DataFlowEdge:
     src_id: int
     dst_id: int
-    is_containment: bool
     evidence: list[VarEvidence] = field(default_factory=list)
     tensor_info: dict[int, dict[str, Any]] = field(default_factory=dict)
     # 顶层边携带的是 src 的哪些输出 slot：
