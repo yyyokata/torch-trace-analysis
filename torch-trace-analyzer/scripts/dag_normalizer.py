@@ -145,7 +145,7 @@ def _ensure_missing_container_nodes(
     seen_attr_ids: set[int] = set()
     for node_id in list(dag.nodes):
         node = registry[node_id]
-        parent_attr = getattr(node.attr, "parent", None)
+        parent_attr = node.attr.parent
         while parent_attr is not None:
             if parent_attr.class_name not in _NATIVE_CONTAINER_KINDS:
                 raise RuntimeError(
@@ -155,7 +155,7 @@ def _ensure_missing_container_nodes(
             if parent_attr_id not in attr_to_node_ids and parent_attr_id not in seen_attr_ids:
                 seen_attr_ids.add(parent_attr_id)
                 missing_container_attrs.append(parent_attr)
-            parent_attr = getattr(parent_attr, "parent", None)
+            parent_attr = parent_attr.parent
 
     for container_attr in missing_container_attrs:
         if id(container_attr) in attr_to_node_ids:
@@ -201,7 +201,7 @@ def _container_attr_path(attr: ContainerAttr) -> str:
     while current is not None:
         if current.attr_name:
             parts.append(current.attr_name)
-        parent = getattr(current, "parent", None)
+        parent = current.parent
         current = parent if isinstance(parent, ContainerAttr) else None
     return ".".join(reversed(parts))
 
@@ -218,7 +218,7 @@ def _collect_relevant_container_node_ids(
 
     for node_id in list(dag.nodes):
         node = registry[node_id]
-        parent_attr = getattr(node.attr, "parent", None)
+        parent_attr = node.attr.parent
         while parent_attr is not None:
             if parent_attr.class_name not in _NATIVE_CONTAINER_KINDS:
                 raise RuntimeError(
@@ -239,7 +239,7 @@ def _collect_relevant_container_node_ids(
                 container_node_ids.append(container_node_id)
             if owner_attr is not None and parent_attr is owner_attr:
                 break
-            parent_attr = getattr(parent_attr, "parent", None)
+            parent_attr = parent_attr.parent
 
     return container_node_ids
 
