@@ -78,17 +78,20 @@ def _serialize_module_node(node: ModuleNode, dag: DAG, registry: dict[int, DagNo
             if node.attr.attr_name
             else node.attr.container_kind
         )
+        attr_id_to_node_id = {id(n.attr): nid for nid, n in registry.items()}
+        children_nodes = [
+            attr_id_to_node_id[id(child_attr)]
+            for child_attr in node.attr.items.values()
+            if id(child_attr) in attr_id_to_node_id
+        ]
         return {
             "node_id": node.node_id,
             "label": label,
             "call_loc": _serialize_call_loc(node.call_loc),
             "is_container": True,
             "container_kind": node.attr.container_kind,
-            "children_nodes": [
-                edge.dst_id
-                for edge in dag.edges
-                if edge.is_containment is True and edge.src_id == node.node_id
-            ],
+            "attr_type": "container",
+            "children_nodes": children_nodes,
         }
 
     if isinstance(node.attr, ModuleAttr):
@@ -140,7 +143,6 @@ def _serialize_edge(edge: DataFlowEdge) -> dict:
     return {
         "src_id": edge.src_id,
         "dst_id": edge.dst_id,
-        "is_containment": edge.is_containment,
         "tensor_info": {
             str(tensor_id): {"shape": info["shape"], "dtype": info["dtype"]}
             for tensor_id, info in edge.tensor_info.items()
