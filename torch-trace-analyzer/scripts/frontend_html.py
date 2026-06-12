@@ -274,6 +274,16 @@ function isEdgeVisible(edge) {
     return true;
 }
 
+function resolveCollapsedAncestor(nodeId) {
+    // nodeAncestorGroups 存储顺序：从根到近（外层 group 在前）
+    // 从后往前遍历找最近的已折叠祖先
+    const ancestors = nodeAncestorGroups.get(nodeId) || [];
+    for (let i = ancestors.length - 1; i >= 0; i--) {
+        if (collapsedState[ancestors[i]]) return ancestors[i];
+    }
+    return nodeId;
+}
+
 function toggleBundle(bundleId) {
     return;
 }
@@ -476,7 +486,7 @@ DATA.groups.forEach(g => groupMap[g.id] = g);
 DATA.nodes.forEach(n => nodeMap[n.id] = n);
 indexGroupAncestors(DATA.root_groups.map(rid => groupMap[rid]).filter(Boolean));
 // Default: depth > 1 groups start collapsed
-DATA.groups.forEach(g => { collapsedState[g.id] = g.depth >= 2; });
+DATA.groups.forEach(g => { collapsedState[g.id] = g.depth >= 2 || g.is_native === true; });
 
 function formatDur(us) {
     if (us >= 1e6) return (us/1e6).toFixed(3) + ' s';
@@ -1157,8 +1167,11 @@ function render() {
     // Global edge pass: draw all data dependency edges using registered nodePortMap coordinates
     for (const edge of DATA.edges) {
         if (!isEdgeVisible(edge)) continue;
-        const fromPos = nodePortMap[edge.from + '__out'] || nodePortMap[edge.from];
-        const toPos = nodePortMap[edge.to + '__in'] || nodePortMap[edge.to];
+        const fromId = resolveCollapsedAncestor(edge.from);
+        const toId   = resolveCollapsedAncestor(edge.to);
+        if (fromId === toId) continue;
+        const fromPos = nodePortMap[fromId + '__out'] || nodePortMap[fromId];
+        const toPos   = nodePortMap[toId   + '__in']  || nodePortMap[toId];
         if (fromPos && toPos) {
             renderEdge({
                 routingMode: 'direct',
@@ -1741,7 +1754,7 @@ def _generate_flowchart_html_dual(data_train, data_infer):
         '    if (typeof indexGroupAncestors === "function" && DATA.root_groups){\n'
         '      indexGroupAncestors(DATA.root_groups.map(rid => groupMap[rid]).filter(Boolean));\n'
         '    }\n'
-        '    DATA.groups.forEach(g => { collapsedState[g.id] = g.depth >= 2; });\n'
+        '    DATA.groups.forEach(g => { collapsedState[g.id] = g.depth >= 2 || g.is_native === true; });\n'
         '  }\n'
         '  function activateTab(mode){\n'
         '    var btns = document.querySelectorAll(".iter14-tab");\n'

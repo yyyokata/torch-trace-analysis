@@ -32,7 +32,6 @@ class DataFlowEdge:
     # src.inner_dag.outputs 中 ReturnValAttr.ret_index == i 的那个端口。
     # 同一对 (src, dst) 之间的多条 tensor flow 合并成单条边，索引在此累积。
     src_output_indices: list[int] = field(default_factory=list)
-    is_native_internal: bool = False
 
 
 @dataclass
