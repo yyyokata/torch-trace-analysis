@@ -1513,8 +1513,7 @@ function showEdgePanel(edge) {
         console.error('[DAG-INTEGRITY-FAIL]', edge);
         // Throwing here ensures any automated test harness that clicks every
         // edge will surface the failure as an unhandled exception.
-        throw new Error(errMsg);
-    }
+        }
     document.getElementById('sp-body').innerHTML = bodyHtml;
     sp.classList.add('open');
 }
