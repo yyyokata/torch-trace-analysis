@@ -47,9 +47,6 @@ def _normalize_single_dag(
     attr_to_node_ids: dict[int, list[int]],
     owner_node_id: int | None,
 ) -> None:
-    edge_keys = {(edge.src_id, edge.dst_id, edge.is_containment) for edge in dag.edges}
-    normalized_edges: list[DataFlowEdge] = []
-
     container_node_ids = _collect_relevant_container_node_ids(
         dag=dag,
         registry=registry,
@@ -61,78 +58,21 @@ def _normalize_single_dag(
             dag.nodes.append(container_node_id)
         registry[container_node_id].metadata["is_container"] = True
 
-    container_member_ids: dict[int, set[int]] = {}
+    # 数据流边原样保留：不重写 boundary edge、不生成 containment 边。
+    # 容器与成员的归属关系通过容器节点 inner_dag.direct_nodes 表达。
     for container_node_id in container_node_ids:
         container_node = registry[container_node_id]
-        container_member_ids[container_node_id] = _resolve_direct_member_ids(
+        member_ids = _resolve_direct_member_ids(
             container_node=container_node,
             dag=dag,
             attr_to_node_ids=attr_to_node_ids,
         )
-
-    for edge in dag.edges:
-        rewritten_edge = edge
-        if not edge.is_containment:
-            rewritten_edge = _rewrite_boundary_edge(
-                edge=edge,
-                container_member_ids=container_member_ids,
-            )
-        key = (rewritten_edge.src_id, rewritten_edge.dst_id, rewritten_edge.is_containment)
-        if key in edge_keys:
-            if rewritten_edge is edge:
-                normalized_edges.append(edge)
+        inner_dag = container_node.inner_dag
+        if inner_dag is None:
             continue
-        edge_keys.add(key)
-        normalized_edges.append(rewritten_edge)
-
-    for container_node_id, member_ids in container_member_ids.items():
-        for member_id in member_ids:
-            key = (container_node_id, member_id, True)
-            if key in edge_keys:
-                continue
-            edge_keys.add(key)
-            normalized_edges.append(
-                DataFlowEdge(
-                    src_id=container_node_id,
-                    dst_id=member_id,
-                    is_containment=True,
-                    evidence=[],
-                    tensor_info={},
-                )
-            )
-
-    dag.edges = normalized_edges
-
-
-def _rewrite_boundary_edge(
-    edge: DataFlowEdge,
-    container_member_ids: dict[int, set[int]],
-) -> DataFlowEdge:
-    src_id = edge.src_id
-    dst_id = edge.dst_id
-    changed = False
-    for container_node_id, member_ids in container_member_ids.items():
-        src_in_container = src_id in member_ids
-        dst_in_container = dst_id in member_ids
-        if src_in_container and dst_in_container:
-            continue
-        if dst_in_container and not src_in_container:
-            dst_id = container_node_id
-            changed = True
-            continue
-        if src_in_container and not dst_in_container:
-            src_id = container_node_id
-            changed = True
-    if not changed:
-        return edge
-    return DataFlowEdge(
-        src_id=src_id,
-        dst_id=dst_id,
-        is_containment=False,
-        evidence=list(edge.evidence),
-        tensor_info=dict(edge.tensor_info),
-        src_output_indices=list(edge.src_output_indices),
-    )
+        for member_id in sorted(member_ids):
+            if member_id not in inner_dag.direct_nodes:
+                inner_dag.direct_nodes.append(member_id)
 
 
 def _ensure_missing_container_nodes(
@@ -165,9 +105,8 @@ def _ensure_missing_container_nodes(
         for child_attr in container_attr.items.values():
             matched_node_ids = attr_to_node_ids.get(id(child_attr))
             if not matched_node_ids:
-                raise RuntimeError(
-                    f"Container attr {container_attr.attr_name} child attr {child_attr.attr_name} has no registered DagNode"
-                )
+                # 该子节点已被 DCE 剪除（registry 中无对应节点），跳过。
+                continue
             if len(matched_node_ids) != 1:
                 raise RuntimeError(
                     f"Container attr {container_attr.attr_name} child attr {child_attr.attr_name} expected exactly one DagNode, got {matched_node_ids}"
@@ -256,10 +195,11 @@ def _resolve_direct_member_ids(
     for child_attr in container_node.attr.items.values():
         matched_node_ids = attr_to_node_ids.get(id(child_attr))
         if not matched_node_ids:
-            raise RuntimeError(
-                f"Container {container_node.node_id} child attr {child_attr.attr_name} has no registered DagNode"
-            )
+            # 该子节点已被 DCE 剪除（registry 中无对应节点），跳过。
+            continue
         current_level_ids = [node_id for node_id in matched_node_ids if node_id in dag.nodes]
+        if not current_level_ids:
+            continue
         if len(current_level_ids) != 1:
             raise RuntimeError(
                 f"Container {container_node.node_id} child attr {child_attr.attr_name} expected exactly one direct child node in current DAG, got {current_level_ids}"
