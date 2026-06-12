@@ -56,6 +56,8 @@ def _normalize_single_dag(
     for container_node_id in container_node_ids:
         if container_node_id not in dag.nodes:
             dag.nodes.append(container_node_id)
+        if container_node_id != owner_node_id and container_node_id not in dag.direct_nodes:
+            dag.direct_nodes.append(container_node_id)
         registry[container_node_id].metadata["is_container"] = True
 
     # 数据流边原样保留：不重写 boundary edge、不生成 containment 边。

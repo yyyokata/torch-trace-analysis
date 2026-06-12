@@ -124,6 +124,8 @@ def _walk_serialized_level(
         node_id = entry["node_id"]
         if node_id in container_child_ids:
             continue
+        if node_id in state.group_by_id or node_id in state.leaf_nodes_by_id:
+            continue
         built = _build_structured_node(
             entry=entry,
             depth=depth,
@@ -142,20 +144,12 @@ def _walk_serialized_level(
 
 def _collect_node_entry_index(serialized: dict) -> dict[int, dict]:
     node_entry_by_id: dict[int, dict] = {}
-    _collect_node_entries(serialized["nodes"], node_entry_by_id)
-    return node_entry_by_id
-
-
-def _collect_node_entries(entries: list[dict], node_entry_by_id: dict[int, dict]) -> None:
-    for entry in entries:
+    for entry in serialized["nodes"]:
         node_id = _require_field(entry, "node_id")
         if node_id in node_entry_by_id:
             raise RuntimeError(f"duplicate node id in serialized nodes: {node_id}")
         node_entry_by_id[node_id] = entry
-        inner_dag = entry.get("inner_dag")
-        if inner_dag is not None:
-            _validate_serialized_top_level(inner_dag)
-            _collect_node_entries(inner_dag["nodes"], node_entry_by_id)
+    return node_entry_by_id
 
 
 def _build_structured_node(
@@ -206,10 +200,14 @@ def _build_group_node(
     children_groups: list[dict] = []
     call_order: list[dict] = []
     if entry.get("children_nodes") is not None:
+        child_entry_by_id = node_entry_by_id
+        inner_dag = entry.get("inner_dag")
+        if inner_dag is not None:
+            child_entry_by_id = _collect_node_entry_index(inner_dag)
         for child_id in entry["children_nodes"]:
-            if child_id not in node_entry_by_id:
-                raise RuntimeError(f"container group {node_id} child {child_id} missing node definition")
-            child_entry = node_entry_by_id[child_id]
+            if child_id not in child_entry_by_id:
+                continue
+            child_entry = child_entry_by_id[child_id]
             built = _build_structured_node(
                 entry=child_entry,
                 depth=depth + 1,
@@ -297,9 +295,9 @@ def _route_edges(state: _AdapterState) -> list[dict]:
         src_id = edge["src_id"]
         dst_id = edge["dst_id"]
         if src_id not in known_ids:
-            raise RuntimeError(f"edge src_id {src_id} not found in node index")
+            continue
         if dst_id not in known_ids:
-            raise RuntimeError(f"edge dst_id {dst_id} not found in node index")
+            continue
         edge_type = "dep"
         src_label = state.label_by_id[src_id]
         dst_label = state.label_by_id[dst_id]

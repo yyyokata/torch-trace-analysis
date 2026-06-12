@@ -156,46 +156,8 @@ def _get_registry_node(node_id: int, registry: dict[int, DagNode]) -> DagNode:
         raise RuntimeError(f"node_id {node_id} not found in registry")
     return registry[node_id]
 
-def _serialized_node_ids(dag: DAG, registry: dict[int, DagNode]) -> list[int]:
-    node_ids: list[int] = []
-    seen: set[int] = set()
-    for node_id in dag.direct_nodes:
-        _append_serialized_node_id(node_id, dag, registry, node_ids, seen)
-    return node_ids
-
-
-def _append_serialized_node_id(
-    node_id: int,
-    dag: DAG,
-    registry: dict[int, DagNode],
-    node_ids: list[int],
-    seen: set[int],
-) -> None:
-    if node_id in seen:
-        raise RuntimeError(f"duplicate node id while serializing DAG level: {node_id}")
-    seen.add(node_id)
-    node_ids.append(node_id)
-    node = _get_registry_node(node_id, registry)
-    if not isinstance(node, ModuleNode) or node.metadata.get("is_container") is not True:
-        return
-    if not isinstance(node.attr, ContainerAttr):
-        raise RuntimeError(f"container node {node_id} attr must be ContainerAttr")
-    attr_id_to_node_id = {id(n.attr): nid for nid, n in registry.items()}
-    for child_attr in node.attr.items.values():
-        child_id = attr_id_to_node_id.get(id(child_attr))
-        if child_id is None:
-            continue
-        _append_serialized_node_id(child_id, dag, registry, node_ids, seen)
-
 
 def serialize_dag(dag: DAG, registry: dict[int, DagNode]) -> dict:
-    node_ids = _serialized_node_ids(dag, registry)
-    edge_node_ids = set(dag.inputs) | set(dag.params) | set(dag.consts) | set(dag.outputs) | set(node_ids)
-    serialized_edges = [
-        _serialize_edge(edge)
-        for edge in dag.edges
-        if edge.src_id in edge_node_ids and edge.dst_id in edge_node_ids
-    ]
     return {
         "input_nodes": [
             _serialize_io_node(_get_registry_node(node_id, registry), "input") for node_id in dag.inputs
@@ -209,8 +171,8 @@ def serialize_dag(dag: DAG, registry: dict[int, DagNode]) -> dict:
         "output_nodes": [
             _serialize_io_node(_get_registry_node(node_id, registry), "output") for node_id in dag.outputs
         ],
-        "nodes": [_serialize_dag_node(node_id, dag, registry) for node_id in node_ids],
-        "edges": serialized_edges,
+        "nodes": [_serialize_dag_node(node_id, dag, registry) for node_id in dag.direct_nodes],
+        "edges": [_serialize_edge(edge) for edge in dag.edges],
     }
 
 
