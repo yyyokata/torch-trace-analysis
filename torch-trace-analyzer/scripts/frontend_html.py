@@ -804,16 +804,98 @@ function render() {
     const topIORows = topIOItems.length > 0 ? [{ items: topIOItems }] : [];
     const bottomIORows = bottomIOItems.length > 0 ? [{ items: bottomIOItems }] : [];
     const allIORows = topIORows.concat(bottomIORows);
-    const calcIORowWidth = (row) => row.items.length > 0
-        ? row.items.length * ioW + (row.items.length - 1) * pillGap
-        : 0;
-    const maxIORowW = allIORows.length > 0 ? Math.max(...allIORows.map(calcIORowWidth)) : 0;
-    const topIOHeight = topIORows.length > 0 ? topIORows.length * ioH + (topIORows.length - 1) * ioGap : 0;
-    const bottomIOHeight = bottomIORows.length > 0 ? bottomIORows.length * ioH + (bottomIORows.length - 1) * ioGap : 0;
     const maxRootW = rootSizes.length ? Math.max(...rootSizes.map(r => r.w)) : LAYOUT.nodeW;
     const maxRootH = rootSizes.length ? Math.max(...rootSizes.map(r => r.h)) : LAYOUT.nodeH;
+    const provisionalSvgW = Math.max(maxRootW + 80, 480);
+    const EXPAND_PADDING = 24;
+    const EXPAND_PILL_W = 100;
+    const EXPAND_COLS = 3;
+    const EXPAND_FRAME_PAD = 16;
+    const EXPAND_COL_GAP = 20;
+    const EXPAND_OUTER_PAD = 24;
+    const EXPANDED_IO_H = 28;
+    const EXPANDED_IO_GAP = 16;
+    const COLLAPSE_BUTTON_W = 70;
+    const COLLAPSE_BUTTON_H = 22;
+    const COLLAPSE_BOTTOM_PADDING = 10;
+    const expandedGroupCount = (DATA.io_groups || []).filter(g =>
+        !((g.id in collapsedState) ? collapsedState[g.id] : g.collapsed)
+    ).length;
+    const minIOColW = EXPAND_COLS * EXPAND_PILL_W + (EXPAND_COLS - 1) * pillGap + 2 * EXPAND_FRAME_PAD;
+    const minIOTotalW = expandedGroupCount > 0
+        ? expandedGroupCount * minIOColW + (expandedGroupCount - 1) * EXPAND_COL_GAP + 2 * EXPAND_OUTER_PAD
+        : 0;
+    const computeIOGroupExpandedLayout = (memberCount, availableSvgW = provisionalSvgW) => {
+        if (memberCount === 0) return { cols: EXPAND_COLS, pillW: EXPAND_PILL_W, memberRows: 0, height: 0 };
+        const availableW = availableSvgW - 2 * EXPAND_FRAME_PAD;
+        const cols = Math.max(EXPAND_COLS, Math.floor(availableW / (EXPAND_PILL_W + pillGap)));
+        const pillW = Math.floor((availableW - (cols - 1) * pillGap) / cols);
+        const memberRows = Math.ceil(memberCount / cols);
+        const memberAreaH = memberRows * EXPANDED_IO_H + (memberRows - 1) * EXPANDED_IO_GAP;
+        const height = memberAreaH + EXPANDED_IO_GAP + COLLAPSE_BUTTON_H + COLLAPSE_BOTTOM_PADDING;
+        return { cols, pillW, memberRows, height };
+    };
+    const calcIOGroupExpandedHeight = (ioGroup, availableW = provisionalSvgW) => {
+        const memberCount = (ioGroup.member_ids || []).length;
+        return computeIOGroupExpandedLayout(memberCount, availableW).height;
+    };
+    const calcIORowWidth = (row, availableW = provisionalSvgW) => {
+        if (!row.items || row.items.length === 0) return 0;
+        let width = 0;
+        let pendingInline = 0;
+        const flushInline = () => {
+            if (pendingInline > 0) {
+                width = Math.max(width, pendingInline * ioW + (pendingInline - 1) * pillGap);
+                pendingInline = 0;
+            }
+        };
+        for (const item of row.items) {
+            if (item.isIOGroup === true) {
+                const ioGroup = item.ioGroup;
+                const isCollapsed = (ioGroup.id in collapsedState) ? collapsedState[ioGroup.id] : ioGroup.collapsed;
+                if (!isCollapsed) {
+                    flushInline();
+                    const memberCount = (ioGroup.member_ids || []).length;
+                    const expandedW = memberCount > 0
+                        ? Math.min(availableW * 0.85, memberCount * (ioW + pillGap) - pillGap)
+                        : 0;
+                    width = Math.max(width, expandedW);
+                    continue;
+                }
+            }
+            pendingInline += 1;
+        }
+        flushInline();
+        return width;
+    };
+    const maxIORowW = allIORows.length > 0 ? Math.max(...allIORows.map(row => calcIORowWidth(row))) : 0;
+    const svgW = Math.max(provisionalSvgW, maxIORowW + 80, minIOTotalW);
+    const calcIORowHeight = (row) => {
+        if (!row.items || row.items.length === 0) return 0;
+        const expandedGroups = row.items.filter(item => {
+            if (item.isIOGroup !== true) return false;
+            const ioGroup = item.ioGroup;
+            const isCollapsed = (ioGroup.id in collapsedState) ? collapsedState[ioGroup.id] : ioGroup.collapsed;
+            return !isCollapsed;
+        });
+        const hasInlineRow = row.items.some(item => {
+            if (item.isIOGroup !== true) return true;
+            const ioGroup = item.ioGroup;
+            const isCollapsed = (ioGroup.id in collapsedState) ? collapsedState[ioGroup.id] : ioGroup.collapsed;
+            return isCollapsed;
+        });
+        let height = hasInlineRow ? ioH : 0;
+        if (expandedGroups.length > 0) {
+            const groupCount = expandedGroups.length;
+            const colW = (svgW - (groupCount - 1) * EXPAND_COL_GAP) / groupCount;
+            const expandedH = Math.max(...expandedGroups.map(item => calcIOGroupExpandedHeight(item.ioGroup, colW)));
+            height += (height > 0 ? ioGap : 0) + expandedH;
+        }
+        return height;
+    };
+    const topIOHeight = topIORows.length > 0 ? topIORows.reduce((acc, row, idx) => acc + calcIORowHeight(row) + (idx > 0 ? ioGap : 0), 0) : 0;
+    const bottomIOHeight = bottomIORows.length > 0 ? bottomIORows.reduce((acc, row, idx) => acc + calcIORowHeight(row) + (idx > 0 ? ioGap : 0), 0) : 0;
 
-    const svgW = Math.max(maxRootW + 80, maxIORowW + 80, 480);
     const rootStartY = 30 + (topIOHeight > 0 ? topIOHeight + ioGap : 0);
     const svgH = 30 + topIOHeight + (topIOHeight > 0 ? ioGap : 0) + maxRootH + (bottomIOHeight > 0 ? ioGap + bottomIOHeight : 0) + 40;
 
@@ -1144,23 +1226,81 @@ function render() {
     };
     const IO_GROUP_MEMBER_LABEL = { input: 'Input', param: 'Param', const: 'Const' };
 
-    function renderIOGroupPill(ioGroup, cx, cy, w, h) {
+    function renderIOGroupPill(ioGroup, cx, cy, w, h, availableW = svgW) {
         const fillColor = IO_GROUP_FILL[ioGroup.io_subtype] || 'rgba(127,140,141,0.55)';
         const memberLabel = IO_GROUP_MEMBER_LABEL[ioGroup.io_subtype] || ioGroup.io_subtype;
         const isCollapsed = (ioGroup.id in collapsedState) ? collapsedState[ioGroup.id] : ioGroup.collapsed;
+        const renderCollapseButton = (bcx, bcy) => {
+            const bx = bcx - COLLAPSE_BUTTON_W / 2;
+            const by = bcy - COLLAPSE_BUTTON_H / 2;
+            const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+            rect.setAttribute('x', bx); rect.setAttribute('y', by);
+            rect.setAttribute('width', COLLAPSE_BUTTON_W); rect.setAttribute('height', COLLAPSE_BUTTON_H);
+            rect.setAttribute('rx', COLLAPSE_BUTTON_H / 2); rect.setAttribute('ry', COLLAPSE_BUTTON_H / 2);
+            rect.setAttribute('class', 'io-node io-group');
+            rect.setAttribute('fill', 'transparent');
+            rect.setAttribute('stroke', 'rgba(255,255,255,0.45)');
+            rect.setAttribute('stroke-width', '1.5');
+            rect.style.cursor = 'pointer';
+            rect.dataset.ioGroupId = ioGroup.id;
+            rect.addEventListener('dblclick', (e) => {
+                e.stopPropagation();
+                collapsedState[ioGroup.id] = true;
+                render();
+            });
+            svg.appendChild(rect);
+
+            const lab = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+            lab.setAttribute('x', bcx); lab.setAttribute('y', bcy + 4);
+            lab.setAttribute('class', 'node-label');
+            lab.setAttribute('font-weight', '700');
+            lab.textContent = '▲ 收起';
+            lab.style.pointerEvents = 'none';
+            svg.appendChild(lab);
+        };
         if (!isCollapsed) {
-            // Expanded: render each member as an individual IO pill
-            let mleft = cx - w / 2;
-            for (const memberId of (ioGroup.member_ids || [])) {
-                const node = nodeMap[memberId];
-                const baseText = node ? (node.class_name || node.label || memberLabel) : memberLabel;
-                const sublabel = (node && node.has_timing)
-                    ? `${baseText} · ${node.pct.toFixed(1)}%`
-                    : baseText;
-                renderIOPill(memberId, mleft + w / 2, cy, w, h, memberLabel, sublabel, fillColor);
-                mleft += w + pillGap;
+            const members = ioGroup.member_ids || [];
+            if (members.length === 0) return 0;
+            const { cols, pillW, memberRows, height: expandedHeight } = computeIOGroupExpandedLayout(members.length, availableW);
+            const startY = cy - EXPANDED_IO_H / 2;
+            const frameX = cx - availableW / 2 + EXPAND_FRAME_PAD - 8;
+            const frameY = startY - 8;
+            const frameW = availableW - 2 * (EXPAND_FRAME_PAD - 8);
+            const frameH = expandedHeight + 8;
+            const frame = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+            frame.setAttribute('x', frameX); frame.setAttribute('y', frameY);
+            frame.setAttribute('width', frameW); frame.setAttribute('height', frameH);
+            frame.setAttribute('rx', 10); frame.setAttribute('ry', 10);
+            frame.setAttribute('fill', 'rgba(255,255,255,0.03)');
+            frame.setAttribute('stroke', fillColor);
+            frame.setAttribute('stroke-width', '1.5');
+            frame.setAttribute('stroke-dasharray', '5,4');
+            svg.appendChild(frame);
+
+            const truncateSublabel = (text) => {
+                const limit = Math.max(1, Math.floor(pillW / 6.5));
+                return text.length > limit ? `${text.slice(0, Math.max(0, limit - 1))}…` : text;
+            };
+            for (let rowIdx = 0; rowIdx < memberRows; rowIdx++) {
+                const first = rowIdx * cols;
+                const rowMemberCount = Math.max(0, Math.min(cols, members.length - first));
+                const rowWidth = rowMemberCount * pillW + (rowMemberCount - 1) * pillGap;
+                let left = cx - rowWidth / 2;
+                const rowCy = startY + rowIdx * (EXPANDED_IO_H + EXPANDED_IO_GAP) + EXPANDED_IO_H / 2;
+                for (let idx = 0; idx < rowMemberCount; idx++) {
+                    const memberId = members[first + idx];
+                    const node = nodeMap[memberId];
+                    const baseText = node ? (node.class_name || node.label || memberLabel) : memberLabel;
+                    const sublabel = (node && node.has_timing)
+                        ? `${baseText} · ${node.pct.toFixed(1)}%`
+                        : baseText;
+                    renderIOPill(memberId, left + pillW / 2, rowCy, pillW, EXPANDED_IO_H, memberLabel, truncateSublabel(sublabel), fillColor);
+                    left += pillW + pillGap;
+                }
             }
-            return;
+            const collapseRowCy = frameY + frameH - COLLAPSE_BOTTOM_PADDING - COLLAPSE_BUTTON_H / 2;
+            renderCollapseButton(cx, collapseRowCy);
+            return expandedHeight;
         }
         // Collapsed: single pill representing the whole IO group
         const x = cx - w / 2;
@@ -1175,9 +1315,9 @@ function render() {
         rect.setAttribute('stroke-width', '1.5');
         rect.style.cursor = 'pointer';
         rect.dataset.ioGroupId = ioGroup.id;
-        rect.addEventListener('click', (e) => {
+        rect.addEventListener('dblclick', (e) => {
             e.stopPropagation();
-            collapsedState[ioGroup.id] = !((ioGroup.id in collapsedState) ? collapsedState[ioGroup.id] : ioGroup.collapsed);
+            collapsedState[ioGroup.id] = false;
             render();
         });
         svg.appendChild(rect);
@@ -1187,46 +1327,80 @@ function render() {
         lab.setAttribute('class', 'node-label');
         lab.setAttribute('font-weight', '700');
         lab.textContent = `▶ ${ioGroup.label}`;
+        lab.style.pointerEvents = 'none';
         svg.appendChild(lab);
 
         nodePortMap[ioGroup.id] = { cx, cy };
         nodePortMap[ioGroup.id + '__in'] = { cx, cy: y };
         nodePortMap[ioGroup.id + '__out'] = { cx, cy: y + h };
+        return h;
     }
 
     function renderIOPillRow(row, startY) {
-        if (!row || !row.items || row.items.length === 0) return;
-        const rowWidth = calcIORowWidth(row);
-        let left = (svgW - rowWidth) / 2;
-        const cy = startY + ioH / 2;
+        if (!row || !row.items || row.items.length === 0) return 0;
+        let y = startY;
+        const inlineItems = [];
+        const expandedItems = [];
         for (const item of row.items) {
             if (item.isIOGroup === true) {
-                renderIOGroupPill(item.ioGroup, left + ioW / 2, cy, ioW, ioH);
-                left += ioW + pillGap;
-                continue;
+                const ioGroup = item.ioGroup;
+                const isCollapsed = (ioGroup.id in collapsedState) ? collapsedState[ioGroup.id] : ioGroup.collapsed;
+                if (!isCollapsed) {
+                    expandedItems.push(item);
+                    continue;
+                }
             }
-            const nid = item.id;
-            const node = nodeMap[nid];
-            const baseText = node ? (node.class_name || node.label || item.defaultSublabel) : item.defaultSublabel;
-            const sublabel = (node && node.has_timing)
-                ? `${baseText} · ${node.pct.toFixed(1)}%`
-                : baseText;
-            renderIOPill(nid, left + ioW / 2, cy, ioW, ioH, item.label, sublabel, item.fillColor);
-            left += ioW + pillGap;
+            inlineItems.push(item);
         }
+
+        if (inlineItems.length > 0) {
+            const rowWidth = inlineItems.length * ioW + (inlineItems.length - 1) * pillGap;
+            let left = (svgW - rowWidth) / 2;
+            const cy = y + ioH / 2;
+            for (const item of inlineItems) {
+                if (item.isIOGroup === true) {
+                    renderIOGroupPill(item.ioGroup, left + ioW / 2, cy, ioW, ioH);
+                    left += ioW + pillGap;
+                    continue;
+                }
+                const nid = item.id;
+                const node = nodeMap[nid];
+                const baseText = node ? (node.class_name || node.label || item.defaultSublabel) : item.defaultSublabel;
+                const sublabel = (node && node.has_timing)
+                    ? `${baseText} · ${node.pct.toFixed(1)}%`
+                    : baseText;
+                renderIOPill(nid, left + ioW / 2, cy, ioW, ioH, item.label, sublabel, item.fillColor);
+                left += ioW + pillGap;
+            }
+            y += ioH;
+        }
+
+        if (expandedItems.length > 0) {
+            if (y > startY) y += ioGap;
+            const groupCount = expandedItems.length;
+            const colW = (svgW - (groupCount - 1) * EXPAND_COL_GAP) / groupCount;
+            const expandedHeight = Math.max(...expandedItems.map(item => calcIOGroupExpandedHeight(item.ioGroup, colW)));
+            let left = 0;
+            for (const item of expandedItems) {
+                renderIOGroupPill(item.ioGroup, left + colW / 2, y + EXPANDED_IO_H / 2, ioW, ioH, colW);
+                left += colW + EXPAND_COL_GAP;
+            }
+            y += expandedHeight;
+        }
+        return y - startY;
     }
 
     let topIOY = 30;
     for (const row of topIORows) {
-        renderIOPillRow(row, topIOY);
-        topIOY += ioH + ioGap;
+        const renderedHeight = renderIOPillRow(row, topIOY);
+        topIOY += renderedHeight + ioGap;
     }
 
     const rootEntry = rootPositions[0];
     let bottomIOY = rootEntry ? (rootEntry.y + rootEntry.h + ioGap) : (rootStartY + maxRootH + ioGap);
     for (const row of bottomIORows) {
-        renderIOPillRow(row, bottomIOY);
-        bottomIOY += ioH + ioGap;
+        const renderedHeight = renderIOPillRow(row, bottomIOY);
+        bottomIOY += renderedHeight + ioGap;
     }
 
 
