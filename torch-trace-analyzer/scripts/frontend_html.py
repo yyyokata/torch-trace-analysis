@@ -487,6 +487,8 @@ DATA.nodes.forEach(n => nodeMap[n.id] = n);
 indexGroupAncestors(DATA.root_groups.map(rid => groupMap[rid]).filter(Boolean));
 // Default: depth > 1 groups start collapsed
 DATA.groups.forEach(g => { collapsedState[g.id] = g.depth >= 2 || g.is_native === true; });
+// Top-level IO groups (Input/Param/Const) default to their adapter-provided collapsed state
+(DATA.io_groups || []).forEach(g => { if (!(g.id in collapsedState)) collapsedState[g.id] = g.collapsed; });
 
 function formatDur(us) {
     if (us >= 1e6) return (us/1e6).toFixed(3) + ' s';
@@ -789,11 +791,13 @@ function render() {
     const ioW = 140, ioH = 40;
     const ioGap = 36;
     const pillGap = 18;
-    const topIOItems = [
-        ...(DATA.input_node_ids || []).map(id => ({ id, label: 'Input', defaultSublabel: 'network input', fillColor: 'rgba(46,204,113,0.55)' })),
-        ...(DATA.param_node_ids || []).map(id => ({ id, label: 'Param', defaultSublabel: 'model param', fillColor: 'rgba(155,89,182,0.55)' })),
-        ...(DATA.const_node_ids || []).map(id => ({ id, label: 'Const', defaultSublabel: 'const value', fillColor: 'rgba(241,196,15,0.55)' })),
-    ];
+    const topIOItems = (DATA.io_groups && DATA.io_groups.length > 0)
+        ? DATA.io_groups.map(g => ({ isIOGroup: true, ioGroup: g }))
+        : [
+            ...(DATA.input_node_ids || []).map(id => ({ id, label: 'Input', defaultSublabel: 'network input', fillColor: 'rgba(46,204,113,0.55)' })),
+            ...(DATA.param_node_ids || []).map(id => ({ id, label: 'Param', defaultSublabel: 'model param', fillColor: 'rgba(155,89,182,0.55)' })),
+            ...(DATA.const_node_ids || []).map(id => ({ id, label: 'Const', defaultSublabel: 'const value', fillColor: 'rgba(241,196,15,0.55)' })),
+        ];
     const bottomIOItems = [
         ...(DATA.output_node_ids || []).map(id => ({ id, label: 'Result', defaultSublabel: 'result output', fillColor: 'rgba(231,76,60,0.55)' })),
     ];
@@ -1133,12 +1137,74 @@ function render() {
         nodePortMap[nid + '__out'] = { cx, cy: y + h };
     }
 
+    const IO_GROUP_FILL = {
+        input: 'rgba(46,204,113,0.55)',
+        param: 'rgba(155,89,182,0.55)',
+        const: 'rgba(241,196,15,0.55)',
+    };
+    const IO_GROUP_MEMBER_LABEL = { input: 'Input', param: 'Param', const: 'Const' };
+
+    function renderIOGroupPill(ioGroup, cx, cy, w, h) {
+        const fillColor = IO_GROUP_FILL[ioGroup.io_subtype] || 'rgba(127,140,141,0.55)';
+        const memberLabel = IO_GROUP_MEMBER_LABEL[ioGroup.io_subtype] || ioGroup.io_subtype;
+        const isCollapsed = (ioGroup.id in collapsedState) ? collapsedState[ioGroup.id] : ioGroup.collapsed;
+        if (!isCollapsed) {
+            // Expanded: render each member as an individual IO pill
+            let mleft = cx - w / 2;
+            for (const memberId of (ioGroup.member_ids || [])) {
+                const node = nodeMap[memberId];
+                const baseText = node ? (node.class_name || node.label || memberLabel) : memberLabel;
+                const sublabel = (node && node.has_timing)
+                    ? `${baseText} · ${node.pct.toFixed(1)}%`
+                    : baseText;
+                renderIOPill(memberId, mleft + w / 2, cy, w, h, memberLabel, sublabel, fillColor);
+                mleft += w + pillGap;
+            }
+            return;
+        }
+        // Collapsed: single pill representing the whole IO group
+        const x = cx - w / 2;
+        const y = cy - h / 2;
+        const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+        rect.setAttribute('x', x); rect.setAttribute('y', y);
+        rect.setAttribute('width', w); rect.setAttribute('height', h);
+        rect.setAttribute('rx', h / 2); rect.setAttribute('ry', h / 2);
+        rect.setAttribute('class', 'io-node io-group');
+        rect.setAttribute('fill', fillColor);
+        rect.setAttribute('stroke', 'rgba(255,255,255,0.35)');
+        rect.setAttribute('stroke-width', '1.5');
+        rect.style.cursor = 'pointer';
+        rect.dataset.ioGroupId = ioGroup.id;
+        rect.addEventListener('click', (e) => {
+            e.stopPropagation();
+            collapsedState[ioGroup.id] = !((ioGroup.id in collapsedState) ? collapsedState[ioGroup.id] : ioGroup.collapsed);
+            render();
+        });
+        svg.appendChild(rect);
+
+        const lab = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+        lab.setAttribute('x', cx); lab.setAttribute('y', cy + 4);
+        lab.setAttribute('class', 'node-label');
+        lab.setAttribute('font-weight', '700');
+        lab.textContent = `▶ ${ioGroup.label}`;
+        svg.appendChild(lab);
+
+        nodePortMap[ioGroup.id] = { cx, cy };
+        nodePortMap[ioGroup.id + '__in'] = { cx, cy: y };
+        nodePortMap[ioGroup.id + '__out'] = { cx, cy: y + h };
+    }
+
     function renderIOPillRow(row, startY) {
         if (!row || !row.items || row.items.length === 0) return;
         const rowWidth = calcIORowWidth(row);
         let left = (svgW - rowWidth) / 2;
         const cy = startY + ioH / 2;
         for (const item of row.items) {
+            if (item.isIOGroup === true) {
+                renderIOGroupPill(item.ioGroup, left + ioW / 2, cy, ioW, ioH);
+                left += ioW + pillGap;
+                continue;
+            }
             const nid = item.id;
             const node = nodeMap[nid];
             const baseText = node ? (node.class_name || node.label || item.defaultSublabel) : item.defaultSublabel;
@@ -1180,6 +1246,27 @@ function render() {
                 type: edge.type || 'dep',
                 edgeData: edge,
                 routeMeta: EDGE_BUNDLE_META.get(edgeKey(edge)) || null,
+            });
+        }
+    }
+
+    // Collapsed top-level IO group edges: draw aggregated group → consumer edges
+    for (const ioGroup of (DATA.io_groups || [])) {
+        const isCollapsed = (ioGroup.id in collapsedState) ? collapsedState[ioGroup.id] : ioGroup.collapsed;
+        if (!isCollapsed) continue;
+        const fromPos = nodePortMap[ioGroup.id + '__out'];
+        if (!fromPos) continue;
+        for (const ce of (ioGroup.collapsed_edges || [])) {
+            const toId = resolveCollapsedAncestor(ce.to);
+            const toPos = nodePortMap[toId + '__in'] || nodePortMap[toId];
+            if (!toPos) continue;
+            renderEdge({
+                routingMode: 'direct',
+                x1: fromPos.cx, y1: fromPos.cy,
+                x2: toPos.cx, y2: toPos.cy,
+                type: ce.type || 'dep',
+                edgeData: { from: ioGroup.id, to: ce.to, type: ce.type || 'dep' },
+                routeMeta: null,
             });
         }
     }

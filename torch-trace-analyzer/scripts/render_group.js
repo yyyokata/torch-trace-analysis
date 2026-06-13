@@ -180,11 +180,35 @@ function buildInternalEdgeRoutingContext(ctx) {
     };
 }
 
+function resolveEdgeEndpointRect(ed, which, routeCtx, ctx) {
+    const portKind = which === 'from' ? ed.from_port : ed.to_port;
+    if (portKind === 'in') {
+        const pt = nodePortMap[ctx.gid + '__in'];
+        if (!pt) {
+            throw new Error(`resolveEdgeEndpointRect: missing in-port for group ${ctx.gid}`);
+        }
+        return { x: pt.cx, y: pt.cy, w: 0, h: 0, rank: -1 };
+    }
+    if (portKind === 'out') {
+        const pt = nodePortMap[ctx.gid + '__out'];
+        if (!pt) {
+            throw new Error(`resolveEdgeEndpointRect: missing out-port for group ${ctx.gid}`);
+        }
+        return { x: pt.cx, y: pt.cy, w: 0, h: 0, rank: -1 };
+    }
+    const childKey = which === 'from' ? ed.from_child : ed.to_child;
+    const rect = routeCtx.childAbsRect[childKey];
+    if (!rect) {
+        return null;
+    }
+    return rect;
+}
+
 function renderGroupInternalEdges(ctx, routeCtx) {
     if (!(ctx.g.internal_edges && ctx.pos.rowLayouts)) return;
     for (const ed of ctx.g.internal_edges) {
-        const fr = routeCtx.childAbsRect[ed.from_child];
-        const to = routeCtx.childAbsRect[ed.to_child];
+        const fr = resolveEdgeEndpointRect(ed, 'from', routeCtx, ctx);
+        const to = resolveEdgeEndpointRect(ed, 'to', routeCtx, ctx);
         if (!fr || !to) {
             console.warn('[renderGroupInternalEdges] missing child rect for edge:', ed);
             continue;
@@ -192,8 +216,8 @@ function renderGroupInternalEdges(ctx, routeCtx) {
         const routedEdge = {
             __internal: true,
             __gid: ctx.gid,
-            from: ed.from_child,
-            to: ed.to_child,
+            from: ed.from_port ? (ctx.gid + '__' + ed.from_port) : ed.from_child,
+            to: ed.to_port ? (ctx.gid + '__' + ed.to_port) : ed.to_child,
             type: ed.type || 'internal',
             from_attr: ed.from_attr,
             to_attr: ed.to_attr,
@@ -240,8 +264,10 @@ function renderGroupAt(gid, ox, oy) {
     RENDER_GROUP_EXPORTS.renderExpandedGroupTiming(ctx);
     RENDER_GROUP_EXPORTS.renderGroupChildren(ctx);
     const routeCtx = RENDER_GROUP_EXPORTS.buildInternalEdgeRoutingContext(ctx);
-    RENDER_GROUP_EXPORTS.renderGroupInternalEdges(ctx, routeCtx);
+    // Register this group's own __in/__out ports BEFORE rendering internal edges,
+    // because port-routed internal edges (from_port/to_port) resolve against them.
     RENDER_GROUP_EXPORTS.registerExpandedGroupPorts(ctx);
+    RENDER_GROUP_EXPORTS.renderGroupInternalEdges(ctx, routeCtx);
 }
 
 Object.assign(RENDER_GROUP_EXPORTS, {
@@ -257,6 +283,7 @@ Object.assign(RENDER_GROUP_EXPORTS, {
     renderExpandedGroupTiming,
     renderGroupChildren,
     buildInternalEdgeRoutingContext,
+    resolveEdgeEndpointRect,
     renderGroupInternalEdges,
     registerExpandedGroupPorts,
     renderGroupAt,
