@@ -35,6 +35,8 @@ class _AdapterState:
     group_list: list[dict] = field(default_factory=list)
     parent_group_of_child: dict[int, int] = field(default_factory=dict)
     label_by_id: dict[int, str] = field(default_factory=dict)
+    port_kind_by_id: dict[int, str] = field(default_factory=dict)
+    all_serialized_node_ids: set[int] = field(default_factory=set)
     raw_edges: list[dict] = field(default_factory=list)
 
 
@@ -93,6 +95,7 @@ def _walk_serialized_level(
     state: _AdapterState,
 ) -> tuple[list[dict], list[dict], list[dict]]:
     _validate_serialized_top_level(serialized)
+    _record_serialized_node_ids(serialized, state)
     state.raw_edges.extend(serialized["edges"])
 
     direct_groups: list[dict] = []
@@ -101,7 +104,10 @@ def _walk_serialized_level(
 
     for section_name, io_subtype in _IO_SECTION_TO_SUBTYPE.items():
         for entry in serialized[section_name]:
-            leaf = _build_io_leaf(entry, io_subtype=io_subtype, depth=depth)
+            effective_subtype = entry.get("io_subtype", io_subtype)
+            if effective_subtype in {"forward_arg", "return_val"}:
+                continue
+            leaf = _build_io_leaf(entry, io_subtype=effective_subtype, depth=depth)
             _register_leaf_node(state, leaf)
             direct_leaves.append(leaf)
             call_order.append({"id": leaf["id"], "type": "node"})
@@ -140,6 +146,14 @@ def _walk_serialized_level(
             direct_leaves.append(built.payload)
             call_order.append({"id": built.payload["id"], "type": "node"})
     return direct_groups, direct_leaves, call_order
+
+
+def _record_serialized_node_ids(serialized: dict, state: _AdapterState) -> None:
+    for section_name in ("input_nodes", "param_nodes", "const_nodes", "output_nodes"):
+        for entry in serialized[section_name]:
+            state.all_serialized_node_ids.add(_require_field(entry, "node_id"))
+    for entry in serialized["nodes"]:
+        state.all_serialized_node_ids.add(_require_field(entry, "node_id"))
 
 
 def _collect_node_entry_index(serialized: dict) -> dict[int, dict]:
@@ -199,6 +213,8 @@ def _build_group_node(
     children_nodes: list[int] = []
     children_groups: list[dict] = []
     call_order: list[dict] = []
+    in_ports: list[dict] = []
+    out_ports: list[dict] = []
     if entry.get("children_nodes") is not None:
         child_entry_by_id = node_entry_by_id
         inner_dag = entry.get("inner_dag")
@@ -228,6 +244,7 @@ def _build_group_node(
         if inner_dag is None:
             raise RuntimeError(f"group node {node_id} missing inner_dag")
         child_groups, child_leaves, call_order = _walk_serialized_level(inner_dag, depth=depth + 1, state=state)
+        in_ports, out_ports = _collect_group_ports(inner_dag, state=state, parent_id=node_id)
         for group in child_groups:
             _assign_parent_group(state, group["id"], node_id)
         for leaf in child_leaves:
@@ -244,12 +261,37 @@ def _build_group_node(
         "children_nodes": children_nodes,
         "children_groups": children_groups,
         "call_order": call_order,
+        "in_ports": in_ports,
+        "out_ports": out_ports,
         "internal_edges": [],
         **location_fields,
         **_timing_defaults(),
     }
     _register_group_node(state, group)
     return group
+
+
+def _collect_group_ports(inner_dag: dict, state: _AdapterState, parent_id: int) -> tuple[list[dict], list[dict]]:
+    in_ports: list[dict] = []
+    out_ports: list[dict] = []
+    for section_name in ("input_nodes", "output_nodes"):
+        for entry in inner_dag[section_name]:
+            io_subtype = entry.get("io_subtype")
+            if io_subtype == "forward_arg":
+                node_id = _require_field(entry, "node_id")
+                label = _require_field(entry, "label")
+                port = {"node_id": node_id, "arg_index": len(in_ports), "label": label}
+                in_ports.append(port)
+                _register_port_node(state, node_id=node_id, label=label, parent_id=parent_id, kind="in")
+            elif io_subtype == "return_val":
+                node_id = _require_field(entry, "node_id")
+                label = _require_field(entry, "label")
+                port = {"node_id": node_id, "ret_index": len(out_ports), "label": label}
+                out_ports.append(port)
+                _register_port_node(state, node_id=node_id, label=label, parent_id=parent_id, kind="out")
+            elif io_subtype not in {None, _IO_SECTION_TO_SUBTYPE[section_name]}:
+                raise RuntimeError(f"unsupported inner_dag io_subtype: {io_subtype}")
+    return in_ports, out_ports
 
 
 def _build_io_leaf(entry: dict, io_subtype: str, depth: int) -> dict:
@@ -294,10 +336,16 @@ def _route_edges(state: _AdapterState) -> list[dict]:
             raise RuntimeError("edge missing dst_id")
         src_id = edge["src_id"]
         dst_id = edge["dst_id"]
+        if edge.get("is_containment"):
+            continue
         if src_id not in known_ids:
-            continue
+            if src_id in state.all_serialized_node_ids or edge.get("tensor_info"):
+                continue
+            raise RuntimeError(f"edge src_id {src_id} not found in node index")
         if dst_id not in known_ids:
-            continue
+            if dst_id in state.all_serialized_node_ids or edge.get("tensor_info"):
+                continue
+            raise RuntimeError(f"edge dst_id {dst_id} not found in node index")
         edge_type = "dep"
         src_label = state.label_by_id[src_id]
         dst_label = state.label_by_id[dst_id]
@@ -306,18 +354,29 @@ def _route_edges(state: _AdapterState) -> list[dict]:
 
         if parent_src is not None and parent_src == parent_dst:
             group = state.group_by_id[parent_src]
-            group["internal_edges"].append(
-                {
-                    "from_child": src_id,
-                    "to_child": dst_id,
-                    "type": edge_type,
-                    "from_attr": src_label,
-                    "to_attr": dst_label,
-                    "parent_class": group["label"],
-                    "tensor_info": edge.get("tensor_info"),
-                    "evidence": edge.get("evidence"),
-                }
-            )
+            internal_edge = {
+                "type": edge_type,
+                "from_attr": src_label,
+                "to_attr": dst_label,
+                "parent_class": group["label"],
+                "tensor_info": edge.get("tensor_info"),
+                "evidence": edge.get("evidence"),
+            }
+            src_port_kind = state.port_kind_by_id.get(src_id)
+            dst_port_kind = state.port_kind_by_id.get(dst_id)
+            if src_port_kind is not None:
+                if src_port_kind != "in":
+                    raise RuntimeError(f"edge src_id {src_id} is not a valid group input port")
+                internal_edge["from_port"] = "in"
+            else:
+                internal_edge["from_child"] = src_id
+            if dst_port_kind is not None:
+                if dst_port_kind != "out":
+                    raise RuntimeError(f"edge dst_id {dst_id} is not a valid group output port")
+                internal_edge["to_port"] = "out"
+            else:
+                internal_edge["to_child"] = dst_id
+            group["internal_edges"].append(internal_edge)
             continue
 
         global_edges.append(
@@ -344,15 +403,25 @@ def _assign_parent_group(state: _AdapterState, child_id: int, parent_id: int) ->
 
 def _register_leaf_node(state: _AdapterState, leaf: dict) -> None:
     node_id = leaf["id"]
-    if node_id in state.leaf_nodes_by_id or node_id in state.group_by_id:
+    if node_id in state.leaf_nodes_by_id or node_id in state.group_by_id or node_id in state.port_kind_by_id:
         raise RuntimeError(f"duplicate node id in adapter output: {node_id}")
     state.leaf_nodes_by_id[node_id] = leaf
     state.label_by_id[node_id] = leaf["label"]
 
 
+def _register_port_node(state: _AdapterState, node_id: int, label: str, parent_id: int, kind: str) -> None:
+    if kind not in {"in", "out"}:
+        raise RuntimeError(f"unsupported port kind: {kind}")
+    if node_id in state.leaf_nodes_by_id or node_id in state.group_by_id or node_id in state.port_kind_by_id:
+        raise RuntimeError(f"duplicate node id in adapter output: {node_id}")
+    state.label_by_id[node_id] = label
+    state.port_kind_by_id[node_id] = kind
+    _assign_parent_group(state, node_id, parent_id)
+
+
 def _register_group_node(state: _AdapterState, group: dict) -> None:
     node_id = group["id"]
-    if node_id in state.group_by_id or node_id in state.leaf_nodes_by_id:
+    if node_id in state.group_by_id or node_id in state.leaf_nodes_by_id or node_id in state.port_kind_by_id:
         raise RuntimeError(f"duplicate node id in adapter output: {node_id}")
     state.group_by_id[node_id] = group
     state.group_list.append(group)
