@@ -54,12 +54,14 @@ def adapt_serialized_dag(serialized: dict, model_id: str, mode: str) -> dict:
         raise RuntimeError("serialized DAG has no root groups")
 
     global_edges = _route_edges(state)
+    io_groups = _collapse_top_level_io_groups(serialized, global_edges)
     root_group_ids = [group["id"] for group in root_groups]
     return {
         "input_node_ids": _extract_io_node_ids(serialized["input_nodes"]),
         "param_node_ids": _extract_io_node_ids(serialized["param_nodes"]),
         "const_node_ids": _extract_io_node_ids(serialized["const_nodes"]),
         "output_node_ids": _extract_io_node_ids(serialized["output_nodes"]),
+        "io_groups": io_groups,
         "root_groups": root_group_ids,
         "groups": state.group_list,
         "nodes": list(state.leaf_nodes_by_id.values()),
@@ -392,6 +394,68 @@ def _route_edges(state: _AdapterState) -> list[dict]:
             }
         )
     return global_edges
+
+
+def _collapse_top_level_io_groups(serialized: dict, global_edges: list[dict]) -> list[dict]:
+    buckets = (
+        ("input", serialized["input_nodes"]),
+        ("param", serialized["param_nodes"]),
+        ("const", serialized["const_nodes"]),
+    )
+    member_ids_by_subtype: dict[str, list[int]] = {
+        subtype: _extract_io_node_ids(entries)
+        for subtype, entries in buckets
+    }
+    member_to_subtype: dict[int, str] = {}
+    for subtype, member_ids in member_ids_by_subtype.items():
+        for member_id in member_ids:
+            if member_id in member_to_subtype:
+                raise RuntimeError(f"duplicate top-level io group member id: {member_id}")
+            member_to_subtype[member_id] = subtype
+
+    collapsed_edges_by_subtype: dict[str, list[dict]] = {subtype: [] for subtype, _ in buckets}
+    seen_edge_keys: set[tuple[str, int, str]] = set()
+    for edge in global_edges:
+        dst_id = edge["to"]
+        if dst_id in member_to_subtype:
+            subtype = member_to_subtype[dst_id]
+            raise RuntimeError(
+                "edge points to member of collapsed io group: "
+                f"io_subtype={subtype}, member_id={dst_id}, edge={edge}"
+            )
+        src_id = edge["from"]
+        subtype = member_to_subtype.get(src_id)
+        if subtype is None:
+            continue
+        group_id = _top_level_io_group_id(subtype)
+        edge_type = edge["type"]
+        key = (group_id, dst_id, edge_type)
+        if key in seen_edge_keys:
+            continue
+        seen_edge_keys.add(key)
+        collapsed_edges_by_subtype[subtype].append({"from": group_id, "to": dst_id, "type": edge_type})
+
+    io_groups: list[dict] = []
+    for subtype, _entries in buckets:
+        member_ids = member_ids_by_subtype[subtype]
+        if not member_ids:
+            continue
+        io_groups.append(
+            {
+                "id": _top_level_io_group_id(subtype),
+                "label": f"{_IO_SUBTYPE_TO_LABEL[subtype]} ({len(member_ids)})",
+                "io_subtype": subtype,
+                "collapsed": True,
+                "member_ids": member_ids,
+                "member_count": len(member_ids),
+                "collapsed_edges": collapsed_edges_by_subtype[subtype],
+            }
+        )
+    return io_groups
+
+
+def _top_level_io_group_id(io_subtype: str) -> str:
+    return f"io_group:{io_subtype}"
 
 
 def _assign_parent_group(state: _AdapterState, child_id: int, parent_id: int) -> None:
