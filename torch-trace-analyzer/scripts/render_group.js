@@ -35,7 +35,7 @@ function renderCollapsedGroupBox(ctx) {
 }
 
 function renderCollapsedGroupLabel(ctx) {
-    const labelText = `▶ ${ctx.g.class_name || ctx.g.label}`;
+    const labelText = `▶ ${ctx.g.class_name}`;
     const labelEl = document.createElementNS(RENDER_GROUP_SVG_NS, 'text');
     labelEl.setAttribute('x', ctx.ox + ctx.pos.w / 2);
     labelEl.setAttribute('y', ctx.oy + ctx.pos.h / 2 - 2);
@@ -95,7 +95,7 @@ function renderExpandedGroupBox(ctx) {
 }
 
 function renderExpandedGroupHeaderLabel(ctx) {
-    const headerText = `▼ ${ctx.g.class_name || ctx.g.label}`;
+    const headerText = `▼ ${ctx.g.class_name}`;
     const labelEl = document.createElementNS(RENDER_GROUP_SVG_NS, 'text');
     labelEl.setAttribute('x', ctx.ox + 12);
     labelEl.setAttribute('y', ctx.oy + 18);
@@ -108,7 +108,7 @@ function renderExpandedGroupHeaderLabel(ctx) {
     return { headerText, labelEl };
 }
 
-function renderExpandedGroupInfoButton(ctx, headerText) {
+function renderExpandedGroupInfoButton(ctx, _headerText) {
     if (!ctx.g.src_file) return;
     const bx = ctx.ox + ctx.pos.w - 20;
     appendGroupInfoButton(

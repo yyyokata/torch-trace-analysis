@@ -974,12 +974,12 @@ function render() {
         svg.appendChild(rect);
         registerNodeDom(nid, rect);
 
-        // Label: class_name with label fallback
+        // Label: class_name only
         const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
         label.setAttribute('x', nx + w/2); label.setAttribute('y', ny + h/2 - 2);
         label.setAttribute('class', 'node-label');
         label.style.pointerEvents = 'none';
-        label.textContent = n.class_name || n.label;
+        label.textContent = n.class_name;
         svg.appendChild(label);
 
         // Sublabel: timing only
@@ -1294,7 +1294,7 @@ function render() {
                 for (let idx = 0; idx < rowMemberCount; idx++) {
                     const memberId = members[first + idx];
                     const node = nodeMap[memberId];
-                    const baseText = node ? (node.class_name || node.label || memberLabel) : memberLabel;
+                    const baseText = node ? node.class_name : memberLabel;
                     const sublabel = (node && node.has_timing)
                         ? `${baseText} · ${node.pct.toFixed(1)}%`
                         : baseText;
@@ -1369,7 +1369,7 @@ function render() {
                 }
                 const nid = item.id;
                 const node = nodeMap[nid];
-                const baseText = node ? (node.class_name || node.label || item.defaultSublabel) : item.defaultSublabel;
+                const baseText = node ? node.class_name : item.defaultSublabel;
                 const sublabel = (node && node.has_timing)
                     ? `${baseText} · ${node.pct.toFixed(1)}%`
                     : baseText;
