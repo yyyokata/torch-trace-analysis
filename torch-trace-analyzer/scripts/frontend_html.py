@@ -1629,7 +1629,7 @@ function renderCodeBlockWithMarks(text, startLine, highlightLine, markVars, ctor
 function showSourcePanel(item) {
     // item is a node or group object carrying src_* fields
     const sp = document.getElementById('side-panel');
-    document.getElementById('sp-title').textContent = item.class_name || item.label || 'Module';
+    document.getElementById('sp-title').textContent = item.class_name;
     const fileLabel = item.src_file
         ? `${item.src_file}:${item.src_start_line}-${item.src_end_line}`
         : '(class definition not available in supplied sources)';
@@ -1638,6 +1638,7 @@ function showSourcePanel(item) {
     if (item.attr_name) {
         bodyHtml += `<div class="evidence-meta"><b>attr_name:</b> ${escapeHtml(item.attr_name)}</div>`;
     }
+    bodyHtml += `<div class="evidence-meta"><b>class_name:</b> ${escapeHtml(item.class_name)}</div>`;
     // Kernel-only contract: dur_us mirrors kernel_us; fwd/bwd/other are the
     // only phase splits we expose. No host walltime / overhead displayed.
     const kernelMs = Number(item && item.kernel_us != null ? item.kernel_us : (item.dur_us || 0)) / 1000.0;

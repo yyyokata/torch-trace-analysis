@@ -322,7 +322,8 @@ def _build_non_io_leaf(entry: dict, depth: int) -> dict:
         "label": label,
         "depth": depth,
         "node_type": attr_type,
-        "class_name": label,
+        "attr_name": _require_field(entry, "attr_name"),
+        "class_name": _require_field(entry, "class_name"),
         **_call_loc_to_src_fields(entry.get("call_loc")),
         **_timing_defaults(),
     }

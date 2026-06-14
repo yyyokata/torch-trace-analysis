@@ -131,13 +131,15 @@ def _serialize_module_node(node: ModuleNode, dag: DAG, registry: dict[int, DagNo
 
     if isinstance(node.attr, ModuleAttr):
         attr_type = "module"
+        attr_name = _format_display_attr_name(node.attr)
+        class_name = node.attr.class_name
     elif isinstance(node.attr, FunctionalAttr):
         attr_type = "functional"
+        attr_name = _format_display_attr_name(node.attr)
+        class_name = node.attr.attr_name
     else:
         raise RuntimeError(f"module node {node.node_id} has unsupported attr type {type(node.attr).__name__}")
 
-    attr_name = _format_display_attr_name(node.attr)
-    class_name = node.attr.class_name
     if attr_name and class_name:
         label = f"{attr_name}({class_name})"
     elif attr_name:
