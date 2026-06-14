@@ -1064,10 +1064,14 @@ function render() {
         const x1 = fr.x + fr.w / 2, y1 = fr.y + fr.h;
         const x2 = to.x + to.w / 2, y2 = to.y;
         const fromRank = fr.rank, toRank = to.rank;
+        const routeMeta = EDGE_BUNDLE_META.get(edgeKey(edgeData)) || null;
+        if (toRank < 0) {
+            return buildDirectEdgePath(x1, y1, x2, y2, routeMeta);
+        }
         const span = Math.abs(toRank - fromRank);
 
         if (span <= 1 && y2 > y1) {
-            return buildDirectEdgePath(x1, y1, x2, y2, EDGE_BUNDLE_META.get(edgeKey(edgeData)) || null);
+            return buildDirectEdgePath(x1, y1, x2, y2, routeMeta);
         }
         if (span === 0) {
             return {

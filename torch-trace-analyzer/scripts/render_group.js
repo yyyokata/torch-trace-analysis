@@ -111,9 +111,11 @@ function renderExpandedGroupHeaderLabel(ctx) {
 function renderExpandedGroupInfoButton(ctx, headerText) {
     if (!ctx.g.src_file) return;
     const labelLen = (headerText.length * 6.6) + 8;
+    const existingX = ctx.ox + 12 + labelLen + 6;
+    const bx = Math.min(existingX, ctx.ox + ctx.pos.w - 20);
     appendGroupInfoButton(
         ctx.g,
-        ctx.ox + 12 + labelLen + 6,
+        bx,
         ctx.oy + 15,
         `View ${ctx.g.label} class definition (${ctx.g.src_file}:${ctx.g.src_start_line}-${ctx.g.src_end_line})`
     );
