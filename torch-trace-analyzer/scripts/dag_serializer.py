@@ -21,6 +21,32 @@ def _serialize_call_loc(loc: CallLoc | None) -> dict | None:
     return {"file": loc.file, "line": loc.line, "col": loc.col}
 
 
+def _format_display_attr_name(attr) -> str:
+    """通过 parent/container_index 链追溯生成 display attr_name，不修改 attr 字段。"""
+    if attr.parent is None:
+        return attr.attr_name
+
+    indices: list[int | str] = []
+    cur = attr
+    while cur.parent is not None:
+        if cur.container_index is None:
+            raise RuntimeError(
+                f"attr {cur.attr_name!r} has parent container but container_index is None"
+            )
+        indices.append(cur.container_index)
+        cur = cur.parent
+
+    if not cur.attr_name:
+        raise RuntimeError(
+            f"container path root for attr {attr.attr_name!r} has empty attr_name"
+        )
+
+    display = cur.attr_name
+    for idx in reversed(indices):
+        display += f"[{idx}]"
+    return display
+
+
 def _serialize_io_node(node: DagNode, io_subtype: str) -> dict:
     # 严格分层下，dag.inputs / dag.outputs 在不同层级承载不同 attr 类型：
     #   - 顶层 dag.inputs 为 InputAttr（LG 全局来源），inner_dag.inputs 为 ForwardArgAttr（子图入参端口）
@@ -73,10 +99,12 @@ def _serialize_module_node(node: ModuleNode, dag: DAG, registry: dict[int, DagNo
     if node.metadata.get("is_container") is True:
         if not isinstance(node.attr, ContainerAttr):
             raise RuntimeError(f"container node {node.node_id} attr must be ContainerAttr")
+        attr_name = _format_display_attr_name(node.attr)
+        class_name = node.attr.container_kind
         label = (
-            f"{node.attr.attr_name}({node.attr.container_kind})"
-            if node.attr.attr_name
-            else node.attr.container_kind
+            f"{attr_name}({class_name})"
+            if attr_name
+            else class_name
         )
         attr_id_to_node_id = {id(n.attr): nid for nid, n in registry.items()}
         children_nodes = [
@@ -87,6 +115,8 @@ def _serialize_module_node(node: ModuleNode, dag: DAG, registry: dict[int, DagNo
         return {
             "node_id": node.node_id,
             "label": label,
+            "attr_name": attr_name,
+            "class_name": class_name,
             "call_loc": _serialize_call_loc(node.call_loc),
             "is_container": True,
             "container_kind": node.attr.container_kind,
@@ -106,7 +136,7 @@ def _serialize_module_node(node: ModuleNode, dag: DAG, registry: dict[int, DagNo
     else:
         raise RuntimeError(f"module node {node.node_id} has unsupported attr type {type(node.attr).__name__}")
 
-    attr_name = node.attr.attr_name
+    attr_name = _format_display_attr_name(node.attr)
     class_name = node.attr.class_name
     if attr_name and class_name:
         label = f"{attr_name}({class_name})"
@@ -120,6 +150,8 @@ def _serialize_module_node(node: ModuleNode, dag: DAG, registry: dict[int, DagNo
     return {
         "node_id": node.node_id,
         "label": label,
+        "attr_name": attr_name,
+        "class_name": class_name,
         "call_loc": _serialize_call_loc(node.call_loc),
         "attr_type": attr_type,
         "is_native": node.is_native,
