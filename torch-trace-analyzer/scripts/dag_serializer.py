@@ -92,6 +92,11 @@ def _serialize_module_node(node: ModuleNode, dag: DAG, registry: dict[int, DagNo
             "container_kind": node.attr.container_kind,
             "attr_type": "container",
             "children_nodes": children_nodes,
+            "inner_dag": (
+                serialize_dag(node.inner_dag, registry)
+                if node.inner_dag is not None
+                else None
+            ),
         }
 
     if isinstance(node.attr, ModuleAttr):
