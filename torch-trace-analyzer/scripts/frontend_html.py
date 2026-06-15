@@ -1669,19 +1669,25 @@ function showSourcePanel(item) {
 
 function showEdgePanel(edge) {
     const sp = document.getElementById('side-panel');
-    const fromLabel = edge.from_node
-        ? `${edge.from_node.class_name}: ${edge.from_node.attr_name}` + (edge.from_node.call_loc?.line ? `@${edge.from_node.call_loc.line}` : '')
-        : '?';
-    const toLabel = edge.to_node
-        ? `${edge.to_node.class_name}: ${edge.to_node.attr_name}` + (edge.to_node.call_loc?.line ? `@${edge.to_node.call_loc.line}` : '')
-        : '?';
-    const fromAttr = edge.from_node ? edge.from_node.attr_name : '?';
-    const toAttr = edge.to_node ? edge.to_node.attr_name : '?';
+    const formatEdgeEndpoint = (node) => {
+        if (!node) return '?';
+        const parts = [node.class_name || '?', node.attr_name || '?'];
+        const callLoc = node.call_loc;
+        if (callLoc) {
+            const fileName = callLoc.file ? String(callLoc.file).split('/').pop() : '';
+            const locText = fileName && callLoc.line ? `${fileName}:${callLoc.line}` : fileName;
+            if (locText) parts.push(locText);
+        }
+        return parts.join(' · ');
+    };
     const parentClass = edge.parent_class || '';
-    document.getElementById('sp-title').textContent = `${fromLabel} → ${toLabel}`;
+    document.getElementById('sp-title').textContent = 'Edge';
     const sub = parentClass ? `data dependency in ${parentClass}.forward()` : 'data dependency';
     document.getElementById('sp-subtitle').textContent = sub;
-    let bodyHtml = '';
+    let bodyHtml = '<div class="side-panel-section"><h4>Endpoints</h4>' +
+        `<div class="evidence-meta"><b>From:</b> ${escapeHtml(formatEdgeEndpoint(edge.from_node))}</div>` +
+        `<div class="evidence-meta"><b>To:</b> ${escapeHtml(formatEdgeEndpoint(edge.to_node))}</div>` +
+        '</div>';
     const ev = edge.evidence;
     const isInputEdge = (edge.from_node && edge.from_node.class_name === '__input__');
     if (ev) {
@@ -1738,14 +1744,14 @@ function showEdgePanel(edge) {
             // the empty producer block — there's no real Python line
             // to render on the input side.
             if (ev.from_excerpt && !isInputEdge) {
-                bodyHtml += '<div class="side-panel-section"><h4>Producer (output of <code>self.' + escapeHtml(fromAttr) + '</code>)</h4>' +
+                bodyHtml += '<div class="side-panel-section"><h4>Producer (output of <code>self.' + escapeHtml(edge.from_node ? edge.from_node.attr_name : '?') + '</code>)</h4>' +
                     renderCodeBlock(ev.from_excerpt.text, ev.from_excerpt.start, ev.from_excerpt.highlight, ev.var, 'producer-mark') +
                     '</div>';
             }
             if (ev.to_excerpt) {
                 const consumerLabel = isInputEdge
-                    ? ('<h4>Consumer (entry point <code>self.' + escapeHtml(toAttr) + '</code>)</h4>')
-                    : ('<h4>Consumer (call to <code>self.' + escapeHtml(toAttr) + '</code>)</h4>');
+                    ? ('<h4>Consumer (entry point <code>self.' + escapeHtml(edge.to_node ? edge.to_node.attr_name : '?') + '</code>)</h4>')
+                    : ('<h4>Consumer (call to <code>self.' + escapeHtml(edge.to_node ? edge.to_node.attr_name : '?') + '</code>)</h4>');
                 bodyHtml += '<div class="side-panel-section">' + consumerLabel +
                     renderCodeBlock(ev.to_excerpt.text, ev.to_excerpt.start, ev.to_excerpt.highlight, ev.var, 'consumer-mark') +
                     '</div>';
@@ -1758,8 +1764,8 @@ function showEdgePanel(edge) {
         // Reaching this branch means the analyzer emitted a corrupt edge.
         // We raise a hard, visible failure rather than silently rendering a
         // grey "no evidence" hint that masks a real bug in the pipeline.
-        const errMsg = 'INTEGRITY ERROR: edge ' + escapeHtml(fromAttr) +
-            ' \u2192 ' + escapeHtml(toAttr) +
+        const errMsg = 'INTEGRITY ERROR: edge ' + escapeHtml(edge.from_node ? edge.from_node.attr_name : '?') +
+            ' \u2192 ' + escapeHtml(edge.to_node ? edge.to_node.attr_name : '?') +
             ' has no source-line evidence (type=' + escapeHtml(String(edge.type || 'unknown')) +
             '). The DAG generator violated the contract that every dep edge must map to a forward() call site.';
         bodyHtml += '<div class="evidence-meta" style="background:#5a1a1a;color:#ffb4b4;padding:10px;border:1px solid #ff5a5a;border-radius:4px;font-weight:bold">' +
