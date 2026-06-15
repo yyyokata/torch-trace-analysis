@@ -439,11 +439,13 @@ function bindGroupHover(el, gid) {
         e.stopPropagation();
         hoveredNodeId = null;
         hoveredGroupId = gid;
+        showTooltip(e, groupMap[gid]);
         applyEdgeFocusState();
     });
     el.addEventListener('mouseleave', (e) => {
         e.stopPropagation();
         hoveredGroupId = null;
+        hideTooltip();
         applyEdgeFocusState();
     });
 }
@@ -686,7 +688,9 @@ function layoutGroup(gid) {
     const childSizes = [];
     for (const item of callOrder) {
         if (item.type === 'node') {
-            childSizes.push({ id: item.id, type: 'node', w: LAYOUT.nodeW, h: LAYOUT.nodeH });
+            const node = nodeMap[item.id];
+            const h = node && node.has_timing ? 36 : 28;
+            childSizes.push({ id: item.id, type: 'node', w: LAYOUT.nodeW, h });
         } else {
             const sz = layoutGroup(item.id);
             childSizes.push({ id: item.id, type: 'group', w: sz.w, h: sz.h });
@@ -979,7 +983,7 @@ function render() {
 
         // Label: class_name only
         const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-        label.setAttribute('x', nx + w/2); label.setAttribute('y', ny + h/2 - 2);
+        label.setAttribute('x', nx + w/2); label.setAttribute('y', ny + h/2);
         label.setAttribute('class', 'node-label');
         label.style.pointerEvents = 'none';
         label.textContent = n.class_name;
