@@ -485,6 +485,9 @@ function indexGroupAncestors(groups, ancestors = []) {
 DATA.groups.forEach(g => groupMap[g.id] = g);
 DATA.nodes.forEach(n => nodeMap[n.id] = n);
 indexGroupAncestors(DATA.root_groups.map(rid => groupMap[rid]).filter(Boolean));
+(DATA.io_groups || []).forEach(g => {
+    (g.member_ids || []).forEach(nid => nodeAncestorGroups.set(nid, [g.id]));
+});
 // Default: depth > 1 groups start collapsed
 DATA.groups.forEach(g => { collapsedState[g.id] = g.depth >= 2 || g.is_native === true; });
 // Top-level IO groups (Input/Param/Const) default to their adapter-provided collapsed state
@@ -1424,27 +1427,6 @@ function render() {
                 type: edge.type || 'dep',
                 edgeData: edge,
                 routeMeta: EDGE_BUNDLE_META.get(edgeKey(edge)) || null,
-            });
-        }
-    }
-
-    // Collapsed top-level IO group edges: draw aggregated group → consumer edges
-    for (const ioGroup of (DATA.io_groups || [])) {
-        const isCollapsed = (ioGroup.id in collapsedState) ? collapsedState[ioGroup.id] : ioGroup.collapsed;
-        if (!isCollapsed) continue;
-        const fromPos = nodePortMap[ioGroup.id + '__out'];
-        if (!fromPos) continue;
-        for (const ce of (ioGroup.collapsed_edges || [])) {
-            const toId = resolveCollapsedAncestor(ce.to);
-            const toPos = nodePortMap[toId + '__in'] || nodePortMap[toId];
-            if (!toPos) continue;
-            renderEdge({
-                routingMode: 'direct',
-                x1: fromPos.cx, y1: fromPos.cy,
-                x2: toPos.cx, y2: toPos.cy,
-                type: ce.type || 'dep',
-                edgeData: { from: ioGroup.id, to: ce.to, type: ce.type || 'dep' },
-                routeMeta: null,
             });
         }
     }

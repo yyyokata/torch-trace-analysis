@@ -219,9 +219,9 @@ function renderGroupInternalEdges(ctx, routeCtx) {
             from: ed.from_port ? (ctx.gid + '__' + ed.from_port) : ed.from_child,
             to: ed.to_port ? (ctx.gid + '__' + ed.to_port) : ed.to_child,
             type: ed.type || 'internal',
-            from_attr: ed.from_attr,
-            to_attr: ed.to_attr,
-            parent_class: ed.parent_class || ctx.g.label,
+            from_node: ed.from_node,
+            to_node: ed.to_node,
+            parent_class: ed.parent_class || ctx.g.class_name,
             evidence: ed.evidence,
         };
         if (!isEdgeVisible(routedEdge)) continue;

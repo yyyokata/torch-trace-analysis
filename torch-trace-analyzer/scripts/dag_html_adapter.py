@@ -54,7 +54,7 @@ def adapt_serialized_dag(serialized: dict, model_id: str, mode: str) -> dict:
         raise RuntimeError("serialized DAG has no root groups")
 
     global_edges = _route_edges(state)
-    io_groups = _collapse_top_level_io_groups(serialized, global_edges)
+    io_groups = _collapse_top_level_io_groups(serialized)
     root_group_ids = [group["id"] for group in root_groups]
     return {
         "input_node_ids": _extract_io_node_ids(serialized["input_nodes"]),
@@ -404,7 +404,7 @@ def _route_edges(state: _AdapterState) -> list[dict]:
     return global_edges
 
 
-def _collapse_top_level_io_groups(serialized: dict, global_edges: list[dict]) -> list[dict]:
+def _collapse_top_level_io_groups(serialized: dict) -> list[dict]:
     buckets = (
         ("input", serialized["input_nodes"]),
         ("param", serialized["param_nodes"]),
@@ -421,28 +421,6 @@ def _collapse_top_level_io_groups(serialized: dict, global_edges: list[dict]) ->
                 raise RuntimeError(f"duplicate top-level io group member id: {member_id}")
             member_to_subtype[member_id] = subtype
 
-    collapsed_edges_by_subtype: dict[str, list[dict]] = {subtype: [] for subtype, _ in buckets}
-    seen_edge_keys: set[tuple[str, int, str]] = set()
-    for edge in global_edges:
-        dst_id = edge["to"]
-        if dst_id in member_to_subtype:
-            subtype = member_to_subtype[dst_id]
-            raise RuntimeError(
-                "edge points to member of collapsed io group: "
-                f"io_subtype={subtype}, member_id={dst_id}, edge={edge}"
-            )
-        src_id = edge["from"]
-        subtype = member_to_subtype.get(src_id)
-        if subtype is None:
-            continue
-        group_id = _top_level_io_group_id(subtype)
-        edge_type = edge["type"]
-        key = (group_id, dst_id, edge_type)
-        if key in seen_edge_keys:
-            continue
-        seen_edge_keys.add(key)
-        collapsed_edges_by_subtype[subtype].append({"from": group_id, "to": dst_id, "type": edge_type})
-
     io_groups: list[dict] = []
     for subtype, _entries in buckets:
         member_ids = member_ids_by_subtype[subtype]
@@ -456,7 +434,6 @@ def _collapse_top_level_io_groups(serialized: dict, global_edges: list[dict]) ->
                 "collapsed": True,
                 "member_ids": member_ids,
                 "member_count": len(member_ids),
-                "collapsed_edges": collapsed_edges_by_subtype[subtype],
             }
         )
     return io_groups
