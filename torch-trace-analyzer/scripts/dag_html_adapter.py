@@ -338,6 +338,8 @@ def _build_non_io_leaf(entry: dict, depth: int) -> dict:
 
 def _route_edges(state: _AdapterState) -> list[dict]:
     global_edges: list[dict] = []
+    seen_global: set[tuple[int, int]] = set()
+    seen_internal_by_group_id: dict[int, set[tuple[int, int]]] = {}
     known_ids = set(state.endpoint_by_id)
     for edge in state.raw_edges:
         if "src_id" not in edge:
@@ -386,9 +388,18 @@ def _route_edges(state: _AdapterState) -> list[dict]:
                 internal_edge["to_port"] = "out"
             else:
                 internal_edge["to_child"] = dst_id
+            edge_key = (src_id, dst_id)
+            seen_internal = seen_internal_by_group_id.setdefault(parent_src, set())
+            if edge_key in seen_internal:
+                continue
+            seen_internal.add(edge_key)
             group["internal_edges"].append(internal_edge)
             continue
 
+        edge_key = (src_id, dst_id)
+        if edge_key in seen_global:
+            continue
+        seen_global.add(edge_key)
         global_edges.append(
             {
                 "from": src_id,
