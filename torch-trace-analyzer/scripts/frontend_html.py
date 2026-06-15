@@ -182,6 +182,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 
 <script>
 const DATA = __FLOWCHART_DATA_PLACEHOLDER__;
+// __SOURCE_MAP_PLACEHOLDER__
 
 const groupMap = {};
 const nodeMap = {};
@@ -1689,26 +1690,25 @@ function renderCodeBlockWithMarks(text, startLine, highlightLine, markVars, ctor
     return `<div class="code-block">${html}</div>`;
 }
 
-function showSourcePanel(item) {
-    // item is a node or group object carrying src_* fields
+function showSourcePanel(g) {
     const sp = document.getElementById('side-panel');
-    document.getElementById('sp-title').textContent = item.class_name;
-    const fileLabel = item.src_file
-        ? `${item.src_file}:${item.src_start_line}-${item.src_end_line}`
-        : '(class definition not available in supplied sources)';
-    document.getElementById('sp-subtitle').textContent = fileLabel;
+    const body = document.getElementById('sp-body');
+    if (!sp || !body) return;
+
+    document.getElementById('sp-title').textContent = g.class_name || 'Source';
+    document.getElementById('sp-subtitle').textContent = g.attr_name || '';
+
     let bodyHtml = '';
-    if (item.attr_name) {
-        bodyHtml += `<div class="evidence-meta"><b>attr_name:</b> ${escapeHtml(item.attr_name)}</div>`;
+    if (g.attr_name) {
+        bodyHtml += `<div class="evidence-meta"><b>attr_name:</b> ${escapeHtml(g.attr_name)}</div>`;
     }
-    bodyHtml += `<div class="evidence-meta"><b>class_name:</b> ${escapeHtml(item.class_name)}</div>`;
-    // Kernel-only contract: dur_us mirrors kernel_us; fwd/bwd/other are the
-    // only phase splits we expose. No host walltime / overhead displayed.
-    const kernelMs = Number(item && item.kernel_us != null ? item.kernel_us : (item.dur_us || 0)) / 1000.0;
-    const fwdMs = Number(item && item.fwd_kernel_us || 0) / 1000.0;
-    const bwdMs = Number(item && item.bwd_kernel_us || 0) / 1000.0;
-    const otherMs = Number(item && item.other_kernel_us || 0) / 1000.0;
-    if (item.has_timing || item.has_phase_timing) {
+    bodyHtml += `<div class="evidence-meta"><b>class_name:</b> ${escapeHtml(g.class_name)}</div>`;
+
+    const kernelMs = Number(g && g.kernel_us != null ? g.kernel_us : (g.dur_us || 0)) / 1000.0;
+    const fwdMs = Number(g && g.fwd_kernel_us || 0) / 1000.0;
+    const bwdMs = Number(g && g.bwd_kernel_us || 0) / 1000.0;
+    const otherMs = Number(g && g.other_kernel_us || 0) / 1000.0;
+    if (g.has_timing || g.has_phase_timing) {
         bodyHtml += '<div class="side-panel-section"><h4>Timing</h4>' +
             renderTimingRow('Kernel', kernelMs, 'kernel') +
             renderTimingRow('Forward', fwdMs, 'forward') +
@@ -1716,35 +1716,40 @@ function showSourcePanel(item) {
             renderTimingRow('Other', otherMs, 'other') +
             '</div>';
     }
-    if (item.src_snippet) {
-        bodyHtml += '<div class="side-panel-section"><h4>Class definition</h4>' +
-            renderCodeBlock(item.src_snippet, item.src_snippet_start, null) +
-            '</div>';
-        if (item.src_truncated) {
-            bodyHtml += `<div class="truncation-note">⚠ Snippet truncated at line ${item.src_snippet_end} (full class spans up to line ${item.src_end_line}).</div>`;
-        }
+
+    const sections = [];
+    const sourceMap = (typeof SOURCE_MAP !== 'undefined') ? SOURCE_MAP : null;
+    if (g.class_def_loc && sourceMap && sourceMap[g.class_def_loc.file]) {
+        const lines = sourceMap[g.class_def_loc.file].split('\n');
+        const startIdx = g.class_def_loc.line - 1;
+        const snippet = lines.slice(startIdx, startIdx + 80).join('\n');
+        sections.push({ title: 'Class ' + g.class_name + ' (definition)', snippet, startLine: g.class_def_loc.line, file: g.class_def_loc.file });
+    }
+    if (g.def_loc && sourceMap && sourceMap[g.def_loc.file]) {
+        const lines = sourceMap[g.def_loc.file].split('\n');
+        const startIdx = g.def_loc.line - 1;
+        const snippet = lines.slice(Math.max(0, startIdx - 1), startIdx + 4).join('\n');
+        sections.push({ title: 'Constructor site', snippet, startLine: Math.max(1, g.def_loc.line - 1), file: g.def_loc.file });
+    }
+    if (g.src_file && sourceMap && sourceMap[g.src_file]) {
+        const lines = sourceMap[g.src_file].split('\n');
+        const startIdx = g.src_start_line - 1;
+        const snippet = lines.slice(Math.max(0, startIdx - 2), startIdx + 3).join('\n');
+        sections.push({ title: 'Call site', snippet, startLine: Math.max(1, g.src_start_line - 2), file: g.src_file });
+    }
+
+    if (sections.length === 0) {
+        bodyHtml += '<p style="color:#888;padding:0 18px">No source available.</p>';
     } else {
-        bodyHtml += '<div class="evidence-meta" style="color:#7a849c">This class has no source location data — it may be a synthetic IO node (Input/Result) or a runtime wrapper.</div>';
+        bodyHtml += sections.map(s => `
+            <div class="side-panel-section">
+                <h4>${escapeHtml(s.title)}</h4>
+                <div class="evidence-meta" style="margin-bottom:6px"><b>file:</b> ${escapeHtml(s.file)} &nbsp;·&nbsp; <b>line:</b> ${escapeHtml(String(s.startLine))}</div>
+                <pre class="code-block">${escapeHtml(s.snippet)}</pre>
+            </div>
+        `).join('');
     }
-    // Iter11 ctor-src: render the constructor source where this instance
-    // is created in its parent's __init__. The backend provides exactly
-    // three fields: ctor_src_file / ctor_src_line / ctor_src_excerpt.
-    // Highlight the attribute name itself with a word-boundary-style match.
-    if (item.ctor_src_excerpt) {
-        const ctorFile = item.ctor_src_file || '';
-        const ctorLine = item.ctor_src_line || '';
-        const ctorStartLine = Math.max(1, Number(ctorLine || 1) - 2);
-        bodyHtml += '<div class="side-panel-section"><h4>Constructor</h4>' +
-            `<div class="evidence-meta" style="margin-bottom:6px"><b>file:</b> ${escapeHtml(ctorFile)} &nbsp;·&nbsp; <b>line:</b> ${escapeHtml(String(ctorLine))}</div>` +
-            renderCodeBlockWithMarks(
-                item.ctor_src_excerpt,
-                ctorStartLine,
-                Number(ctorLine) || null,
-                item.attr_name ? [item.attr_name] : []
-            ) +
-            '</div>';
-    }
-    document.getElementById('sp-body').innerHTML = bodyHtml;
+    body.innerHTML = bodyHtml;
     sp.classList.add('open');
 }
 
@@ -1942,8 +1947,39 @@ def generate_html_flowchart_dual(source_files, timing_data=None, meta=None,
     raise NotImplementedError(
         "static dual HTML flowchart generation has been removed in feat/static-cleanup"
     )
+def _collect_source_files(data: dict) -> set[str]:
+    """遍历 groups，收集所有 loc 字段引用的 file 路径（去重）。"""
+    files: set[str] = set()
+    for group in data.get("groups", []):
+        src_file = group.get("src_file")
+        if src_file:
+            files.add(src_file)
+        for loc_field in ("call_loc", "def_loc", "class_def_loc"):
+            loc = group.get(loc_field)
+            if isinstance(loc, dict):
+                f = loc.get("file")
+                if f:
+                    files.add(f)
+    return files
+
+
+def _build_source_map(file_paths: set[str]) -> dict[str, str]:
+    """读取文件内容，返回 {path: content}，不存在的文件跳过。"""
+    source_map: dict[str, str] = {}
+    for path in file_paths:
+        try:
+            source_map[path] = Path(path).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            pass
+    return source_map
+
+
 def render_flowchart_to_file(flowchart_data, output_path):
     html_content = _generate_flowchart_html(flowchart_data)
+    source_files = _collect_source_files(flowchart_data)
+    source_map = _build_source_map(source_files)
+    source_map_js = "const SOURCE_MAP = " + _json.dumps(source_map, ensure_ascii=False) + ";"
+    html_content = html_content.replace("// __SOURCE_MAP_PLACEHOLDER__", source_map_js)
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(html_content.encode("utf-8", "replace").decode("utf-8"))
     return output_path

@@ -28,6 +28,7 @@ class Attr:
 @dataclass
 class ModuleAttr(Attr):
     is_native: bool = True
+    class_def_loc: "CallLoc | None" = None
 
 
 @dataclass

@@ -262,6 +262,8 @@ def _build_group_node(
         "label": label,
         "class_name": class_name,
         "attr_name": attr_name,
+        "def_loc": entry.get("def_loc"),
+        "class_def_loc": entry.get("class_def_loc"),
         "depth": depth,
         "node_type": node_type,
         "children_nodes": children_nodes,
