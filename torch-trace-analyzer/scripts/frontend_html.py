@@ -191,6 +191,8 @@ let nodePortMap = {};
 let edgeDomRegistry = [];
 let focusedEdgePath = null;
 let hoveredEdgeKey = null;
+let hoveredEdges = [];
+let hoveredEdgeIdx = 0;
 let hoveredGroupId = null;
 let hoveredNodeId = null;
 let nodeDomRegistry = new Map();
@@ -421,6 +423,8 @@ function applyEdgeFocusState() {
 function clearEdgeFocus() {
     focusedEdgePath = null;
     hoveredEdgeKey = null;
+    hoveredEdges = [];
+    hoveredEdgeIdx = 0;
     hoveredGroupId = null;
     hoveredNodeId = null;
     applyEdgeFocusState();
@@ -455,6 +459,8 @@ function bindIONodeHover(el, nid) {
     el.addEventListener('mouseenter', () => {
         hoveredGroupId = null;
         hoveredEdgeKey = null;
+        hoveredEdges = [];
+        hoveredEdgeIdx = 0;
         hoveredNodeId = nid;
         applyEdgeFocusState();
     });
@@ -786,6 +792,8 @@ function render() {
     nodeDomRegistry = new Map();
     focusedEdgePath = null;
     hoveredEdgeKey = null;
+    hoveredEdges = [];
+    hoveredEdgeIdx = 0;
     hoveredGroupId = null;
     hoveredNodeId = null;
     // Layout root groups (RootModule)
@@ -921,6 +929,15 @@ function render() {
             <polygon points="0 0, 8 3, 0 6" fill="rgba(46,204,113,0.6)"/>
         </marker>
     </defs>`;
+
+    const overlapBadge = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+    overlapBadge.setAttribute('id', 'overlap-badge');
+    overlapBadge.setAttribute('display', 'none');
+    overlapBadge.setAttribute('font-size', '11');
+    overlapBadge.setAttribute('fill', '#fff');
+    overlapBadge.setAttribute('text-anchor', 'middle');
+    overlapBadge.style.pointerEvents = 'none';
+    svg.appendChild(overlapBadge);
 
     // Position the (single) RootModule centered horizontally.
     const rootPositions = [];
@@ -1156,19 +1173,67 @@ function render() {
         }
     }
 
+    function showOverlapBadge(path, idx, total) {
+        const badge = document.getElementById('overlap-badge');
+        if (!badge) return;
+        try {
+            const bb = path.getBBox();
+            badge.setAttribute('x', bb.x + bb.width / 2);
+            badge.setAttribute('y', bb.y + bb.height / 2 - 6);
+        } catch (_) {}
+        badge.textContent = `${idx + 1}/${total}`;
+        badge.setAttribute('display', 'block');
+    }
+    function hideOverlapBadge() {
+        const badge = document.getElementById('overlap-badge');
+        if (badge) badge.setAttribute('display', 'none');
+    }
+    function updateOverlapBadge() {
+        const badge = document.getElementById('overlap-badge');
+        if (!badge || hoveredEdges.length <= 1) return;
+        badge.textContent = `${hoveredEdgeIdx + 1}/${hoveredEdges.length}`;
+    }
+
     function bindEdgeInteractions(path, edgeData) {
         if (!path || !edgeData) return;
         const key = edgeKey(edgeData);
         path.style.cursor = 'pointer';
         path.dataset.edgeKey = key;
         path.addEventListener('mouseenter', () => {
-            hoveredEdgeKey = key;
+            const fromResolved = resolveCollapsedAncestor(edgeData.from || '');
+            const toResolved   = resolveCollapsedAncestor(edgeData.to   || '');
+            const seen = new Set();
+            hoveredEdges = edgeDomRegistry.filter(item => {
+                if (!item.edge) return false;
+                const f = resolveCollapsedAncestor(item.edge.from || '');
+                const t = resolveCollapsedAncestor(item.edge.to   || '');
+                if (f !== fromResolved || t !== toResolved) return false;
+                if (seen.has(item.key)) return false;
+                seen.add(item.key);
+                return true;
+            });
+            hoveredEdgeIdx = hoveredEdges.findIndex(item => item.key === key);
+            if (hoveredEdgeIdx < 0) hoveredEdgeIdx = 0;
+            hoveredEdgeKey = hoveredEdges.length > 0 ? hoveredEdges[hoveredEdgeIdx].key : key;
             applyEdgeFocusState();
+            if (hoveredEdges.length > 1) showOverlapBadge(path, hoveredEdgeIdx, hoveredEdges.length);
         });
         path.addEventListener('mouseleave', () => {
+            hoveredEdges = [];
+            hoveredEdgeIdx = 0;
             hoveredEdgeKey = null;
+            hideOverlapBadge();
             applyEdgeFocusState();
         });
+        path.addEventListener('wheel', (e) => {
+            if (hoveredEdges.length <= 1) return;
+            e.preventDefault();
+            hoveredEdgeIdx = (hoveredEdgeIdx + (e.deltaY > 0 ? 1 : -1) + hoveredEdges.length) % hoveredEdges.length;
+            hoveredEdgeKey = hoveredEdges[hoveredEdgeIdx].key;
+            applyEdgeFocusState();
+            updateOverlapBadge();
+            showEdgePanel(hoveredEdges[hoveredEdgeIdx].edge);
+        }, { passive: false });
         path.addEventListener('click', (e) => {
             e.stopPropagation();
             const alreadyActive = focusedEdgePath === key;
@@ -2007,7 +2072,7 @@ def _generate_flowchart_html_dual(data_train, data_infer):
         '    try { if (typeof edgeDomRegistry !== "undefined") edgeDomRegistry.length = 0; } catch(e){}\n'
         '    try { if (typeof groupLayout !== "undefined") { Object.keys(groupLayout).forEach(k => delete groupLayout[k]); } } catch(e){}\n'
         '    try { if (typeof nodePortMap !== "undefined") { Object.keys(nodePortMap).forEach(k => delete nodePortMap[k]); } } catch(e){}\n'
-        '    try { hoveredEdgeKey = null; hoveredNodeId = null; hoveredGroupId = null; focusedEdgeKey = null; } catch(e){}\n'
+        '    try { hoveredEdgeKey = null; hoveredEdges = []; hoveredEdgeIdx = 0; hoveredNodeId = null; hoveredGroupId = null; focusedEdgeKey = null; } catch(e){}\n'
         '    // Close any open side panel from the previous tab.\n'
         '    try { var sp = document.getElementById("side-panel"); if (sp) sp.classList.remove("open"); } catch(e){}\n'
         '  }\n'
