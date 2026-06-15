@@ -930,15 +930,6 @@ function render() {
         </marker>
     </defs>`;
 
-    const overlapBadge = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-    overlapBadge.setAttribute('id', 'overlap-badge');
-    overlapBadge.setAttribute('display', 'none');
-    overlapBadge.setAttribute('font-size', '11');
-    overlapBadge.setAttribute('fill', '#fff');
-    overlapBadge.setAttribute('text-anchor', 'middle');
-    overlapBadge.style.pointerEvents = 'none';
-    svg.appendChild(overlapBadge);
-
     // Position the (single) RootModule centered horizontally.
     const rootPositions = [];
     if (rootSizes.length > 0) {
@@ -1173,25 +1164,29 @@ function render() {
         }
     }
 
-    function showOverlapBadge(path, idx, total) {
-        const badge = document.getElementById('overlap-badge');
-        if (!badge) return;
-        try {
-            const bb = path.getBBox();
-            badge.setAttribute('x', bb.x + bb.width / 2);
-            badge.setAttribute('y', bb.y + bb.height / 2 - 6);
-        } catch (_) {}
-        badge.textContent = `${idx + 1}/${total}`;
-        badge.setAttribute('display', 'block');
+    function showOverlapBadge(e, idx, total) {
+        let badge = document.getElementById('overlap-badge');
+        if (!badge) {
+            badge = document.createElement('div');
+            badge.id = 'overlap-badge';
+            badge.style.cssText = 'position:fixed;background:rgba(30,30,40,0.92);color:#e0e0e0;'
+                + 'font-size:12px;padding:3px 8px;border-radius:4px;pointer-events:none;'
+                + 'z-index:9999;white-space:nowrap;border:1px solid rgba(255,255,255,0.15);';
+            document.body.appendChild(badge);
+        }
+        badge.textContent = `${idx + 1}/${total}  ·  scroll to switch`;
+        badge.style.left = (e.clientX + 14) + 'px';
+        badge.style.top  = (e.clientY - 10) + 'px';
+        badge.style.display = 'block';
     }
     function hideOverlapBadge() {
         const badge = document.getElementById('overlap-badge');
-        if (badge) badge.setAttribute('display', 'none');
+        if (badge) badge.style.display = 'none';
     }
     function updateOverlapBadge() {
         const badge = document.getElementById('overlap-badge');
         if (!badge || hoveredEdges.length <= 1) return;
-        badge.textContent = `${hoveredEdgeIdx + 1}/${hoveredEdges.length}`;
+        badge.textContent = `${hoveredEdgeIdx + 1}/${hoveredEdges.length}  ·  scroll to switch`;
     }
 
     function bindEdgeInteractions(path, edgeData) {
@@ -1199,15 +1194,20 @@ function render() {
         const key = edgeKey(edgeData);
         path.style.cursor = 'pointer';
         path.dataset.edgeKey = key;
-        path.addEventListener('mouseenter', () => {
-            const fromResolved = resolveCollapsedAncestor(edgeData.from || '');
-            const toResolved   = resolveCollapsedAncestor(edgeData.to   || '');
+        path.addEventListener('mouseenter', (e) => {
+            const pt = svg.createSVGPoint();
+            pt.x = e.clientX;
+            pt.y = e.clientY;
+            const svgPt = pt.matrixTransform(svg.getScreenCTM().inverse());
+
             const seen = new Set();
             hoveredEdges = edgeDomRegistry.filter(item => {
-                if (!item.edge) return false;
-                const f = resolveCollapsedAncestor(item.edge.from || '');
-                const t = resolveCollapsedAncestor(item.edge.to   || '');
-                if (f !== fromResolved || t !== toResolved) return false;
+                if (!item.path) return false;
+                const saved = item.path.getAttribute('stroke-width');
+                item.path.setAttribute('stroke-width', '10');
+                const hit = item.path.isPointInStroke(svgPt);
+                item.path.setAttribute('stroke-width', saved ?? '2');
+                if (!hit) return false;
                 if (seen.has(item.key)) return false;
                 seen.add(item.key);
                 return true;
@@ -1216,9 +1216,21 @@ function render() {
             if (hoveredEdgeIdx < 0) hoveredEdgeIdx = 0;
             hoveredEdgeKey = hoveredEdges.length > 0 ? hoveredEdges[hoveredEdgeIdx].key : key;
             applyEdgeFocusState();
-            if (hoveredEdges.length > 1) showOverlapBadge(path, hoveredEdgeIdx, hoveredEdges.length);
+            if (hoveredEdges.length > 1) showOverlapBadge(e, hoveredEdgeIdx, hoveredEdges.length);
+            path._overlapMoveHandler = (ev) => {
+                const badge = document.getElementById('overlap-badge');
+                if (badge && badge.style.display !== 'none') {
+                    badge.style.left = (ev.clientX + 14) + 'px';
+                    badge.style.top  = (ev.clientY - 10) + 'px';
+                }
+            };
+            path.addEventListener('mousemove', path._overlapMoveHandler);
         });
         path.addEventListener('mouseleave', () => {
+            if (path._overlapMoveHandler) {
+                path.removeEventListener('mousemove', path._overlapMoveHandler);
+                path._overlapMoveHandler = null;
+            }
             hoveredEdges = [];
             hoveredEdgeIdx = 0;
             hoveredEdgeKey = null;
