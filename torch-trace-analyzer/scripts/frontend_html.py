@@ -1204,7 +1204,7 @@ function render() {
             hoveredEdges = edgeDomRegistry.filter(item => {
                 if (!item.path) return false;
                 const saved = item.path.getAttribute('stroke-width');
-                item.path.setAttribute('stroke-width', '10');
+                item.path.setAttribute('stroke-width', '20');
                 const hit = item.path.isPointInStroke(svgPt);
                 item.path.setAttribute('stroke-width', saved ?? '2');
                 if (!hit) return false;
