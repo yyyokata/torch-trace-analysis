@@ -58,9 +58,13 @@ def _serialize_io_node(node: DagNode, io_subtype: str) -> dict:
         if isinstance(node.attr, InputAttr):
             resolved_subtype = "input"
             label = node.attr.attr_name or node.attr.kind or f"input_{node.node_id}"
+            attr_name = node.attr.attr_name
+            class_name = node.attr.class_name
         elif isinstance(node.attr, ForwardArgAttr):
             resolved_subtype = "forward_arg"
             label = f"arg_{node.attr.arg_index}"
+            attr_name = node.attr.attr_name
+            class_name = node.attr.class_name
         else:
             raise RuntimeError(f"node {node.node_id} is not an Input/ForwardArg input node")
     elif io_subtype == "param":
@@ -68,29 +72,49 @@ def _serialize_io_node(node: DagNode, io_subtype: str) -> dict:
             raise RuntimeError(f"node {node.node_id} is not a Param input node")
         resolved_subtype = "param"
         label = node.attr.param_name or f"param_{node.node_id}"
+        # ParamAttr 的 attr_name 与 param_name 同值（构造点统一赋值），class_name 为 type(_tensor).__name__。
+        attr_name = node.attr.attr_name
+        class_name = node.attr.class_name
     elif io_subtype == "const":
         if not isinstance(node, InputNode) or not isinstance(node.attr, ConstantAttr):
             raise RuntimeError(f"node {node.node_id} is not a Constant input node")
         resolved_subtype = "const"
         label = f"{node.attr.attr_name}({node.attr.op_name})" if node.attr.attr_name else node.attr.op_name
+        attr_name = node.attr.attr_name
+        class_name = node.attr.class_name
     elif io_subtype == "output":
         if not isinstance(node, ResultNode):
             raise RuntimeError(f"node {node.node_id} is not a ResultNode")
         if isinstance(node.attr, ResultAttr):
             resolved_subtype = "output"
             label = node.attr.head_name or f"output_{node.node_id}"
+            attr_name = node.attr.head_name
+            class_name = node.attr.class_name
         elif isinstance(node.attr, ReturnValAttr):
             resolved_subtype = "return_val"
             label = node.attr.ret_key or f"ret_{node.attr.ret_index}"
+            attr_name = node.attr.ret_key or f"ret_{node.attr.ret_index}"
+            class_name = node.attr.class_name
         else:
             raise RuntimeError(f"node {node.node_id} is not a Result/ReturnVal output node")
     else:
         raise RuntimeError(f"unsupported io subtype: {io_subtype}")
 
+    if not attr_name:
+        raise RuntimeError(
+            f"io node {node.node_id} (subtype={resolved_subtype}) has empty attr_name"
+        )
+    if not class_name:
+        raise RuntimeError(
+            f"io node {node.node_id} (subtype={resolved_subtype}) has empty class_name"
+        )
+
     return {
         "node_id": node.node_id,
         "io_subtype": resolved_subtype,
         "label": label,
+        "attr_name": attr_name,
+        "class_name": class_name,
         "call_loc": _serialize_call_loc(node.call_loc),
     }
 
@@ -136,7 +160,7 @@ def _serialize_module_node(node: ModuleNode, dag: DAG, registry: dict[int, DagNo
     elif isinstance(node.attr, FunctionalAttr):
         attr_type = "functional"
         attr_name = _format_display_attr_name(node.attr)
-        class_name = node.attr.attr_name
+        class_name = node.attr.class_name
     else:
         raise RuntimeError(f"module node {node.node_id} has unsupported attr type {type(node.attr).__name__}")
 

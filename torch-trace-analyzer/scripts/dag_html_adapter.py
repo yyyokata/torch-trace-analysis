@@ -34,7 +34,7 @@ class _AdapterState:
     group_by_id: dict[int, dict] = field(default_factory=dict)
     group_list: list[dict] = field(default_factory=list)
     parent_group_of_child: dict[int, int] = field(default_factory=dict)
-    label_by_id: dict[int, str] = field(default_factory=dict)
+    endpoint_by_id: dict[int, dict] = field(default_factory=dict)
     port_kind_by_id: dict[int, str] = field(default_factory=dict)
     all_serialized_node_ids: set[int] = field(default_factory=set)
     raw_edges: list[dict] = field(default_factory=list)
@@ -110,7 +110,7 @@ def _walk_serialized_level(
             if effective_subtype in {"forward_arg", "return_val"}:
                 continue
             leaf = _build_io_leaf(entry, io_subtype=effective_subtype, depth=depth)
-            _register_leaf_node(state, leaf)
+            _register_leaf_node(state, leaf, entry)
             direct_leaves.append(leaf)
             call_order.append({"id": leaf["id"], "type": "node"})
 
@@ -192,7 +192,7 @@ def _build_structured_node(
         return _BuiltNode(kind="group", payload=group)
 
     leaf = _build_non_io_leaf(entry, depth=depth)
-    _register_leaf_node(state, leaf)
+    _register_leaf_node(state, leaf, entry)
     return _BuiltNode(kind="leaf", payload=leaf)
 
 
@@ -210,6 +210,8 @@ def _build_group_node(
 ) -> dict:
     node_id = _require_field(entry, "node_id")
     label = _require_field(entry, "label")
+    class_name = entry.get("class_name") or ""
+    attr_name = entry.get("attr_name") or ""
     location_fields = _call_loc_to_src_fields(entry.get("call_loc"))
 
     children_nodes: list[int] = []
@@ -258,6 +260,8 @@ def _build_group_node(
     group = {
         "id": node_id,
         "label": label,
+        "class_name": class_name,
+        "attr_name": attr_name,
         "depth": depth,
         "node_type": node_type,
         "children_nodes": children_nodes,
@@ -269,7 +273,7 @@ def _build_group_node(
         **location_fields,
         **_timing_defaults(),
     }
-    _register_group_node(state, group)
+    _register_group_node(state, group, entry)
     return group
 
 
@@ -284,13 +288,13 @@ def _collect_group_ports(inner_dag: dict, state: _AdapterState, parent_id: int) 
                 label = _require_field(entry, "label")
                 port = {"node_id": node_id, "arg_index": len(in_ports), "label": label}
                 in_ports.append(port)
-                _register_port_node(state, node_id=node_id, label=label, parent_id=parent_id, kind="in")
+                _register_port_node(state, node_id=node_id, parent_id=parent_id, kind="in", entry=entry)
             elif io_subtype == "return_val":
                 node_id = _require_field(entry, "node_id")
                 label = _require_field(entry, "label")
                 port = {"node_id": node_id, "ret_index": len(out_ports), "label": label}
                 out_ports.append(port)
-                _register_port_node(state, node_id=node_id, label=label, parent_id=parent_id, kind="out")
+                _register_port_node(state, node_id=node_id, parent_id=parent_id, kind="out", entry=entry)
             elif io_subtype not in {None, _IO_SECTION_TO_SUBTYPE[section_name]}:
                 raise RuntimeError(f"unsupported inner_dag io_subtype: {io_subtype}")
     return in_ports, out_ports
@@ -299,13 +303,16 @@ def _collect_group_ports(inner_dag: dict, state: _AdapterState, parent_id: int) 
 def _build_io_leaf(entry: dict, io_subtype: str, depth: int) -> dict:
     node_id = _require_field(entry, "node_id")
     label = _require_field(entry, "label")
+    attr_name = _require_field(entry, "attr_name")
+    class_name = _require_field(entry, "class_name")
     call_loc = entry.get("call_loc")
     return {
         "id": node_id,
         "label": label,
         "depth": depth,
         "node_type": io_subtype,
-        "class_name": label,
+        "attr_name": attr_name,
+        "class_name": class_name,
         **_call_loc_to_src_fields(call_loc),
         **_timing_defaults(),
     }
@@ -331,7 +338,7 @@ def _build_non_io_leaf(entry: dict, depth: int) -> dict:
 
 def _route_edges(state: _AdapterState) -> list[dict]:
     global_edges: list[dict] = []
-    known_ids = set(state.label_by_id)
+    known_ids = set(state.endpoint_by_id)
     for edge in state.raw_edges:
         if "src_id" not in edge:
             raise RuntimeError("edge missing src_id")
@@ -350,8 +357,8 @@ def _route_edges(state: _AdapterState) -> list[dict]:
                 continue
             raise RuntimeError(f"edge dst_id {dst_id} not found in node index")
         edge_type = "dep"
-        src_label = state.label_by_id[src_id]
-        dst_label = state.label_by_id[dst_id]
+        src_node = state.endpoint_by_id[src_id]
+        dst_node = state.endpoint_by_id[dst_id]
         parent_src = state.parent_group_of_child.get(src_id)
         parent_dst = state.parent_group_of_child.get(dst_id)
 
@@ -359,9 +366,9 @@ def _route_edges(state: _AdapterState) -> list[dict]:
             group = state.group_by_id[parent_src]
             internal_edge = {
                 "type": edge_type,
-                "from_attr": src_label,
-                "to_attr": dst_label,
-                "parent_class": group["label"],
+                "from_node": src_node,
+                "to_node": dst_node,
+                "parent_class": group["class_name"],
                 "tensor_info": edge.get("tensor_info"),
                 "evidence": edge.get("evidence"),
             }
@@ -387,8 +394,8 @@ def _route_edges(state: _AdapterState) -> list[dict]:
                 "from": src_id,
                 "to": dst_id,
                 "type": edge_type,
-                "from_attr": src_label,
-                "to_attr": dst_label,
+                "from_node": src_node,
+                "to_node": dst_node,
                 "parent_class": "",
                 "tensor_info": edge.get("tensor_info"),
                 "evidence": edge.get("evidence"),
@@ -466,31 +473,43 @@ def _assign_parent_group(state: _AdapterState, child_id: int, parent_id: int) ->
     state.parent_group_of_child[child_id] = parent_id
 
 
-def _register_leaf_node(state: _AdapterState, leaf: dict) -> None:
+def _register_leaf_node(state: _AdapterState, leaf: dict, entry: dict) -> None:
     node_id = leaf["id"]
     if node_id in state.leaf_nodes_by_id or node_id in state.group_by_id or node_id in state.port_kind_by_id:
         raise RuntimeError(f"duplicate node id in adapter output: {node_id}")
     state.leaf_nodes_by_id[node_id] = leaf
-    state.label_by_id[node_id] = leaf["label"]
+    state.endpoint_by_id[node_id] = _make_endpoint(
+        attr_name=_require_field(entry, "attr_name"),
+        class_name=_require_field(entry, "class_name"),
+        call_loc=entry.get("call_loc"),
+    )
 
 
-def _register_port_node(state: _AdapterState, node_id: int, label: str, parent_id: int, kind: str) -> None:
+def _register_port_node(state: _AdapterState, node_id: int, parent_id: int, kind: str, entry: dict) -> None:
     if kind not in {"in", "out"}:
         raise RuntimeError(f"unsupported port kind: {kind}")
     if node_id in state.leaf_nodes_by_id or node_id in state.group_by_id or node_id in state.port_kind_by_id:
         raise RuntimeError(f"duplicate node id in adapter output: {node_id}")
-    state.label_by_id[node_id] = label
+    state.endpoint_by_id[node_id] = _make_endpoint(
+        attr_name=_require_field(entry, "attr_name"),
+        class_name=_require_field(entry, "class_name"),
+        call_loc=entry.get("call_loc"),
+    )
     state.port_kind_by_id[node_id] = kind
     _assign_parent_group(state, node_id, parent_id)
 
 
-def _register_group_node(state: _AdapterState, group: dict) -> None:
+def _register_group_node(state: _AdapterState, group: dict, entry: dict) -> None:
     node_id = group["id"]
     if node_id in state.group_by_id or node_id in state.leaf_nodes_by_id or node_id in state.port_kind_by_id:
         raise RuntimeError(f"duplicate node id in adapter output: {node_id}")
     state.group_by_id[node_id] = group
     state.group_list.append(group)
-    state.label_by_id[node_id] = group["label"]
+    state.endpoint_by_id[node_id] = _make_endpoint(
+        attr_name=_require_field(entry, "attr_name"),
+        class_name=_require_field(entry, "class_name"),
+        call_loc=entry.get("call_loc"),
+    )
 
 
 def _call_loc_to_src_fields(call_loc: dict | None) -> dict:
@@ -516,6 +535,18 @@ def _timing_defaults() -> dict:
         "dur_us": 0,
         "kernel_us": 0,
         "role": None,
+    }
+
+
+def _make_endpoint(attr_name: str, class_name: str, call_loc: dict | None) -> dict:
+    if not attr_name:
+        raise RuntimeError(f"edge endpoint missing attr_name (class_name={class_name!r})")
+    if not class_name:
+        raise RuntimeError(f"edge endpoint missing class_name (attr_name={attr_name!r})")
+    return {
+        "attr_name": attr_name,
+        "class_name": class_name,
+        "call_loc": call_loc,
     }
 
 

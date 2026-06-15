@@ -199,7 +199,7 @@ const LONG_EDGE_MIN_SPAN = 260;
 
 function edgeKey(edge) {
     if (!edge) return '';
-    return [edge.from || '', edge.to || '', edge.type || '', edge.from_attr || '', edge.to_attr || '', edge.parent_class || ''].join('||');
+    return [edge.from || '', edge.to || '', edge.type || '', edge.parent_class || ''].join('||');
 }
 
 function bundleKey(direction, nid) {
@@ -217,9 +217,9 @@ function collectAllRenderableEdges() {
                 from: e.from_child,
                 to: e.to_child,
                 type: e.type || 'internal',
-                from_attr: e.from_attr,
-                to_attr: e.to_attr,
-                parent_class: e.parent_class || g.label,
+                from_node: e.from_node,
+                to_node: e.to_node,
+                parent_class: e.parent_class,
                 evidence: e.evidence,
             });
         }
@@ -1687,15 +1687,21 @@ function showSourcePanel(item) {
 
 function showEdgePanel(edge) {
     const sp = document.getElementById('side-panel');
-    const fromAttr = edge.from_attr || '?';
-    const toAttr = edge.to_attr || '?';
+    const fromLabel = edge.from_node
+        ? `${edge.from_node.class_name}: ${edge.from_node.attr_name}` + (edge.from_node.call_loc?.line ? `@${edge.from_node.call_loc.line}` : '')
+        : '?';
+    const toLabel = edge.to_node
+        ? `${edge.to_node.class_name}: ${edge.to_node.attr_name}` + (edge.to_node.call_loc?.line ? `@${edge.to_node.call_loc.line}` : '')
+        : '?';
+    const fromAttr = edge.from_node ? edge.from_node.attr_name : '?';
+    const toAttr = edge.to_node ? edge.to_node.attr_name : '?';
     const parentClass = edge.parent_class || '';
-    document.getElementById('sp-title').textContent = `${fromAttr} → ${toAttr}`;
+    document.getElementById('sp-title').textContent = `${fromLabel} → ${toLabel}`;
     const sub = parentClass ? `data dependency in ${parentClass}.forward()` : 'data dependency';
     document.getElementById('sp-subtitle').textContent = sub;
     let bodyHtml = '';
     const ev = edge.evidence;
-    const isInputEdge = (fromAttr === 'Input');
+    const isInputEdge = (edge.from_node && edge.from_node.class_name === '__input__');
     if (ev) {
         const fmtShape = (shape) => {
             if (shape === null || shape === undefined) return '';
