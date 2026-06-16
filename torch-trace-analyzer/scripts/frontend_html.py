@@ -2267,9 +2267,11 @@ def _generate_flowchart_html(data):
     # than a naive non-greedy `{...};` regex: the serialized JSON contains many
     # nested `};` substrings inside code snippets, which can cause partial
     # matches and leave stale template data in place.
-    pattern = r'const DATA = .*?(?=\nconst groupMap = \{\};)'
-    replacement = 'const DATA = ' + data_json + '\n'
-    html_template = re.sub(pattern, lambda m: replacement, html_template, flags=re.DOTALL)
+    html_template = html_template.replace(
+        'const DATA = __FLOWCHART_DATA_PLACEHOLDER__;',
+        'const DATA = ' + data_json + ';',
+        1
+    )
     
     return html_template
 
