@@ -128,21 +128,22 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 .code-line .code-text mark.var-mark { background: rgba(255, 209, 102, 0.25); color: #fff4c2; border-radius: 3px; padding: 0 2px; box-shadow: inset 0 0 0 1px rgba(255, 209, 102, 0.35); font-weight: 600; }
 .code-line .code-text mark.var-mark.producer-mark { background: rgba(46, 204, 113, 0.30); color: #d5f5e3; box-shadow: inset 0 0 0 1px rgba(46, 204, 113, 0.40); }
 .code-line .code-text mark.var-mark.consumer-mark { background: rgba(255, 209, 102, 0.25); color: #fff4c2; box-shadow: inset 0 0 0 1px rgba(255, 209, 102, 0.35); }
-.lineage-step { margin: 0 12px 14px; padding-bottom: 6px; border-bottom: 1px dashed rgba(255,255,255,0.06); }
-.lineage-step:last-child { border-bottom: none; }
-.lineage-head { font-size: 11px; color: #c0c8d8; padding: 0 6px 6px 0; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.lineage-head code { background: rgba(255,255,255,0.04); padding: 1px 6px; border-radius: 4px; font-size: 11px; color: #ffd166; }
-.lineage-tag { display: inline-block; font-size: 10px; padding: 2px 8px; border-radius: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.4px; }
-.lineage-tag.tag-producer { background: rgba(46,204,113,0.15); color: #6dd29d; border: 1px solid rgba(46,204,113,0.35); }
-.lineage-tag.tag-consumer { background: rgba(255,209,102,0.18); color: #ffd166; border: 1px solid rgba(255,209,102,0.4); }
-.lineage-tag.tag-step { background: rgba(100,181,246,0.15); color: #64b5f6; border: 1px solid rgba(100,181,246,0.35); }
-.lineage-loc { font-size: 10px; color: #6f7a93; font-family: 'SFMono-Regular', Consolas, monospace; }
 .dag-svg .group-clickable { cursor: pointer; }
 .dag-svg .edge-path { pointer-events: stroke; cursor: pointer; }
 .dag-svg .edge-path:hover { stroke-width: 3.4; opacity: 1 !important; }
 .evidence-meta { padding: 6px 18px 10px; font-size: 11px; color: #aab4cf; }
 .evidence-meta b { color: #64b5f6; }
 .evidence-meta code { background: rgba(100,181,246,0.12); padding: 1px 5px; border-radius: 3px; font-family: monospace; color: #ffffff; }
+.flow-block { margin: 0 12px 10px; border: 1px solid rgba(255,255,255,0.07); border-radius: 6px; overflow: hidden; }
+.flow-block-head { display: flex; align-items: center; gap: 8px; padding: 7px 10px; cursor: pointer; user-select: none; background: rgba(100,181,246,0.06); font-size: 11px; color: #c0c8d8; }
+.flow-block-head:hover { background: rgba(100,181,246,0.12); }
+.flow-block-head .flow-toggle { color: #64b5f6; font-size: 10px; min-width: 10px; }
+.flow-block-head .flow-dtype { background: rgba(255,255,255,0.06); padding: 1px 6px; border-radius: 4px; font-family: monospace; font-size: 10px; color: #ffd166; }
+.flow-block-head .flow-shape { font-family: monospace; font-size: 10px; color: #a8d8a8; }
+.flow-block-body { display: none; }
+.flow-block-body.open { display: block; }
+.flow-step { padding: 6px 10px 0; }
+.flow-step-code { margin: 4px 0 6px; }
 .timing-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .timing-label { display: inline-flex; align-items: center; gap: 6px; }
 .metric-help { display: inline-flex; align-items: center; justify-content: center; width: 14px; height: 14px; border-radius: 50%; border: 1px solid rgba(100,181,246,0.45); color: #8fc5ff; font-size: 10px; line-height: 1; cursor: help; position: relative; }
@@ -1653,42 +1654,6 @@ function renderCodeBlock(text, startLine, highlightLine, varNames, markClass) {
     return `<div class="code-block">${html}</div>`;
 }
 
-// Iter11 ctor-src: like renderCodeBlock, but additionally <mark>-wrap any
-// occurrence of an identifier from `markVars` (word-boundary match) on
-// every code line. The HTML-escaping happens first so user data can never
-// inject markup; we then walk the escaped text with a single regex that
-// asserts non-identifier boundaries on each side.
-function renderCodeBlockWithMarks(text, startLine, highlightLine, markVars, ctorStart, ctorEnd) {
-    if (!text) return '<div class="code-block"><div class="code-line"><span class="code-text" style="color:#7a849c">(no source available)</span></div></div>';
-    const vars = Array.isArray(markVars) ? markVars.filter(v => typeof v === 'string' && v.length > 0) : [];
-    let markRe = null;
-    if (vars.length > 0) {
-        // Sort by length desc so e.g. `embedding_dim` matches before `dim`.
-        const sorted = vars.slice().sort((a, b) => b.length - a.length);
-        const escaped = sorted.map(v => v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
-        // Use a non-identifier lookbehind/lookahead. Allow start/end of
-        // string by leveraging the fact that we apply the regex per-line
-        // (so ^ / $ are line boundaries effectively). We rely on the fact
-        // that escaped HTML never contains a `<` from our identifiers, so
-        // working on the escaped string is safe.
-        markRe = new RegExp('(^|[^A-Za-z0-9_])(' + escaped.join('|') + ')(?![A-Za-z0-9_])', 'g');
-    }
-    const lines = text.split('\n');
-    const html = lines.map((line, i) => {
-        const lineno = startLine + i;
-        let cls = 'code-line';
-        if (highlightLine && lineno === highlightLine) cls += ' highlight';
-        if (ctorStart && ctorEnd && lineno >= ctorStart && lineno <= ctorEnd) cls += ' ctor-range';
-        let escaped = escapeHtml(line);
-        if (markRe) {
-            // Reset lastIndex (g flag) per line, since we create fresh per call.
-            markRe.lastIndex = 0;
-            escaped = escaped.replace(markRe, (m, p1, p2) => p1 + '<mark>' + p2 + '</mark>');
-        }
-        return `<div class="${cls}"><span class="lineno">${lineno}</span><span class="code-text">${escaped}</span></div>`;
-    }).join('');
-    return `<div class="code-block">${html}</div>`;
-}
 
 function showSourcePanel(g) {
     const sp = document.getElementById('side-panel');
@@ -1761,6 +1726,14 @@ function showSourcePanel(g) {
     sp.classList.add('open');
 }
 
+function toggleFlowBlock(bodyId, headEl) {
+    const body = document.getElementById(bodyId);
+    if (!body) return;
+    const open = body.classList.toggle('open');
+    const toggle = headEl.querySelector('.flow-toggle');
+    if (toggle) toggle.textContent = open ? '▼' : '▶';
+}
+
 function showEdgePanel(edge) {
     const sp = document.getElementById('side-panel');
     const formatEdgeEndpoint = (node) => {
@@ -1778,12 +1751,71 @@ function showEdgePanel(edge) {
     document.getElementById('sp-title').textContent = 'Edge';
     const sub = parentClass ? `data dependency in ${parentClass}.forward()` : 'data dependency';
     document.getElementById('sp-subtitle').textContent = sub;
+
     let bodyHtml = '<div class="side-panel-section"><h4>Endpoints</h4>' +
         `<div class="evidence-meta"><b>From:</b> ${escapeHtml(formatEdgeEndpoint(edge.from_node))}</div>` +
         `<div class="evidence-meta"><b>To:</b> ${escapeHtml(formatEdgeEndpoint(edge.to_node))}</div>` +
         '</div>';
-    // evidence 面板已随 DataFlowEdge -> flows 重构移除（旧 edge.evidence / step.role 字段已删）。
-    // shape/dtype/steps 的渲染留待后续 evidence 摘取阶段基于 flows 重建，目前 Edge 面板仅展示 Endpoints。
+
+    const sourceMap = (typeof SOURCE_MAP !== 'undefined') ? SOURCE_MAP : null;
+    const flows = edge.flows || {};
+    const idxKeys = Object.keys(flows).sort((a, b) => Number(a) - Number(b));
+
+    if (idxKeys.length > 0) {
+        bodyHtml += '<div class="side-panel-section"><h4>Flows</h4>';
+        const autoExpand = idxKeys.length <= 1;
+
+        idxKeys.forEach(idx => {
+            const flow = flows[idx];
+            const shapeStr = (flow.shape && flow.shape.length > 0) ? '[' + flow.shape.join('\u00d7') + ']' : '';
+            const dtypeShort = (flow.dtype || '').replace('torch.', '');
+            const bodyId = `flow-body-${edge.from}-${edge.to}-${idx}`;
+
+            bodyHtml += `<div class="flow-block">` +
+                `<div class="flow-block-head" onclick="toggleFlowBlock('${bodyId}', this)">` +
+                `<span class="flow-toggle">${autoExpand ? '▼' : '▶'}</span>` +
+                `<span>idx\u202f=\u202f${escapeHtml(String(idx))}</span>` +
+                (dtypeShort ? `<span class="flow-dtype">${escapeHtml(dtypeShort)}</span>` : '') +
+                (shapeStr ? `<span class="flow-shape">${escapeHtml(shapeStr)}</span>` : '') +
+                `</div>` +
+                `<div class="flow-block-body${autoExpand ? ' open' : ''}" id="${escapeHtml(bodyId)}">`;
+
+            (flow.steps || []).forEach((step, si) => {
+                const loc = step.loc || {};
+                const varName = step.var || '';
+                const file = loc.file || '';
+                const line = loc.line;
+                const fileName = file.split('/').pop();
+                const locLabel = fileName && line ? `${fileName}:${line}` : (fileName || '');
+
+                let codeHtml = '';
+                if (sourceMap && file && sourceMap[file] && line) {
+                    const allLines = sourceMap[file].split('\n');
+                    // 只显示命中行（单行），除非该行以 \ 结尾（Python 续行）则往下扩展
+                    let endLine = line;
+                    while (endLine < allLines.length && (allLines[endLine - 1] || '').trimEnd().endsWith('\\')) {
+                        endLine++;
+                    }
+                    const snippet = allLines.slice(line - 1, endLine).join('\n');
+                    codeHtml = renderCodeBlock(snippet, line, line, varName ? [varName] : [], 'var-mark');
+                }
+
+                bodyHtml += `<div class="flow-step">` +
+                    `<div class="evidence-meta">` +
+                    `<b>step\u202f${si}</b>` +
+                    (varName ? `\u2002<code>${escapeHtml(varName)}</code>` : `\u2002<span style="color:#555">(no\u00a0var)</span>`) +
+                    (locLabel ? `\u2002<span class="lineage-loc">${escapeHtml(locLabel)}</span>` : '') +
+                    `</div>` +
+                    (codeHtml ? `<div class="flow-step-code">${codeHtml}</div>` : '') +
+                    `</div>`;
+            });
+
+            bodyHtml += `</div></div>`; // flow-block-body + flow-block
+        });
+
+        bodyHtml += '</div>'; // side-panel-section
+    }
+
     document.getElementById('sp-body').innerHTML = bodyHtml;
     sp.classList.add('open');
 }
@@ -1884,6 +1916,13 @@ def _collect_source_files(data: dict) -> set[str]:
                 f = loc.get("file")
                 if f:
                     files.add(f)
+    # edges → flows → steps → loc
+    for edge in data.get("edges", []):
+        for flow in (edge.get("flows") or {}).values():
+            for step in (flow.get("steps") or []):
+                loc = step.get("loc")
+                if isinstance(loc, dict) and loc.get("file"):
+                    files.add(loc["file"])
     return files
 
 
