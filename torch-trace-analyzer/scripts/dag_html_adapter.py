@@ -353,11 +353,11 @@ def _route_edges(state: _AdapterState) -> list[dict]:
         if edge.get("is_containment"):
             continue
         if src_id not in known_ids:
-            if src_id in state.all_serialized_node_ids or edge.get("tensor_info"):
+            if src_id in state.all_serialized_node_ids or edge.get("flows"):
                 continue
             raise RuntimeError(f"edge src_id {src_id} not found in node index")
         if dst_id not in known_ids:
-            if dst_id in state.all_serialized_node_ids or edge.get("tensor_info"):
+            if dst_id in state.all_serialized_node_ids or edge.get("flows"):
                 continue
             raise RuntimeError(f"edge dst_id {dst_id} not found in node index")
         edge_type = "dep"
@@ -373,8 +373,7 @@ def _route_edges(state: _AdapterState) -> list[dict]:
                 "from_node": src_node,
                 "to_node": dst_node,
                 "parent_class": group["class_name"],
-                "tensor_info": edge.get("tensor_info"),
-                "evidence": edge.get("evidence"),
+                "flows": edge.get("flows"),
             }
             src_port_kind = state.port_kind_by_id.get(src_id)
             dst_port_kind = state.port_kind_by_id.get(dst_id)
@@ -410,8 +409,7 @@ def _route_edges(state: _AdapterState) -> list[dict]:
                 "from_node": src_node,
                 "to_node": dst_node,
                 "parent_class": "",
-                "tensor_info": edge.get("tensor_info"),
-                "evidence": edge.get("evidence"),
+                "flows": edge.get("flows"),
             }
         )
     return global_edges

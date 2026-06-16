@@ -223,7 +223,7 @@ function collectAllRenderableEdges() {
                 from_node: e.from_node,
                 to_node: e.to_node,
                 parent_class: e.parent_class,
-                evidence: e.evidence,
+                flows: e.flows,
             });
         }
     }
@@ -1782,92 +1782,8 @@ function showEdgePanel(edge) {
         `<div class="evidence-meta"><b>From:</b> ${escapeHtml(formatEdgeEndpoint(edge.from_node))}</div>` +
         `<div class="evidence-meta"><b>To:</b> ${escapeHtml(formatEdgeEndpoint(edge.to_node))}</div>` +
         '</div>';
-    const ev = edge.evidence;
-    const isInputEdge = (edge.from_node && edge.from_node.class_name === '__input__');
-    if (ev) {
-        const fmtShape = (shape) => {
-            if (shape === null || shape === undefined) return '';
-            if (Array.isArray(shape)) {
-                if (shape.length === 0) return '';
-                if (shape.every(x => Array.isArray(x))) {
-                    return '[' + shape.map(inner => fmtShape(inner)).filter(Boolean).join(', ') + ']';
-                }
-                return '[' + shape.map(x => String(x)).join(', ') + ']';
-            }
-            return String(shape);
-        };
-        const shapeFrom = fmtShape(ev.shape_from);
-        const shapeTo = fmtShape(ev.shape_to);
-        let shapeBlock = '';
-        if (shapeFrom || shapeTo) {
-            shapeBlock = '<div class="side-panel-section"><h4>Tensor Shape</h4>' +
-                (shapeFrom ? `<div class="evidence-meta"><b>From:</b> <code>${escapeHtml(shapeFrom)}</code></div>` : '') +
-                (shapeTo ? `<div class="evidence-meta"><b>To:</b> <code>${escapeHtml(shapeTo)}</code></div>` : '') +
-                '</div>';
-        }
-        const headVar = ev.var ? ('<b>Tensor variable:</b> <code>' + escapeHtml(ev.var) + '</code> &nbsp;·&nbsp; ') : '';
-        bodyHtml += `<div class="evidence-meta">
-            ${headVar}<b>file:</b> ${escapeHtml(ev.file)}
-        </div>`;
-        if (shapeBlock) bodyHtml += shapeBlock;
-
-        // Iter11 varlineage: render the full assignment chain
-        // (var_history) when available so the user sees how the
-        // value travels from producer → intermediate ops → consumer.
-        const history = Array.isArray(ev.var_history) ? ev.var_history : [];
-                if (history.length > 0) {
-                    bodyHtml += '<div class="side-panel-section"><h4>Variable lineage (' + history.length + ' step' + (history.length === 1 ? '' : 's') + ')</h4>';
-                    history.forEach((step, idx) => {
-                        const tag = (step.role === 'consumer')
-                            ? '<span class="lineage-tag tag-consumer">consumer</span>'
-                            : (idx === 0 ? '<span class="lineage-tag tag-producer">producer</span>'
-                                       : '<span class="lineage-tag tag-step">step ' + (idx + 1) + '</span>');
-                        const vlabel = step.var ? ('<code>' + escapeHtml(step.var) + '</code>') : '<code>(carrier)</code>';
-                        const stepMarkClass = (step.role === 'consumer') ? 'consumer-mark' : 'producer-mark';
-                        bodyHtml += '<div class="lineage-step">' +
-                            '<div class="lineage-head">' + tag + ' ' + vlabel +
-                            ' <span class="lineage-loc">@' + escapeHtml(step.file || ev.file) + ':' + step.line + '</span></div>' +
-                            renderCodeBlock(step.excerpt && step.excerpt.text, step.excerpt && step.excerpt.start, step.excerpt && step.excerpt.highlight, step.var ? [step.var] : [], stepMarkClass) +
-                            '</div>';
-                    });
-                    bodyHtml += '</div>';
-                } else {
-        
-            // Fall back to producer/consumer two-block layout when no
-            // lineage chain was attached. For Input/top edges we skip
-            // the empty producer block — there's no real Python line
-            // to render on the input side.
-            if (ev.from_excerpt && !isInputEdge) {
-                bodyHtml += '<div class="side-panel-section"><h4>Producer (output of <code>self.' + escapeHtml(edge.from_node ? edge.from_node.attr_name : '?') + '</code>)</h4>' +
-                    renderCodeBlock(ev.from_excerpt.text, ev.from_excerpt.start, ev.from_excerpt.highlight, ev.var, 'producer-mark') +
-                    '</div>';
-            }
-            if (ev.to_excerpt) {
-                const consumerLabel = isInputEdge
-                    ? ('<h4>Consumer (entry point <code>self.' + escapeHtml(edge.to_node ? edge.to_node.attr_name : '?') + '</code>)</h4>')
-                    : ('<h4>Consumer (call to <code>self.' + escapeHtml(edge.to_node ? edge.to_node.attr_name : '?') + '</code>)</h4>');
-                bodyHtml += '<div class="side-panel-section">' + consumerLabel +
-                    renderCodeBlock(ev.to_excerpt.text, ev.to_excerpt.start, ev.to_excerpt.highlight, ev.var, 'consumer-mark') +
-                    '</div>';
-            }
-        }
-    } else if (edge.type === 'flow') {
-        bodyHtml += '<div class="evidence-meta" style="color:#c77a3c">Sequential fallback edge: data flow could not be parsed from <code>forward()</code>; the edge represents the call order between siblings.</div>';
-    } else {
-        // Iter8 strict rule: every edge MUST carry source-line evidence.
-        // Reaching this branch means the analyzer emitted a corrupt edge.
-        // We raise a hard, visible failure rather than silently rendering a
-        // grey "no evidence" hint that masks a real bug in the pipeline.
-        const errMsg = 'INTEGRITY ERROR: edge ' + escapeHtml(edge.from_node ? edge.from_node.attr_name : '?') +
-            ' \u2192 ' + escapeHtml(edge.to_node ? edge.to_node.attr_name : '?') +
-            ' has no source-line evidence (type=' + escapeHtml(String(edge.type || 'unknown')) +
-            '). The DAG generator violated the contract that every dep edge must map to a forward() call site.';
-        bodyHtml += '<div class="evidence-meta" style="background:#5a1a1a;color:#ffb4b4;padding:10px;border:1px solid #ff5a5a;border-radius:4px;font-weight:bold">' +
-            '\u26d4 ' + errMsg + '</div>';
-        console.error('[DAG-INTEGRITY-FAIL]', edge);
-        // Throwing here ensures any automated test harness that clicks every
-        // edge will surface the failure as an unhandled exception.
-        }
+    // evidence 面板已随 DataFlowEdge -> flows 重构移除（旧 edge.evidence / step.role 字段已删）。
+    // shape/dtype/steps 的渲染留待后续 evidence 摘取阶段基于 flows 重建，目前 Edge 面板仅展示 Endpoints。
     document.getElementById('sp-body').innerHTML = bodyHtml;
     sp.classList.add('open');
 }

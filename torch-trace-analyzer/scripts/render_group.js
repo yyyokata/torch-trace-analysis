@@ -222,7 +222,7 @@ function renderGroupInternalEdges(ctx, routeCtx) {
             from_node: ed.from_node,
             to_node: ed.to_node,
             parent_class: ed.parent_class || ctx.g.class_name,
-            evidence: ed.evidence,
+            flows: ed.flows,
         };
         if (!isEdgeVisible(routedEdge)) continue;
         renderEdge({

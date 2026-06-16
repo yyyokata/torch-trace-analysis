@@ -192,27 +192,20 @@ def _serialize_module_node(node: ModuleNode, dag: DAG, registry: dict[int, DagNo
 
 
 def _serialize_edge(edge: DataFlowEdge) -> dict:
-    evidence = None
-    if edge.evidence:
-        evidence = []
-        for var_evidence in edge.evidence:
-            evidence.extend(
-                {
-                    "loc": _serialize_call_loc(step.loc),
-                    "role": step.role,
-                    "var": step.var,
-                }
-                for step in var_evidence.steps
-            )
-
     return {
         "src_id": edge.src_id,
         "dst_id": edge.dst_id,
-        "tensor_info": {
-            str(tensor_id): {"shape": info["shape"], "dtype": info["dtype"]}
-            for tensor_id, info in edge.tensor_info.items()
+        "flows": {
+            str(idx): {
+                "shape": tf.shape,
+                "dtype": tf.dtype,
+                "steps": [
+                    {"loc": _serialize_call_loc(step.loc), "var": step.var}
+                    for step in tf.steps
+                ],
+            }
+            for idx, tf in edge.flows.items()
         },
-        "evidence": evidence,
     }
 
 
