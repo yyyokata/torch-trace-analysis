@@ -1978,7 +1978,7 @@ def render_flowchart_to_file(flowchart_data, output_path):
     html_content = _generate_flowchart_html(flowchart_data)
     source_files = _collect_source_files(flowchart_data)
     source_map = _build_source_map(source_files)
-    source_map_js = "const SOURCE_MAP = " + _json.dumps(source_map, ensure_ascii=True) + ";"
+    source_map_js = "const SOURCE_MAP = " + _json.dumps(source_map, ensure_ascii=True).replace("</", "<\\/") + ";"
     html_content = html_content.replace("// __SOURCE_MAP_PLACEHOLDER__", source_map_js)
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(html_content.encode("utf-8", "replace").decode("utf-8"))
