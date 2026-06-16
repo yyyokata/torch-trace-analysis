@@ -45,6 +45,10 @@ class ResultAttr(Attr):
 @dataclass
 class ForwardArgAttr(Attr):
     arg_index: int = 0
+    # 该 ForwardArgAttr 所属 module node 的 node_id（用于沿 arg_bindings 向上追溯）
+    owner_module_node_id: int = -1
+    # forward 形参的真实名字（如 forward(self, y) 中的 "y"），用于 EvidenceStep.var
+    param_name: str = ""
 
 
 @dataclass
