@@ -1722,7 +1722,15 @@ function showSourcePanel(g) {
     if (g.class_def_loc && sourceMap && sourceMap[g.class_def_loc.file]) {
         const lines = sourceMap[g.class_def_loc.file].split('\n');
         const startIdx = g.class_def_loc.line - 1;
-        const snippet = lines.slice(startIdx, startIdx + 80).join('\n');
+        const classIndent = lines[startIdx].search(/\S/);
+        let endIdx = startIdx + 1;
+        while (endIdx < lines.length) {
+            const line = lines[endIdx];
+            if (line.trim() === '' || line.trim().startsWith('#')) { endIdx++; continue; }
+            if (line.search(/\S/) <= classIndent) break;
+            endIdx++;
+        }
+        const snippet = lines.slice(startIdx, endIdx).join('\n');
         sections.push({ title: 'Class ' + g.class_name + ' (definition)', snippet, startLine: g.class_def_loc.line, file: g.class_def_loc.file });
     }
     if (g.def_loc && sourceMap && sourceMap[g.def_loc.file]) {
