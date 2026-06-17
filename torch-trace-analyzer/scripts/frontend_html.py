@@ -1937,14 +1937,16 @@ def render_multi_tab_flowchart_to_file(
 ) -> None:
     """
     tabs: {"training": [{"label": "step_forward", "data": <adapted_dict>}, ...],
-           "inference": [...]}
+           "inference": [{"label": "predict_online", "error": "...", "warnings": [...]}, ...]}
     每个 mode 下的 list 可以有任意数量 step，各出一张图对应一个 L2 tab。
     """
     html_content = _generate_flowchart_html_multi(tabs)
     source_files: set[str] = set()
     for items in tabs.values():
         for item in items:
-            source_files.update(_collect_source_files(item["data"]))
+            if "data" in item:
+                source_files.update(_collect_source_files(item["data"]))
+    
     source_map = _build_source_map(source_files)
     source_map_js = "const SOURCE_MAP = " + _json.dumps(source_map, ensure_ascii=True).replace("</", "<\\/") + ";"
     html_content = html_content.replace("// __SOURCE_MAP_PLACEHOLDER__", source_map_js)
@@ -1962,25 +1964,37 @@ def _generate_flowchart_html_multi(tabs: dict[str, list[dict]]) -> str:
     first_mode = list(tabs.keys())[0]
     if not tabs[first_mode]:
         raise ValueError(f"tabs[{first_mode!r}] must contain at least one entry")
+    default_mode = None
+    default_idx = None
+    default_data = None
     for mode, items in tabs.items():
         if not items:
             raise ValueError(f"tabs[{mode!r}] must contain at least one entry")
-        for item in items:
-            if "label" not in item or "data" not in item:
-                raise ValueError(f"tab item for mode={mode!r} must contain label and data")
+        for idx, item in enumerate(items):
+            if "label" not in item:
+                raise ValueError(f"tab item for mode={mode!r} must contain label")
+            if "data" not in item and "error" not in item:
+                raise ValueError(f"tab item for mode={mode!r} must contain data or error")
+            if default_data is None and "data" in item:
+                default_mode = mode
+                default_idx = idx
+                default_data = item["data"]
 
-    default_data = tabs[first_mode][0]["data"]
+    if default_data is None or default_mode is None or default_idx is None:
+        raise ValueError("at least one tab item must contain data")
+
     base_html = _generate_flowchart_html(default_data)
 
-    all_tab_data = {mode: [item["data"] for item in items] for mode, items in tabs.items()}
+    all_tab_data = {mode: items for mode, items in tabs.items()}
     all_tab_labels = {mode: [str(item["label"]) for item in items] for mode, items in tabs.items()}
     active_l2 = {mode: 0 for mode in tabs.keys()}
+    active_l2[default_mode] = default_idx
 
     all_tab_data_json = _json.dumps(all_tab_data, ensure_ascii=True).replace("</", "<\\/")
     active_l2_json = _json.dumps(active_l2, ensure_ascii=True)
     data_preamble = (
         "const ALL_TAB_DATA = " + all_tab_data_json + ";\n"
-        f'let ACTIVE_L1 = {first_mode!r};\n'
+        f'let ACTIVE_L1 = {default_mode!r};\n'
         "const ACTIVE_L2 = " + active_l2_json + ";\n"
         "let DATA = ALL_TAB_DATA[ACTIVE_L1][ACTIVE_L2[ACTIVE_L1]];\n"
     )
@@ -2060,6 +2074,27 @@ def _generate_flowchart_html_multi(tabs: dict[str, list[dict]]) -> str:
 
     switch_js = (
         "\n<script>\n"
+        "function _ensureDagShell() {\n"
+        "    var dagContainer = document.getElementById(\"dag-container\");\n"
+        "    if (!dagContainer) return;\n"
+        "    if (!document.getElementById(\"dag-svg\")) {\n"
+        "        dagContainer.innerHTML = '<svg class=\"dag-svg\" id=\"dag-svg\"></svg>';\n"
+        "    }\n"
+        "}\n"
+        "function _showErrorPanel(errMsg, warnings) {\n"
+        "    var metaInfo = document.getElementById(\"meta-info\");\n"
+        "    if (metaInfo) metaInfo.textContent = 'DAG build failed for this step';\n"
+        "    var modeBadge = document.getElementById(\"mode-badge\");\n"
+        "    if (modeBadge) modeBadge.innerHTML = '<span class=\"mode-badge\" style=\"background:rgba(248,81,73,0.15);color:#f85149;border-color:rgba(248,81,73,0.35)\">⚠ Build Error</span>';\n"
+        "    var legend = document.getElementById(\"legend\");\n"
+        "    if (legend) legend.innerHTML = warnings.length ? '<div class=\"legend-item\" style=\"color:#f0ad4e\">⚠ Build warnings: ' + escapeHtml(String(warnings.length)) + '</div>' : '';\n"
+        "    var summary = document.getElementById(\"summary\");\n"
+        "    if (summary) summary.innerHTML = '<h3>⚠ DAG Build Failed</h3><p>This runstep did not produce a renderable DAG. See the error details below.</p>';\n"
+        "    var dagContainer = document.getElementById(\"dag-container\");\n"
+        "    if (!dagContainer) return;\n"
+        "    var warningHtml = warnings.length ? '<details><summary style=\"cursor:pointer;color:#f0ad4e\">⚠ Build Warnings (' + escapeHtml(String(warnings.length)) + ')</summary><pre style=\"font-size:11px;color:#f0ad4e;white-space:pre-wrap\">' + warnings.map(function (w) { return escapeHtml(w); }).join('\\n') + '</pre></details>' : '';\n"
+        "    dagContainer.innerHTML = '<div style=\"padding:40px;font-family:monospace\"><div style=\"color:#f85149;font-size:16px;margin-bottom:16px\">⚠ DAG build failed for this step</div><pre style=\"background:#161b22;padding:16px;border-radius:6px;color:#ffa657;font-size:12px;white-space:pre-wrap;overflow:auto\">' + escapeHtml(errMsg) + '</pre>' + warningHtml + '</div>';\n"
+        "}\n"
         "function _resetSharedState() {\n"
         "    if (typeof groupMap === \"object\" && groupMap) {\n"
         "        Object.keys(groupMap).forEach(k => { delete groupMap[k]; });\n"
@@ -2112,6 +2147,11 @@ def _generate_flowchart_html_multi(tabs: dict[str, list[dict]]) -> str:
         "    if (DATA === nextData) return;\n"
         "    _resetSharedState();\n"
         "    DATA = nextData;\n"
+        "    if (DATA && DATA.error) {\n"
+        "        _showErrorPanel(DATA.error, DATA.warnings || []);\n"
+        "        return;\n"
+        "    }\n"
+        "    _ensureDagShell();\n"
         "    _rebuildIndices();\n"
         "    render();\n"
         "}\n"
