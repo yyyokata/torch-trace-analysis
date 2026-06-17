@@ -1302,8 +1302,9 @@ function render() {
         input: 'rgba(46,204,113,0.55)',
         param: 'rgba(155,89,182,0.55)',
         const: 'rgba(241,196,15,0.55)',
+        output: 'rgba(231,76,60,0.55)',
     };
-    const IO_GROUP_MEMBER_LABEL = { input: 'Input', param: 'Param', const: 'Const' };
+    const IO_GROUP_MEMBER_LABEL = { input: 'Input', param: 'Param', const: 'Const', output: 'Result' };
 
     function renderIOGroupPill(ioGroup, cx, cy, w, h, availableW = svgW) {
         const fillColor = IO_GROUP_FILL[ioGroup.io_subtype] || 'rgba(127,140,141,0.55)';

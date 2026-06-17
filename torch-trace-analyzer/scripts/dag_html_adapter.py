@@ -420,6 +420,7 @@ def _collapse_top_level_io_groups(serialized: dict) -> list[dict]:
         ("input", serialized["input_nodes"]),
         ("param", serialized["param_nodes"]),
         ("const", serialized["const_nodes"]),
+        ("output", serialized["output_nodes"]),
     )
     member_ids_by_subtype: dict[str, list[int]] = {
         subtype: _extract_io_node_ids(entries)
