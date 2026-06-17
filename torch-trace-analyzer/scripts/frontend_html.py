@@ -1996,7 +1996,7 @@ def _generate_flowchart_html_multi(tabs: dict[str, list[dict]]) -> str:
         "const ALL_TAB_DATA = " + all_tab_data_json + ";\n"
         f'let ACTIVE_L1 = {default_mode!r};\n'
         "const ACTIVE_L2 = " + active_l2_json + ";\n"
-        "let DATA = ALL_TAB_DATA[ACTIVE_L1][ACTIVE_L2[ACTIVE_L1]];\n"
+        "let DATA = (ALL_TAB_DATA[ACTIVE_L1][ACTIVE_L2[ACTIVE_L1]].data || ALL_TAB_DATA[ACTIVE_L1][ACTIVE_L2[ACTIVE_L1]]);\n"
     )
     base_html, n_sub = _re.subn(
         r"const DATA = .*?(?=\nconst groupMap = \{\};)",
@@ -2074,6 +2074,15 @@ def _generate_flowchart_html_multi(tabs: dict[str, list[dict]]) -> str:
 
     switch_js = (
         "\n<script>\n"
+        "function _resolveTabPayload(tabEntry) {\n"
+        "    if (!tabEntry) {\n"
+        "        throw new Error('multi-tab switch got empty tab entry');\n"
+        "    }\n"
+        "    if (tabEntry.error) {\n"
+        "        return tabEntry;\n"
+        "    }\n"
+        "    return tabEntry.data || tabEntry;\n"
+        "}\n"
         "function _ensureDagShell() {\n"
         "    var dagContainer = document.getElementById(\"dag-container\");\n"
         "    if (!dagContainer) return;\n"
@@ -2143,7 +2152,8 @@ def _generate_flowchart_html_multi(tabs: dict[str, list[dict]]) -> str:
         "        switchDataset(ALL_TAB_DATA[ACTIVE_L1][ACTIVE_L2[ACTIVE_L1]]);\n"
         "    }\n"
         "}\n"
-        "function switchDataset(nextData) {\n"
+        "function switchDataset(nextTabEntry) {\n"
+        "    var nextData = _resolveTabPayload(nextTabEntry);\n"
         "    if (DATA === nextData) return;\n"
         "    _resetSharedState();\n"
         "    DATA = nextData;\n"
