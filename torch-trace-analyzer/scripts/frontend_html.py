@@ -39,17 +39,6 @@ _RENDER_GROUP_JS_PLACEHOLDER = "__RENDER_GROUP_JS_PLACEHOLDER__"
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
-# Explicit, unambiguous imports of all shared helpers from analyze_trace.
-# Any rename or removal of these names in analyze_trace.py will surface here
-# as an ImportError instead of silently degrading at runtime.
-from analyze_trace import (  # noqa: E402  (sys.path tweak above is intentional)
-    _strip_inline_comment,
-    build_instance_timing_pipeline,
-    build_main_thread_hierarchy,
-    extract_step_phase_intervals,
-    format_duration,
-)
-
 
 FLOWCHART_HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -1890,19 +1879,6 @@ render();
 </html>"""
 
 
-def generate_html_flowchart(source_files, timing_data=None, meta=None, output_path="flowchart.html", trace_events=None, conditional_mode="infer", _return_data_only=False):
-    raise NotImplementedError(
-        "static HTML flowchart generation has been removed in feat/static-cleanup"
-    )
-def build_timing_data_from_trace(events, source_files, mod_info, step_dur_us, profiler_steps, src_info=None, roots=None):
-    raise NotImplementedError(
-        "static HTML flowchart timing overlay has been removed in feat/static-cleanup"
-    )
-def generate_html_flowchart_dual(source_files, timing_data=None, meta=None,
-                                 output_path="flowchart.html", trace_events=None):
-    raise NotImplementedError(
-        "static dual HTML flowchart generation has been removed in feat/static-cleanup"
-    )
 def _collect_source_files(data: dict) -> set[str]:
     """遍历 groups，收集所有 loc 字段引用的 file 路径（去重）。"""
     files: set[str] = set()
@@ -1953,6 +1929,199 @@ def render_dual_flowchart_to_file(data_train, data_infer, output_path):
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(html_content.encode("utf-8", "replace").decode("utf-8"))
     return output_path
+
+
+def render_multi_tab_flowchart_to_file(
+    tabs: dict[str, list[dict]],
+    output_path: str,
+) -> None:
+    """
+    tabs: {"training": [{"label": "step_forward", "data": <adapted_dict>}, ...],
+           "inference": [...]}
+    每个 mode 下的 list 可以有任意数量 step，各出一张图对应一个 L2 tab。
+    """
+    html_content = _generate_flowchart_html_multi(tabs)
+    source_files: set[str] = set()
+    for items in tabs.values():
+        for item in items:
+            source_files.update(_collect_source_files(item["data"]))
+    source_map = _build_source_map(source_files)
+    source_map_js = "const SOURCE_MAP = " + _json.dumps(source_map, ensure_ascii=True).replace("</", "<\\/") + ";"
+    html_content = html_content.replace("// __SOURCE_MAP_PLACEHOLDER__", source_map_js)
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(html_content.encode("utf-8", "replace").decode("utf-8"))
+    return output_path
+
+
+def _generate_flowchart_html_multi(tabs: dict[str, list[dict]]) -> str:
+    import json as _json
+    import re as _re
+
+    if not tabs:
+        raise ValueError("tabs must not be empty")
+    first_mode = list(tabs.keys())[0]
+    if not tabs[first_mode]:
+        raise ValueError(f"tabs[{first_mode!r}] must contain at least one entry")
+    for mode, items in tabs.items():
+        if not items:
+            raise ValueError(f"tabs[{mode!r}] must contain at least one entry")
+        for item in items:
+            if "label" not in item or "data" not in item:
+                raise ValueError(f"tab item for mode={mode!r} must contain label and data")
+
+    default_data = tabs[first_mode][0]["data"]
+    base_html = _generate_flowchart_html(default_data)
+
+    all_tab_data = {mode: [item["data"] for item in items] for mode, items in tabs.items()}
+    all_tab_labels = {mode: [str(item["label"]) for item in items] for mode, items in tabs.items()}
+    active_l2 = {mode: 0 for mode in tabs.keys()}
+
+    all_tab_data_json = _json.dumps(all_tab_data, ensure_ascii=True).replace("</", "<\\/")
+    active_l2_json = _json.dumps(active_l2, ensure_ascii=True)
+    data_preamble = (
+        "const ALL_TAB_DATA = " + all_tab_data_json + ";\n"
+        f'let ACTIVE_L1 = {first_mode!r};\n'
+        "const ACTIVE_L2 = " + active_l2_json + ";\n"
+        "let DATA = ALL_TAB_DATA[ACTIVE_L1][ACTIVE_L2[ACTIVE_L1]];\n"
+    )
+    base_html, n_sub = _re.subn(
+        r"const DATA = .*?(?=\nconst groupMap = \{\};)",
+        lambda _m: data_preamble,
+        base_html,
+        count=1,
+        flags=_re.DOTALL,
+    )
+    if n_sub != 1:
+        raise RuntimeError("failed to replace DATA preamble for multi-tab flowchart html")
+
+    tab_styles = (
+        "<style>\n"
+        ".multi-tabs-l1 {\n"
+        "    position: sticky; top: 0; z-index: 200;\n"
+        "    display: flex; align-items: center;\n"
+        "    height: 48px; padding: 0 16px;\n"
+        "    background: #0d1117; border-bottom: 1px solid #21262d;\n"
+        "}\n"
+        ".multi-tab-l1 {\n"
+        "    height: 48px; padding: 0 20px;\n"
+        "    background: none; border: none; border-bottom: 2px solid transparent;\n"
+        "    color: #8b949e; font-size: 14px; cursor: pointer;\n"
+        "    transition: color .15s, border-color .15s;\n"
+        "}\n"
+        ".multi-tab-l1.active { color: #64b5f6; border-bottom-color: #64b5f6; background: rgba(100,181,246,.07); }\n"
+        ".multi-tab-l1:hover:not(.active) { color: #c9d1d9; }\n"
+        ".multi-tabs-l2-container {\n"
+        "    background: #0d1117; border-bottom: 1px solid #161b22;\n"
+        "    padding: 4px 0 4px 32px;\n"
+        "}\n"
+        ".multi-l1-panel { display: none; }\n"
+        ".multi-l1-panel.active { display: block; }\n"
+        ".multi-tabs-l2 { display: flex; gap: 6px; flex-wrap: wrap; }\n"
+        ".multi-tab-l2 {\n"
+        "    height: 28px; padding: 0 12px;\n"
+        "    background: #161b22; border: 1px solid #30363d; border-radius: 14px;\n"
+        "    color: #8b949e; font-size: 12px; cursor: pointer;\n"
+        "    transition: background .15s, color .15s;\n"
+        "}\n"
+        ".multi-tab-l2.active { background: #1f3a5f; border-color: #388bfd; color: #64b5f6; }\n"
+        ".multi-tab-l2:hover:not(.active) { background: #21262d; color: #c9d1d9; }\n"
+        "</style>\n"
+    )
+    if "</head>" in base_html:
+        base_html = base_html.replace("</head>", tab_styles + "</head>", 1)
+    else:
+        base_html = tab_styles + base_html
+
+    l1_buttons: list[str] = []
+    l2_panels: list[str] = []
+    for idx, (mode, labels) in enumerate(all_tab_labels.items()):
+        is_active = idx == 0
+        l1_class = "multi-tab-l1 active" if is_active else "multi-tab-l1"
+        l1_buttons.append(
+            f'<button class="{l1_class}" data-l1="{mode}" onclick="activateL1({mode!r})">{mode.title()}</button>'
+        )
+        l2_buttons: list[str] = []
+        for step_idx, label in enumerate(labels):
+            l2_class = "multi-tab-l2 active" if step_idx == 0 else "multi-tab-l2"
+            l2_buttons.append(
+                f'<button class="{l2_class}" data-l1="{mode}" onclick="activateL2({mode!r}, {step_idx})">{label}</button>'
+            )
+        panel_class = "multi-l1-panel active" if is_active else "multi-l1-panel"
+        l2_panels.append(
+            f'<div class="{panel_class}" data-l1-panel="{mode}"><div class="multi-tabs-l2">' + "".join(l2_buttons) + "</div></div>"
+        )
+    tab_html = (
+        '<div class="multi-tabs-l1">' + "".join(l1_buttons) + "</div>\n"
+        '<div class="multi-tabs-l2-container">' + "".join(l2_panels) + "</div>\n"
+    )
+    base_html, body_sub = _re.subn(r"(<body[^>]*>)", r"\1\n" + tab_html, base_html, count=1)
+    if body_sub != 1:
+        raise RuntimeError("failed to inject multi-tab bar into flowchart html body")
+
+    switch_js = (
+        "\n<script>\n"
+        "function _resetSharedState() {\n"
+        "    if (typeof groupMap === \"object\" && groupMap) {\n"
+        "        Object.keys(groupMap).forEach(k => { delete groupMap[k]; });\n"
+        "    }\n"
+        "    if (typeof nodeMap === \"object\" && nodeMap) {\n"
+        "        Object.keys(nodeMap).forEach(k => { delete nodeMap[k]; });\n"
+        "    }\n"
+        "    if (typeof collapsedState === \"object\" && collapsedState) {\n"
+        "        Object.keys(collapsedState).forEach(k => { delete collapsedState[k]; });\n"
+        "    }\n"
+        "    try { if (typeof nodeAncestorGroups !== \"undefined\" && nodeAncestorGroups && nodeAncestorGroups.clear) nodeAncestorGroups.clear(); } catch (e) {}\n"
+        "    try { if (typeof nodeDomRegistry !== \"undefined\" && nodeDomRegistry && nodeDomRegistry.clear) nodeDomRegistry.clear(); } catch (e) {}\n"
+        "    try { if (typeof edgeDomRegistry !== \"undefined\") edgeDomRegistry.length = 0; } catch (e) {}\n"
+        "    try { if (typeof groupLayout !== \"undefined\") { Object.keys(groupLayout).forEach(k => delete groupLayout[k]); } } catch (e) {}\n"
+        "    try { if (typeof nodePortMap !== \"undefined\") { Object.keys(nodePortMap).forEach(k => delete nodePortMap[k]); } } catch (e) {}\n"
+        "    try { hoveredEdgeKey = null; hoveredEdges = []; hoveredEdgeIdx = 0; hoveredNodeId = null; hoveredGroupId = null; focusedEdgeKey = null; } catch (e) {}\n"
+        "    try { var sp = document.getElementById(\"side-panel\"); if (sp) sp.classList.remove(\"open\"); } catch (e) {}\n"
+        "}\n"
+        "function _rebuildIndices() {\n"
+        "    DATA.groups.forEach(g => groupMap[g.id] = g);\n"
+        "    DATA.nodes.forEach(n => nodeMap[n.id] = n);\n"
+        "    if (typeof indexGroupAncestors === \"function\" && DATA.root_groups) {\n"
+        "        indexGroupAncestors(DATA.root_groups.map(rid => groupMap[rid]).filter(Boolean));\n"
+        "    }\n"
+        "    DATA.groups.forEach(g => { collapsedState[g.id] = g.depth >= 2 || g.is_native === true; });\n"
+        "}\n"
+        "function activateL1(mode) {\n"
+        "    ACTIVE_L1 = mode;\n"
+        "    document.querySelectorAll('.multi-tab-l1').forEach(b => {\n"
+        "        b.classList.toggle('active', b.dataset.l1 === mode);\n"
+        "    });\n"
+        "    document.querySelectorAll('.multi-l1-panel').forEach(p => {\n"
+        "        p.classList.toggle('active', p.dataset.l1Panel === mode);\n"
+        "    });\n"
+        "    document.querySelectorAll(`.multi-tab-l2[data-l1=\"${mode}\"]`).forEach((b, i) => {\n"
+        "        b.classList.toggle('active', i === ACTIVE_L2[mode]);\n"
+        "    });\n"
+        "    switchDataset(ALL_TAB_DATA[ACTIVE_L1][ACTIVE_L2[ACTIVE_L1]]);\n"
+        "}\n"
+        "function activateL2(mode, idx) {\n"
+        "    ACTIVE_L2[mode] = idx;\n"
+        "    if (mode === ACTIVE_L1) {\n"
+        "        document.querySelectorAll(`.multi-tab-l2[data-l1=\"${mode}\"]`).forEach((b, i) => {\n"
+        "            b.classList.toggle('active', i === idx);\n"
+        "        });\n"
+        "        switchDataset(ALL_TAB_DATA[ACTIVE_L1][ACTIVE_L2[ACTIVE_L1]]);\n"
+        "    }\n"
+        "}\n"
+        "function switchDataset(nextData) {\n"
+        "    if (DATA === nextData) return;\n"
+        "    _resetSharedState();\n"
+        "    DATA = nextData;\n"
+        "    _rebuildIndices();\n"
+        "    render();\n"
+        "}\n"
+        "</script>\n"
+    )
+    if "</body>" in base_html:
+        base_html = base_html.replace("</body>", switch_js + "</body>", 1)
+    else:
+        base_html = base_html + switch_js
+    return base_html
 
 
 def _generate_flowchart_html_dual(data_train, data_infer):
