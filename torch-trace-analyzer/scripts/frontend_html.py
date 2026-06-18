@@ -1998,6 +1998,7 @@ def _generate_flowchart_html_multi(tabs: dict[str, list[dict]]) -> str:
         f'let ACTIVE_L1 = {default_mode!r};\n'
         "const ACTIVE_L2 = " + active_l2_json + ";\n"
         "let DATA = (ALL_TAB_DATA[ACTIVE_L1][ACTIVE_L2[ACTIVE_L1]].data || ALL_TAB_DATA[ACTIVE_L1][ACTIVE_L2[ACTIVE_L1]]);\n"
+        "// __SOURCE_MAP_PLACEHOLDER__\n"
     )
     base_html, n_sub = _re.subn(
         r"const DATA = .*?(?=\nconst groupMap = \{\};)",
