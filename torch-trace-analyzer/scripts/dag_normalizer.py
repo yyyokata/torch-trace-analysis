@@ -67,6 +67,11 @@ def _normalize_single_dag(
             dag.direct_nodes.append(container_node_id)
         registry[container_node_id].metadata["is_container"] = True
 
+    for node_id in list(dag.nodes):
+        node = registry.get(node_id)
+        if node is not None and isinstance(node, ModuleNode) and isinstance(node.attr, ContainerAttr):
+            node.metadata["is_container"] = True
+
     # 数据流边原样保留：不重写 boundary edge、不生成 containment 边。
     # 容器与成员的归属关系通过容器节点 inner_dag.direct_nodes 表达。
     for container_node_id in container_node_ids:
