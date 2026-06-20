@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from attr_types import CallLoc, ContainerAttr, _NATIVE_CONTAINER_KINDS
+from attr_types import CallLoc, ContainerAttr, FunctionalAttr, ModuleAttr, _NATIVE_CONTAINER_KINDS
 from dag_types import DAG, DagNode, DataFlowEdge, ModuleNode
 
 
@@ -18,6 +18,8 @@ def normalize_containers_recursive(
         attr_to_node_ids=attr_to_node_ids,
         owner_node_id=None,
         visited_dag_ids=set(),
+        scope_frames_prefix=("forward",),
+        allow_function_grouping=True,
     )
 
 
@@ -27,25 +29,41 @@ def _normalize_containers_recursive(
     attr_to_node_ids: dict[int, list[int]],
     owner_node_id: int | None,
     visited_dag_ids: set[int],
+    scope_frames_prefix: tuple[str, ...],
+    allow_function_grouping: bool,
 ) -> None:
     dag_object_id = id(dag)
     if dag_object_id in visited_dag_ids:
         return
     visited_dag_ids.add(dag_object_id)
-    _normalize_single_dag(dag, registry, attr_to_node_ids, owner_node_id=owner_node_id)
+    _normalize_single_dag(
+        dag,
+        registry,
+        attr_to_node_ids,
+        owner_node_id=owner_node_id,
+        scope_frames_prefix=scope_frames_prefix,
+        allow_function_grouping=allow_function_grouping,
+    )
     _rebuild_adjacency(dag)
     for node_id in list(dag.nodes):
         if owner_node_id is not None and node_id == owner_node_id:
             continue
         node = registry[node_id]
-        if isinstance(node, ModuleNode) and node.inner_dag is not None:
-            _normalize_containers_recursive(
-                node.inner_dag,
-                registry,
-                attr_to_node_ids=attr_to_node_ids,
-                owner_node_id=node_id,
-                visited_dag_ids=visited_dag_ids,
-            )
+        if not isinstance(node, ModuleNode) or node.inner_dag is None:
+            continue
+        if node.metadata.get("is_synthetic"):
+            continue
+        child_scope_frames_prefix = ("forward",)
+        child_allow_function_grouping = not node.metadata.get("is_container", False)
+        _normalize_containers_recursive(
+            node.inner_dag,
+            registry,
+            attr_to_node_ids=attr_to_node_ids,
+            owner_node_id=node_id,
+            visited_dag_ids=visited_dag_ids,
+            scope_frames_prefix=child_scope_frames_prefix,
+            allow_function_grouping=child_allow_function_grouping,
+        )
 
 
 def _normalize_single_dag(
@@ -53,6 +71,8 @@ def _normalize_single_dag(
     registry: dict[int, DagNode],
     attr_to_node_ids: dict[int, list[int]],
     owner_node_id: int | None,
+    scope_frames_prefix: tuple[str, ...],
+    allow_function_grouping: bool,
 ) -> None:
     container_node_ids = _collect_relevant_container_node_ids(
         dag=dag,
@@ -98,6 +118,123 @@ def _normalize_single_dag(
         for member_id in sorted(member_ids):
             if member_id not in inner_dag.direct_nodes:
                 inner_dag.direct_nodes.append(member_id)
+
+    if allow_function_grouping:
+        _apply_function_grouping_a(dag, registry, scope_frames_prefix=scope_frames_prefix)
+
+
+def _apply_function_grouping_a(
+    dag: DAG,
+    registry: dict[int, DagNode],
+    scope_frames_prefix: tuple[str, ...],
+) -> None:
+    buckets: dict[str, list[int]] = {}
+    bucket_order: list[str] = []
+    for node_id in list(dag.direct_nodes):
+        node = registry[node_id]
+        frames = node.call_loc.frames
+        if len(frames) <= len(scope_frames_prefix):
+            continue
+        frame_names = tuple(frame.function_name for frame in frames[: len(scope_frames_prefix)])
+        if frame_names != scope_frames_prefix:
+            continue
+        helper_name = frames[len(scope_frames_prefix)].function_name
+        if helper_name not in buckets:
+            buckets[helper_name] = []
+            bucket_order.append(helper_name)
+        buckets[helper_name].append(node_id)
+
+    for helper_name in bucket_order:
+        member_ids = buckets[helper_name]
+        if not all(isinstance(registry[node_id].attr, FunctionalAttr) for node_id in member_ids):
+            continue
+        new_node = _build_function_group_node(
+            dag=dag,
+            registry=registry,
+            member_ids=member_ids,
+            helper_name=helper_name,
+        )
+        dag.nodes.append(new_node.node_id)
+        dag.direct_nodes = _replace_direct_nodes_with_group(
+            dag.direct_nodes,
+            member_ids=set(member_ids),
+            group_node_id=new_node.node_id,
+        )
+        registry[new_node.node_id] = new_node
+        _apply_function_grouping_a(
+            new_node.inner_dag,
+            registry,
+            scope_frames_prefix=scope_frames_prefix + (helper_name,),
+        )
+
+
+def _build_function_group_node(
+    dag: DAG,
+    registry: dict[int, DagNode],
+    member_ids: list[int],
+    helper_name: str,
+) -> ModuleNode:
+    representative_node = registry[member_ids[0]]
+    frames = representative_node.call_loc.frames
+    if not frames:
+        raise RuntimeError(
+            f"A-group {helper_name} representative node {representative_node.node_id} has empty call_loc.frames"
+        )
+    leaf_frame = frames[-1]
+    if not leaf_frame.file:
+        raise RuntimeError(
+            f"A-group {helper_name} representative node {representative_node.node_id} has empty frame file"
+        )
+    if leaf_frame.line <= 0:
+        raise RuntimeError(
+            f"A-group {helper_name} representative node {representative_node.node_id} has invalid frame line {leaf_frame.line}"
+        )
+    if leaf_frame.function_name != helper_name:
+        raise RuntimeError(
+            f"A-group {helper_name} representative node {representative_node.node_id} leaf function {leaf_frame.function_name} mismatches helper name"
+        )
+    member_id_set = set(member_ids)
+    return ModuleNode(
+        node_id=_next_node_id(registry),
+        call_loc=representative_node.call_loc,
+        attr=ModuleAttr(
+            attr_name=helper_name,
+            class_name="SyntheticFunctionGroup",
+            def_loc=CallLoc(file=leaf_frame.file, line=leaf_frame.line, col=0),
+        ),
+        metadata={"is_synthetic": True, "synthetic_type": "function_group"},
+        inner_dag=DAG(
+            inputs=[],
+            outputs=[],
+            nodes=member_ids.copy(),
+            edges=[
+                edge for edge in dag.edges if edge.src_id in member_id_set and edge.dst_id in member_id_set
+            ],
+            direct_nodes=member_ids.copy(),
+        ),
+        is_native=False,
+    )
+
+
+def _replace_direct_nodes_with_group(
+    direct_nodes: list[int],
+    member_ids: set[int],
+    group_node_id: int,
+) -> list[int]:
+    new_direct_nodes: list[int] = []
+    inserted = False
+    for node_id in direct_nodes:
+        if node_id in member_ids:
+            if not inserted:
+                new_direct_nodes.append(group_node_id)
+                inserted = True
+            continue
+        new_direct_nodes.append(node_id)
+    return new_direct_nodes
+
+
+def _next_node_id(registry: dict[int, DagNode]) -> int:
+    return max(registry.keys()) + 1 if registry else 0
 
 
 def _ensure_missing_container_nodes(
