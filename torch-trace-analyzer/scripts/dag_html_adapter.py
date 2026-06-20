@@ -215,7 +215,7 @@ def _build_group_node(
     location_fields = _call_loc_to_src_fields(entry.get("call_loc"))
 
     children_nodes: list[int] = []
-    children_groups: list[dict] = []
+    children_group_ids: list[int] = []
     call_order: list[dict] = []
     in_ports: list[dict] = []
     out_ports: list[dict] = []
@@ -237,7 +237,7 @@ def _build_group_node(
             )
             _assign_parent_group(state, child_id, node_id)
             if built.kind == "group":
-                children_groups.append(built.payload)
+                children_group_ids.append(built.payload["id"])
                 call_order.append({"id": built.payload["id"], "type": "group"})
             else:
                 children_nodes.append(built.payload["id"])
@@ -253,7 +253,7 @@ def _build_group_node(
             _assign_parent_group(state, group["id"], node_id)
         for leaf in child_leaves:
             _assign_parent_group(state, leaf["id"], node_id)
-        children_groups = child_groups
+        children_group_ids = [group["id"] for group in child_groups]
         children_nodes = [leaf["id"] for leaf in child_leaves]
         node_type = "group"
 
@@ -267,7 +267,7 @@ def _build_group_node(
         "depth": depth,
         "node_type": node_type,
         "children_nodes": children_nodes,
-        "children_groups": children_groups,
+        "children_group_ids": children_group_ids,
         "call_order": call_order,
         "in_ports": in_ports,
         "out_ports": out_ports,

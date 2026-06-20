@@ -476,7 +476,7 @@ function indexGroupAncestors(groups, ancestors = []) {
         for (const nid of (g.children_nodes || [])) {
             nodeAncestorGroups.set(nid, nextAncestors.slice());
         }
-        indexGroupAncestors(g.children_groups || [], nextAncestors);
+        indexGroupAncestors((g.children_group_ids || []).map(id => groupMap[id]).filter(g => g != null), nextAncestors);
     }
 }
 
