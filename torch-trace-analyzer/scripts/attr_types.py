@@ -7,10 +7,18 @@ _NATIVE_CONTAINER_KINDS = {"ModuleList", "ModuleDict", "Sequential"}
 
 
 @dataclass(frozen=True)
+class CallFrame:
+    file: str
+    line: int
+    function_name: str
+
+
+@dataclass(frozen=True)
 class CallLoc:
     file: str
     line: int
     col: int
+    frames: tuple[CallFrame, ...] = ()
 
 
 @dataclass
@@ -92,6 +100,7 @@ class ContainerAttr(Attr):
 
 
 __all__ = [
+    "CallFrame",
     "CallLoc",
     "Attr",
     "ModuleAttr",
