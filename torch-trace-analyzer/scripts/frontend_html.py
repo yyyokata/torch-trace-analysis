@@ -798,15 +798,21 @@ function render() {
     const ioGap = 36;
     const pillGap = 18;
     const topIOItems = (DATA.io_groups && DATA.io_groups.length > 0)
-        ? DATA.io_groups.map(g => ({ isIOGroup: true, ioGroup: g }))
+        ? DATA.io_groups
+            .filter(g => g.io_subtype !== 'output')
+            .map(g => ({ isIOGroup: true, ioGroup: g }))
         : [
             ...(DATA.input_node_ids || []).map(id => ({ id, label: 'Input', defaultSublabel: 'network input', fillColor: 'rgba(46,204,113,0.55)' })),
             ...(DATA.param_node_ids || []).map(id => ({ id, label: 'Param', defaultSublabel: 'model param', fillColor: 'rgba(155,89,182,0.55)' })),
             ...(DATA.const_node_ids || []).map(id => ({ id, label: 'Const', defaultSublabel: 'const value', fillColor: 'rgba(241,196,15,0.55)' })),
         ];
-    const bottomIOItems = [
-        ...(DATA.output_node_ids || []).map(id => ({ id, label: 'Result', defaultSublabel: 'result output', fillColor: 'rgba(231,76,60,0.55)' })),
-    ];
+    const outputIOGroup = (DATA.io_groups || []).find(g => g.io_subtype === 'output');
+    const bottomIOItems = outputIOGroup
+        ? [{ isIOGroup: true, ioGroup: outputIOGroup }]
+        : (DATA.output_node_ids || []).map(id => ({
+              id, label: 'Result', defaultSublabel: 'result output',
+              fillColor: 'rgba(231,76,60,0.55)'
+          }));
     const topIORows = topIOItems.length > 0 ? [{ items: topIOItems }] : [];
     const bottomIORows = bottomIOItems.length > 0 ? [{ items: bottomIOItems }] : [];
     const allIORows = topIORows.concat(bottomIORows);
