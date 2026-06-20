@@ -20,6 +20,7 @@ def normalize_containers_recursive(
         visited_dag_ids=set(),
         scope_frames_prefix=("forward",),
         allow_function_grouping=True,
+        allow_callloc_grouping=True,
     )
 
 
@@ -31,6 +32,7 @@ def _normalize_containers_recursive(
     visited_dag_ids: set[int],
     scope_frames_prefix: tuple[str, ...],
     allow_function_grouping: bool,
+    allow_callloc_grouping: bool,
 ) -> None:
     dag_object_id = id(dag)
     if dag_object_id in visited_dag_ids:
@@ -43,6 +45,7 @@ def _normalize_containers_recursive(
         owner_node_id=owner_node_id,
         scope_frames_prefix=scope_frames_prefix,
         allow_function_grouping=allow_function_grouping,
+        allow_callloc_grouping=allow_callloc_grouping,
     )
     _rebuild_adjacency(dag)
     for node_id in list(dag.nodes):
@@ -55,6 +58,7 @@ def _normalize_containers_recursive(
             continue
         child_scope_frames_prefix = ("forward",)
         child_allow_function_grouping = not node.metadata.get("is_container", False)
+        child_allow_callloc_grouping = not node.metadata.get("is_container", False)
         _normalize_containers_recursive(
             node.inner_dag,
             registry,
@@ -63,6 +67,7 @@ def _normalize_containers_recursive(
             visited_dag_ids=visited_dag_ids,
             scope_frames_prefix=child_scope_frames_prefix,
             allow_function_grouping=child_allow_function_grouping,
+            allow_callloc_grouping=child_allow_callloc_grouping,
         )
 
 
@@ -73,6 +78,7 @@ def _normalize_single_dag(
     owner_node_id: int | None,
     scope_frames_prefix: tuple[str, ...],
     allow_function_grouping: bool,
+    allow_callloc_grouping: bool,
 ) -> None:
     container_node_ids = _collect_relevant_container_node_ids(
         dag=dag,
@@ -121,6 +127,8 @@ def _normalize_single_dag(
 
     if allow_function_grouping:
         _apply_function_grouping_a(dag, registry, scope_frames_prefix=scope_frames_prefix)
+    if allow_callloc_grouping:
+        _apply_function_grouping_b(dag, registry, parent_func=scope_frames_prefix[-1])
 
 
 def _apply_function_grouping_a(
@@ -214,6 +222,57 @@ def _build_function_group_node(
         ),
         is_native=False,
     )
+
+
+def _apply_function_grouping_b(
+    dag: DAG,
+    registry: dict[int, DagNode],
+    parent_func: str,
+) -> None:
+    buckets: dict[tuple[str, int], list[int]] = {}
+    bucket_order: list[tuple[str, int]] = []
+    for node_id in list(dag.direct_nodes):
+        node = registry[node_id]
+        key = (node.call_loc.file, node.call_loc.line)
+        if key not in buckets:
+            buckets[key] = []
+            bucket_order.append(key)
+        buckets[key].append(node_id)
+
+    for key in bucket_order:
+        member_ids = buckets[key]
+        if len(member_ids) < 2:
+            continue
+        if not all(isinstance(registry[node_id].attr, FunctionalAttr) for node_id in member_ids):
+            continue
+        representative_node = registry[member_ids[0]]
+        member_id_set = set(member_ids)
+        group_node = ModuleNode(
+            node_id=_next_node_id(registry),
+            call_loc=representative_node.call_loc,
+            attr=ModuleAttr(
+                attr_name=f"{parent_func}:{key[1]}",
+                class_name="SyntheticCallLocLineGroup",
+            ),
+            metadata={"is_synthetic": True, "synthetic_type": "callloc_group"},
+            inner_dag=DAG(
+                inputs=[],
+                outputs=[],
+                nodes=member_ids.copy(),
+                edges=[
+                    edge for edge in dag.edges if edge.src_id in member_id_set and edge.dst_id in member_id_set
+                ],
+                direct_nodes=member_ids.copy(),
+            ),
+            is_native=False,
+        )
+        dag.nodes.append(group_node.node_id)
+        dag.direct_nodes = _replace_direct_nodes_with_group(
+            dag.direct_nodes,
+            member_ids=member_id_set,
+            group_node_id=group_node.node_id,
+        )
+        registry[group_node.node_id] = group_node
 
 
 def _replace_direct_nodes_with_group(
