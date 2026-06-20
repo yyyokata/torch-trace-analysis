@@ -18,7 +18,15 @@ from dag_types import DAG, DagNode, DataFlowEdge, InputNode, ModuleNode, ResultN
 def _serialize_call_loc(loc: CallLoc | None) -> dict | None:
     if loc is None:
         return None
-    return {"file": loc.file, "line": loc.line, "col": loc.col}
+    return {
+        "file": loc.file,
+        "line": loc.line,
+        "col": loc.col,
+        "frames": [
+            {"file": frame.file, "line": frame.line, "function_name": frame.function_name}
+            for frame in loc.frames
+        ],
+    }
 
 
 def _format_display_attr_name(attr) -> str:
