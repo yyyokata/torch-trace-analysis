@@ -191,6 +191,7 @@ def _serialize_module_node(node: ModuleNode, dag: DAG, registry: dict[int, DagNo
         "class_def_loc": _serialize_call_loc(node.attr.class_def_loc) if isinstance(node.attr, ModuleAttr) else None,
         "attr_type": attr_type,
         "is_native": node.is_native,
+        **node.metadata,
         "inner_dag": (
             serialize_dag(node.inner_dag, registry)
             if node.inner_dag is not None

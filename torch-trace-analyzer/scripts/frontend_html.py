@@ -487,8 +487,12 @@ indexGroupAncestors(DATA.root_groups.map(rid => groupMap[rid]).filter(Boolean));
 (DATA.io_groups || []).forEach(g => {
     (g.member_ids || []).forEach(nid => nodeAncestorGroups.set(nid, [g.id]));
 });
-// Default: depth > 1 groups start collapsed
-DATA.groups.forEach(g => { collapsedState[g.id] = g.depth >= 2 || g.is_native === true; });
+// Default: depth > 1, native, and synthetic A/B groups start collapsed
+DATA.groups.forEach(g => {
+    collapsedState[g.id] = g.depth >= 2 || g.is_native === true
+        || g.synthetic_type === 'function_group'
+        || g.synthetic_type === 'callloc_group';
+});
 // Top-level IO groups (Input/Param/Const) default to their adapter-provided collapsed state
 (DATA.io_groups || []).forEach(g => { if (!(g.id in collapsedState)) collapsedState[g.id] = g.collapsed; });
 
@@ -2166,7 +2170,7 @@ def _generate_flowchart_html_multi(tabs: dict[str, list[dict]]) -> str:
         "    if (typeof indexGroupAncestors === \"function\" && DATA.root_groups) {\n"
         "        indexGroupAncestors(DATA.root_groups.map(rid => groupMap[rid]).filter(Boolean));\n"
         "    }\n"
-        "    DATA.groups.forEach(g => { collapsedState[g.id] = g.depth >= 2 || g.is_native === true; });\n"
+        "    DATA.groups.forEach(g => { collapsedState[g.id] = g.depth >= 2 || g.is_native === true || g.synthetic_type === 'function_group' || g.synthetic_type === 'callloc_group'; });\n"
         "}\n"
         "function activateL1(mode) {\n"
         "    ACTIVE_L1 = mode;\n"

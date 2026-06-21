@@ -266,6 +266,8 @@ def _build_group_node(
         "class_def_loc": entry.get("class_def_loc"),
         "depth": depth,
         "node_type": node_type,
+        "is_synthetic": entry.get("is_synthetic", False),
+        "synthetic_type": entry.get("synthetic_type"),
         "children_nodes": children_nodes,
         "children_group_ids": children_group_ids,
         "call_order": call_order,
