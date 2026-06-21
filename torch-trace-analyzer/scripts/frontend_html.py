@@ -552,7 +552,37 @@ function computeRanks(group) {
     const outEdges = {};  // id -> [dst ids]
     ids.forEach(id => { inEdges[id] = []; outEdges[id] = []; });
     const edges = (group.internal_edges || []).filter(e => idSet.has(e.from_child) && idSet.has(e.to_child) && e.from_child !== e.to_child);
-    edges.forEach(e => {
+
+    function resolveAncestorInSet(nodeId, idSet) {
+        if (idSet.has(nodeId)) return nodeId;
+        const ancestors = nodeAncestorGroups.get(nodeId) || [];
+        let result = null;
+        for (let i = 0; i < ancestors.length; i++) {
+            if (idSet.has(ancestors[i])) result = ancestors[i];
+        }
+        return result;
+    }
+
+    const crossLayerEdges = [];
+    for (const e of (DATA.edges || [])) {
+        const f = resolveAncestorInSet(e.from, idSet);
+        const t = resolveAncestorInSet(e.to, idSet);
+        if (f && t && f !== t) {
+            crossLayerEdges.push({ from_child: f, to_child: t });
+        }
+    }
+
+    const allEdgesForRank = [...edges];
+    const edgeKeySet = new Set(edges.map(e => `${e.from_child}:${e.to_child}`));
+    for (const e of crossLayerEdges) {
+        const k = `${e.from_child}:${e.to_child}`;
+        if (!edgeKeySet.has(k)) {
+            allEdgesForRank.push(e);
+            edgeKeySet.add(k);
+        }
+    }
+
+    allEdgesForRank.forEach(e => {
         outEdges[e.from_child].push(e.to_child);
         inEdges[e.to_child].push(e.from_child);
     });
@@ -567,7 +597,7 @@ function computeRanks(group) {
         if (inEdges[id].length === 0) { rank[id] = 0; queue.push(id); }
     });
     // Iterative relaxation, guarded by an iteration cap to avoid infinite loops
-    let safety = ids.length * (edges.length + 4) + 16;
+    let safety = ids.length * (allEdgesForRank.length + 4) + 16;
     while (queue.length && safety-- > 0) {
         const u = queue.shift();
         const ru = rank[u] || 0;
@@ -594,7 +624,7 @@ function computeRanks(group) {
         }
     }
 
-    return { rank, edges, callIndex };
+    return { rank, edges: allEdgesForRank, callIndex };
 }
 
 // Order children within each rank using the median heuristic to reduce
