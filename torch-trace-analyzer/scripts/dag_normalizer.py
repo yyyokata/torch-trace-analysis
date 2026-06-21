@@ -57,8 +57,9 @@ def _normalize_containers_recursive(
         if node.metadata.get("is_synthetic"):
             continue
         child_scope_frames_prefix = ("forward",)
-        child_allow_function_grouping = not node.metadata.get("is_container", False)
-        child_allow_callloc_grouping = not node.metadata.get("is_container", False)
+        _skip_grouping = node.metadata.get("is_container", False) or node.is_native
+        child_allow_function_grouping = not _skip_grouping
+        child_allow_callloc_grouping = not _skip_grouping
         _normalize_containers_recursive(
             node.inner_dag,
             registry,
@@ -207,7 +208,7 @@ def _build_function_group_node(
         call_loc=representative_node.call_loc,
         attr=ModuleAttr(
             attr_name=helper_name,
-            class_name="SyntheticFunctionGroup",
+            class_name=helper_name,
             def_loc=CallLoc(file=leaf_frame.file, line=leaf_frame.line, col=0),
         ),
         metadata={"is_synthetic": True, "synthetic_type": "function_group"},
@@ -229,11 +230,15 @@ def _apply_function_grouping_b(
     registry: dict[int, DagNode],
     parent_func: str,
 ) -> None:
-    buckets: dict[tuple[str, int], list[int]] = {}
-    bucket_order: list[tuple[str, int]] = []
+    buckets: dict[tuple[str, str], list[int]] = {}
+    bucket_order: list[tuple[str, str]] = []
     for node_id in list(dag.direct_nodes):
         node = registry[node_id]
-        key = (node.call_loc.file, node.call_loc.line)
+        frames = node.call_loc.frames
+        if not frames:
+            continue
+        function_name = frames[-1].function_name
+        key = (node.call_loc.file, function_name)
         if key not in buckets:
             buckets[key] = []
             bucket_order.append(key)
@@ -247,12 +252,17 @@ def _apply_function_grouping_b(
             continue
         representative_node = registry[member_ids[0]]
         member_id_set = set(member_ids)
+        function_name = key[1]
+        lines = [registry[node_id].call_loc.line for node_id in member_ids]
+        min_line = min(lines)
+        max_line = max(lines)
+        group_name = f"{function_name}:{min_line}~{max_line}"
         group_node = ModuleNode(
             node_id=_next_node_id(registry),
             call_loc=representative_node.call_loc,
             attr=ModuleAttr(
-                attr_name=f"{parent_func}:{key[1]}",
-                class_name="SyntheticCallLocLineGroup",
+                attr_name=group_name,
+                class_name=group_name,
             ),
             metadata={"is_synthetic": True, "synthetic_type": "callloc_group"},
             inner_dag=DAG(
