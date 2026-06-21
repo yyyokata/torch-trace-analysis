@@ -230,29 +230,76 @@ def _apply_function_grouping_b(
     registry: dict[int, DagNode],
     parent_func: str,
 ) -> None:
-    buckets: dict[tuple[str, str], list[int]] = {}
-    bucket_order: list[tuple[str, str]] = []
-    for node_id in list(dag.direct_nodes):
-        node = registry[node_id]
-        frames = node.call_loc.frames
-        if not frames:
-            continue
-        function_name = frames[-1].function_name
-        key = (node.call_loc.file, function_name)
-        if key not in buckets:
-            buckets[key] = []
-            bucket_order.append(key)
-        buckets[key].append(node_id)
+    segments: list[list[int]] = []
+    current_seg: list[int] = []
+    current_key: tuple[str, str] | None = None
+    order = list(getattr(dag, "call_order", None) or [])
+    has_functional_direct = any(
+        isinstance(registry[node_id].attr, FunctionalAttr) for node_id in dag.direct_nodes
+    )
+    has_nonfunctional_direct = any(
+        not isinstance(registry[node_id].attr, FunctionalAttr) for node_id in dag.direct_nodes
+    )
+    if not order and has_functional_direct and has_nonfunctional_direct:
+        local_node_ids: set[int] = set(dag.direct_nodes)
+        seed_order: list[int] = list(dag.direct_nodes)
+        for edge in dag.edges:
+            if edge.src_id not in local_node_ids:
+                local_node_ids.add(edge.src_id)
+                seed_order.append(edge.src_id)
+            if edge.dst_id not in local_node_ids:
+                local_node_ids.add(edge.dst_id)
+                seed_order.append(edge.dst_id)
+        indegree = {node_id: 0 for node_id in local_node_ids}
+        outgoing: dict[int, list[int]] = {node_id: [] for node_id in local_node_ids}
+        for edge in dag.edges:
+            if edge.src_id not in local_node_ids or edge.dst_id not in local_node_ids:
+                continue
+            outgoing[edge.src_id].append(edge.dst_id)
+            indegree[edge.dst_id] += 1
+        zero_indegree = [node_id for node_id in seed_order if indegree[node_id] == 0]
+        topo_order: list[int] = []
+        while zero_indegree:
+            node_id = zero_indegree.pop(0)
+            topo_order.append(node_id)
+            for dst_id in outgoing[node_id]:
+                indegree[dst_id] -= 1
+                if indegree[dst_id] == 0:
+                    zero_indegree.append(dst_id)
+        order = topo_order or list(dag.direct_nodes)
+    if not order:
+        order = list(dag.direct_nodes)
 
-    for key in bucket_order:
-        member_ids = buckets[key]
-        if len(member_ids) < 2:
-            continue
-        if not all(isinstance(registry[node_id].attr, FunctionalAttr) for node_id in member_ids):
-            continue
+    for node_id in order:
+        node = registry[node_id]
+        frames = node.call_loc.frames if node.call_loc is not None else ()
+        if (
+            isinstance(node.attr, FunctionalAttr)
+            and node.call_loc is not None
+            and frames
+        ):
+            function_name = frames[-1].function_name
+            key = (node.call_loc.file, function_name)
+            if key == current_key:
+                current_seg.append(node_id)
+            else:
+                if len(current_seg) >= 2:
+                    segments.append(current_seg)
+                current_seg = [node_id]
+                current_key = key
+        else:
+            if len(current_seg) >= 2:
+                segments.append(current_seg)
+            current_seg = []
+            current_key = None
+
+    if len(current_seg) >= 2:
+        segments.append(current_seg)
+
+    for member_ids in segments:
         representative_node = registry[member_ids[0]]
         member_id_set = set(member_ids)
-        function_name = key[1]
+        function_name = representative_node.call_loc.frames[-1].function_name
         lines = [registry[node_id].call_loc.line for node_id in member_ids]
         min_line = min(lines)
         max_line = max(lines)
