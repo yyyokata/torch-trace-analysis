@@ -1465,6 +1465,10 @@ async function render() {
                 hoveredEdgeIdx = hoveredEdges.findIndex(item => item.key === key);
                 if (hoveredEdgeIdx < 0) hoveredEdgeIdx = 0;
                 hoveredEdgeKey = hoveredEdges.length > 0 ? hoveredEdges[hoveredEdgeIdx].key : key;
+                if (hoveredEdges.length > 0) {
+                    const firstPath = hoveredEdges[hoveredEdgeIdx].path;
+                    firstPath.parentNode && firstPath.parentNode.appendChild(firstPath);
+                }
                 applyEdgeFocusState();
                 if (hoveredEdges.length > 1) showOverlapBadge(e, hoveredEdgeIdx, hoveredEdges.length);
                 path._overlapMoveHandler = (ev) => {
@@ -1492,6 +1496,8 @@ async function render() {
                 e.preventDefault();
                 hoveredEdgeIdx = (hoveredEdgeIdx + (e.deltaY > 0 ? 1 : -1) + hoveredEdges.length) % hoveredEdges.length;
                 hoveredEdgeKey = hoveredEdges[hoveredEdgeIdx].key;
+                const activePath = hoveredEdges[hoveredEdgeIdx].path;
+                activePath.parentNode && activePath.parentNode.appendChild(activePath);
                 applyEdgeFocusState();
                 updateOverlapBadge();
                 showEdgePanel(hoveredEdges[hoveredEdgeIdx].edge);
