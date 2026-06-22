@@ -78,15 +78,6 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 .dag-svg .edge-path.internal { stroke: rgba(100,181,246,0.46); stroke-width: 1.35; }
 .dag-svg .edge-path.dep { stroke: rgba(46,204,113,0.62); stroke-width: 1.9; }
 .dag-svg .edge-path.flow { stroke: rgba(255,255,255,0.28); stroke-width: 1.35; stroke-dasharray: 4,3; }
-.dag-svg .edge-path.edge-dim { opacity: 0.14 !important; filter: saturate(0.7); }
-.dag-svg .edge-path.edge-active { opacity: 1 !important; }
-.dag-svg .edge-path.dep.edge-active { stroke: #7CFFB2 !important; }
-.dag-svg .edge-path.flow.edge-active { stroke: #FFD166 !important; }
-.dag-svg .edge-path.internal.edge-active { stroke: #7FD1FF !important; }
-.dag-svg .leaf-node.node-dim, .dag-svg .group-box.node-dim, .dag-svg .io-node.node-dim { opacity: 0.25; }
-.dag-svg .group-label.node-dim, .dag-svg .group-timing.node-dim { opacity: 0.25; }
-.dag-svg .leaf-node.node-active, .dag-svg .group-box.node-active, .dag-svg .io-node.node-active { stroke: #FFD166 !important; stroke-width: 3 !important; opacity: 1 !important; }
-.dag-svg .group-label.node-active, .dag-svg .group-timing.node-active { opacity: 1 !important; }
 .dag-svg .port { fill: rgba(255,255,255,0.15); stroke: rgba(255,255,255,0.3); stroke-width: 1; }
 .tooltip { position: fixed; background: #16213e; border: 1px solid rgba(100,181,246,0.3); border-radius: 8px; padding: 10px 14px; font-size: 11px; color: #e0e0e0; pointer-events: none; z-index: 1000; max-width: 300px; box-shadow: 0 4px 20px rgba(0,0,0,0.4); opacity: 0; transition: opacity 0.15s; }
 .tooltip.visible { opacity: 1; }
@@ -379,36 +370,65 @@ function getActiveEdgeItems() {
 
 function setEdgeItemFocusState(item, state) {
     if (!item || !item.path) return;
+    const p = item.path;
     if (state === 'active') {
-        item.path.classList.add('edge-active');
-        item.path.classList.remove('edge-dim');
-        syncLongEdgeDisplay(item.path, true);
+        p.style.setProperty('opacity', '1', 'important');
+        p.style.removeProperty('filter');
+        let activeStroke = null;
+        if (p.classList.contains('dep')) activeStroke = '#7CFFB2';
+        else if (p.classList.contains('flow')) activeStroke = '#FFD166';
+        else if (p.classList.contains('internal')) activeStroke = '#7FD1FF';
+        if (activeStroke) p.style.setProperty('stroke', activeStroke, 'important');
+        else p.style.removeProperty('stroke');
+        syncLongEdgeDisplay(p, true);
         return;
     }
     if (state === 'dim') {
-        item.path.classList.remove('edge-active');
-        item.path.classList.add('edge-dim');
-        syncLongEdgeDisplay(item.path, false);
+        p.style.setProperty('opacity', '0.14', 'important');
+        p.style.setProperty('filter', 'saturate(0.7)', 'important');
+        p.style.removeProperty('stroke');
+        syncLongEdgeDisplay(p, false);
         return;
     }
-    item.path.classList.remove('edge-active', 'edge-dim');
-    syncLongEdgeDisplay(item.path, false);
+    p.style.removeProperty('opacity');
+    p.style.removeProperty('filter');
+    p.style.removeProperty('stroke');
+    syncLongEdgeDisplay(p, false);
+}
+
+function _applyNodeFocusStyle(el, state) {
+    const isRect = el.classList.contains('leaf-node') ||
+                   el.classList.contains('group-box') ||
+                   el.classList.contains('io-node');
+    const isText = el.classList.contains('group-label') ||
+                   el.classList.contains('group-timing');
+    if (state === 'active') {
+        el.style.setProperty('opacity', '1', 'important');
+        if (isRect) {
+            el.style.setProperty('stroke', '#FFD166', 'important');
+            el.style.setProperty('stroke-width', '3', 'important');
+        }
+        return;
+    }
+    if (state === 'dim') {
+        el.style.setProperty('opacity', '0.25', 'important');
+        if (isRect) {
+            el.style.removeProperty('stroke');
+            el.style.removeProperty('stroke-width');
+        }
+        return;
+    }
+    el.style.removeProperty('opacity');
+    if (isRect) {
+        el.style.removeProperty('stroke');
+        el.style.removeProperty('stroke-width');
+    }
 }
 
 function setNodeFocusStateById(nodeId, state) {
     const els = nodeDomRegistry.get(nodeId) || [];
     for (const el of els) {
-        if (state === 'active') {
-            el.classList.add('node-active');
-            el.classList.remove('node-dim');
-            continue;
-        }
-        if (state === 'dim') {
-            el.classList.remove('node-active');
-            el.classList.add('node-dim');
-            continue;
-        }
-        el.classList.remove('node-active', 'node-dim');
+        _applyNodeFocusStyle(el, state);
     }
 }
 
@@ -417,17 +437,7 @@ function setGroupFocusStateById(gid, state) {
     if (!dom) return;
     for (const el of Object.values(dom)) {
         if (!el) continue;
-        if (state === 'active') {
-            el.classList.add('node-active');
-            el.classList.remove('node-dim');
-            continue;
-        }
-        if (state === 'dim') {
-            el.classList.remove('node-active');
-            el.classList.add('node-dim');
-            continue;
-        }
-        el.classList.remove('node-active', 'node-dim');
+        _applyNodeFocusStyle(el, state);
     }
 }
 
