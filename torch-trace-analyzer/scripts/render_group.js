@@ -142,109 +142,17 @@ function renderGroupChildren(ctx) {
     }
 }
 
-function buildInternalEdgeRoutingContext(ctx) {
-    const childPositions = ctx.pos.childPositions || [];
-    if (childPositions.length === 0) {
-        return {
-            childAbsRect: {},
-            groupLeft: null,
-            groupRight: null,
-            childLeftEdge: null,
-            childRightEdge: null,
-            skipLaneCounter: {},
-        };
-    }
-
-    const childAbsRect = {};
-    let cMinX = Infinity;
-    let cMaxX = -Infinity;
-    for (const child of childPositions) {
-        const ax = ctx.ox + child.x;
-        childAbsRect[child.id] = {
-            x: ax,
-            y: ctx.oy + child.y,
-            w: child.w,
-            h: child.h,
-            rank: child.rank,
-        };
-        if (ax < cMinX) cMinX = ax;
-        if (ax + child.w > cMaxX) cMaxX = ax + child.w;
-    }
-    return {
-        childAbsRect,
-        groupLeft: Math.max(ctx.ox + 6, cMinX - LAYOUT.laneGutter),
-        groupRight: Math.min(ctx.ox + ctx.pos.w - 6, cMaxX + LAYOUT.laneGutter),
-        childLeftEdge: cMinX,
-        childRightEdge: cMaxX,
-        skipLaneCounter: { left: 0, right: 0 },
-    };
-}
-
-function resolveEdgeEndpointRect(ed, which, routeCtx, ctx) {
-    const portKind = which === 'from' ? ed.from_port : ed.to_port;
-    if (portKind === 'in') {
-        const pt = nodePortMap[ctx.gid + '__in'];
-        if (!pt) {
-            throw new Error(`resolveEdgeEndpointRect: missing in-port for group ${ctx.gid}`);
-        }
-        return { x: pt.cx, y: pt.cy, w: 0, h: 0, rank: -1 };
-    }
-    if (portKind === 'out') {
-        const pt = nodePortMap[ctx.gid + '__out'];
-        if (!pt) {
-            throw new Error(`resolveEdgeEndpointRect: missing out-port for group ${ctx.gid}`);
-        }
-        return { x: pt.cx, y: pt.cy, w: 0, h: 0, rank: -1 };
-    }
-    const childKey = which === 'from' ? ed.from_child : ed.to_child;
-    const rect = routeCtx.childAbsRect[childKey];
-    if (!rect) {
-        return null;
-    }
-    return rect;
-}
-
-function renderGroupInternalEdges(ctx, routeCtx) {
-    if (!(ctx.g.internal_edges && ctx.pos.rowLayouts)) return;
-    for (const ed of ctx.g.internal_edges) {
-        const fr = resolveEdgeEndpointRect(ed, 'from', routeCtx, ctx);
-        const to = resolveEdgeEndpointRect(ed, 'to', routeCtx, ctx);
-        if (!fr || !to) {
-            console.warn('[renderGroupInternalEdges] missing child rect for edge:', ed);
-            continue;
-        }
-        const routedEdge = {
-            __internal: true,
-            __gid: ctx.gid,
-            from: ed.from_port ? (ctx.gid + '__' + ed.from_port) : ed.from_child,
-            to: ed.to_port ? (ctx.gid + '__' + ed.to_port) : ed.to_child,
-            type: ed.type || 'internal',
-            from_node: ed.from_node,
-            to_node: ed.to_node,
-            parent_class: ed.parent_class || ctx.g.class_name,
-            flows: ed.flows,
-        };
-        if (!isEdgeVisible(routedEdge)) continue;
-        renderEdge({
-            routingMode: 'intra_group',
-            fr,
-            to,
-            type: ed.type,
-            edgeData: routedEdge,
-            routeCtx: {
-                groupLeft: routeCtx.groupLeft,
-                groupRight: routeCtx.groupRight,
-                childLeftEdge: routeCtx.childLeftEdge,
-                childRightEdge: routeCtx.childRightEdge,
-                skipLaneCounter: routeCtx.skipLaneCounter,
-            },
-        });
-    }
-}
-
 function registerExpandedGroupPorts(ctx) {
-    nodePortMap[ctx.gid + '__in'] = { cx: ctx.ox + ctx.pos.w / 2, cy: ctx.oy };
-    nodePortMap[ctx.gid + '__out'] = { cx: ctx.ox + ctx.pos.w / 2, cy: ctx.oy + ctx.pos.h };
+    const inPoint = { cx: ctx.ox + ctx.pos.w / 2, cy: ctx.oy };
+    const outPoint = { cx: ctx.ox + ctx.pos.w / 2, cy: ctx.oy + ctx.pos.h };
+    nodePortMap[ctx.gid + '__in'] = inPoint;
+    nodePortMap[ctx.gid + '__out'] = outPoint;
+    for (const port of (ctx.g.in_ports || [])) {
+        nodePortMap[port.node_id] = inPoint;
+    }
+    for (const port of (ctx.g.out_ports || [])) {
+        nodePortMap[port.node_id] = outPoint;
+    }
 }
 
 function renderGroupAt(gid, ox, oy) {
@@ -263,11 +171,7 @@ function renderGroupAt(gid, ox, oy) {
     RENDER_GROUP_EXPORTS.renderExpandedGroupInfoButton(ctx, headerText);
     RENDER_GROUP_EXPORTS.renderExpandedGroupTiming(ctx);
     RENDER_GROUP_EXPORTS.renderGroupChildren(ctx);
-    const routeCtx = RENDER_GROUP_EXPORTS.buildInternalEdgeRoutingContext(ctx);
-    // Register this group's own __in/__out ports BEFORE rendering internal edges,
-    // because port-routed internal edges (from_port/to_port) resolve against them.
     RENDER_GROUP_EXPORTS.registerExpandedGroupPorts(ctx);
-    RENDER_GROUP_EXPORTS.renderGroupInternalEdges(ctx, routeCtx);
 }
 
 Object.assign(RENDER_GROUP_EXPORTS, {
@@ -282,9 +186,6 @@ Object.assign(RENDER_GROUP_EXPORTS, {
     renderExpandedGroupInfoButton,
     renderExpandedGroupTiming,
     renderGroupChildren,
-    buildInternalEdgeRoutingContext,
-    resolveEdgeEndpointRect,
-    renderGroupInternalEdges,
     registerExpandedGroupPorts,
     renderGroupAt,
 });

@@ -291,24 +291,7 @@ function bundleKey(direction, nid) {
 }
 
 function collectAllRenderableEdges() {
-    const allEdges = [];
-    for (const e of (DATA.edges || [])) allEdges.push(e);
-    for (const g of (DATA.groups || [])) {
-        for (const e of (g.internal_edges || [])) {
-            allEdges.push({
-                __internal: true,
-                __gid: g.id,
-                from: e.from_child,
-                to: e.to_child,
-                type: e.type || 'internal',
-                from_node: e.from_node,
-                to_node: e.to_node,
-                parent_class: e.parent_class,
-                flows: e.flows,
-            });
-        }
-    }
-    return allEdges;
+    return [...(DATA.edges || [])];
 }
 
 function buildEdgeBundleState() {
@@ -655,8 +638,8 @@ const LAYOUT = {
     maxRowWidth: 1100  // soft cap; ranks wider than this are wrapped onto multiple rows
 };
 
-// Compute longest-path rank for each child of a group based on its
-// internal_edges. Roots (no incoming edge) get rank 0; rank(v) = max(rank(u)+1)
+// Compute longest-path rank for each child of a group based on visible data-flow
+// edges. Roots (no incoming edge) get rank 0; rank(v) = max(rank(u)+1)
 // over all edges u→v. This produces a layered DAG layout where data flows
 // strictly top-to-bottom and siblings of the same rank line up horizontally.
 function computeRanks(group) {
@@ -666,40 +649,36 @@ function computeRanks(group) {
     const inEdges = {};   // id -> [src ids]
     const outEdges = {};  // id -> [dst ids]
     ids.forEach(id => { inEdges[id] = []; outEdges[id] = []; });
-    const edges = (group.internal_edges || []).filter(e => idSet.has(e.from_child) && idSet.has(e.to_child) && e.from_child !== e.to_child);
 
-    function resolveAncestorInSet(nodeId, idSet) {
-        if (idSet.has(nodeId)) return nodeId;
+    function resolveAncestorInSet(nodeId, candidateSet) {
+        if (candidateSet.has(nodeId)) return nodeId;
         const ancestors = nodeAncestorGroups.get(nodeId) || [];
         let result = null;
         for (let i = 0; i < ancestors.length; i++) {
-            if (idSet.has(ancestors[i])) result = ancestors[i];
+            if (candidateSet.has(ancestors[i])) result = ancestors[i];
         }
         return result;
     }
 
-    const crossLayerEdges = [];
+    const edges = [];
+    const edgeKeySet = new Set();
     for (const e of (DATA.edges || [])) {
-        const f = resolveAncestorInSet(e.from, idSet);
-        const t = resolveAncestorInSet(e.to, idSet);
-        if (f && t && f !== t) {
-            crossLayerEdges.push({ from_child: f, to_child: t });
+        const fromId = resolveAncestorInSet(e.from, idSet);
+        const toId = resolveAncestorInSet(e.to, idSet);
+        if (!fromId || !toId || fromId === toId) {
+            continue;
         }
+        const key = `${fromId}:${toId}`;
+        if (edgeKeySet.has(key)) {
+            continue;
+        }
+        edgeKeySet.add(key);
+        edges.push({ from: fromId, to: toId });
     }
 
-    const allEdgesForRank = [...edges];
-    const edgeKeySet = new Set(edges.map(e => `${e.from_child}:${e.to_child}`));
-    for (const e of crossLayerEdges) {
-        const k = `${e.from_child}:${e.to_child}`;
-        if (!edgeKeySet.has(k)) {
-            allEdgesForRank.push(e);
-            edgeKeySet.add(k);
-        }
-    }
-
-    allEdgesForRank.forEach(e => {
-        outEdges[e.from_child].push(e.to_child);
-        inEdges[e.to_child].push(e.from_child);
+    edges.forEach(e => {
+        outEdges[e.from].push(e.to);
+        inEdges[e.to].push(e.from);
     });
 
     // Topological-ish longest-path rank assignment with cycle safety.
@@ -712,7 +691,7 @@ function computeRanks(group) {
         if (inEdges[id].length === 0) { rank[id] = 0; queue.push(id); }
     });
     // Iterative relaxation, guarded by an iteration cap to avoid infinite loops
-    let safety = ids.length * (allEdgesForRank.length + 4) + 16;
+    let safety = ids.length * (edges.length + 4) + 16;
     while (queue.length && safety-- > 0) {
         const u = queue.shift();
         const ru = rank[u] || 0;
@@ -739,7 +718,7 @@ function computeRanks(group) {
         }
     }
 
-    return { rank, edges: allEdgesForRank, callIndex };
+    return { rank, edges, callIndex };
 }
 
 // Order children within each rank using the median heuristic to reduce
@@ -765,8 +744,8 @@ function orderRanks(rankInfo, childSizes) {
     const buildAdj = () => {
         const inAdj = {}, outAdj = {};
         edges.forEach(e => {
-            (outAdj[e.from_child] = outAdj[e.from_child] || []).push(e.to_child);
-            (inAdj[e.to_child] = inAdj[e.to_child] || []).push(e.from_child);
+            (outAdj[e.from] = outAdj[e.from] || []).push(e.to);
+            (inAdj[e.to] = inAdj[e.to] || []).push(e.from);
         });
         return { inAdj, outAdj };
     };
@@ -887,12 +866,13 @@ function layoutGroup(gid) {
     // space on both sides so the rank-aware edge router has clear routing
     // lanes without crossing children.
     let hasSkipEdges = false;
-    if (g.internal_edges && g.internal_edges.length) {
+    {
         const rankOf = rankInfo.rank;
-        for (const ed of g.internal_edges) {
-            const ra = rankOf[ed.from_child], rb = rankOf[ed.to_child];
+        for (const ed of rankInfo.edges) {
+            const ra = rankOf[ed.from], rb = rankOf[ed.to];
             if (ra !== undefined && rb !== undefined && Math.abs(rb - ra) > 1) {
-                hasSkipEdges = true; break;
+                hasSkipEdges = true;
+                break;
             }
         }
     }
@@ -1591,28 +1571,13 @@ async function render() {
             return tasks;
         }
 
-        function collectInternalEdgeTasks(items) {
+        function collectGlobalEdgeTasks() {
             const tasks = [];
-            function visitGroup(gid, ox, oy) {
-                const ctx = RENDER_GROUP_EXPORTS.getGroupRenderContext(gid, ox, oy);
-                if (!ctx || !ctx.pos) {
-                    throw new Error(`collectInternalEdgeTasks missing layout for group: ${gid}`);
+            for (const edge of (DATA.edges || [])) {
+                if (!isEdgeVisible(edge)) {
+                    continue;
                 }
-                if (ctx.pos.collapsed) {
-                    return;
-                }
-                for (const child of (ctx.pos.childPositions || [])) {
-                    if (child.type === 'group') {
-                        visitGroup(child.id, ctx.ox + child.x, ctx.oy + child.y);
-                    }
-                }
-                const routeCtx = RENDER_GROUP_EXPORTS.buildInternalEdgeRoutingContext(ctx);
-                for (const edgeDef of (ctx.g.internal_edges || [])) {
-                    tasks.push({ type: 'edge', taskKind: 'internal_edge', ctx, routeCtx, edgeDef });
-                }
-            }
-            for (const item of items) {
-                visitGroup(item.id, item.x, item.y);
+                tasks.push({ type: 'edge', taskKind: 'global_edge', edgeData: edge });
             }
             return tasks;
         }
@@ -1875,52 +1840,11 @@ async function render() {
             allowedTypes: ['group', 'node', 'io'],
         });
 
-        const internalEdgeTasks = collectInternalEdgeTasks(rootPositions);
-        const globalEdgeTasks = [];
-        for (const edge of DATA.edges) {
-            if (!isEdgeVisible(edge)) continue;
-            globalEdgeTasks.push({ type: 'edge', taskKind: 'global_edge', edgeData: edge });
-        }
+        const globalEdgeTasks = collectGlobalEdgeTasks();
 
-        await runChunked(internalEdgeTasks.concat(globalEdgeTasks), async (task) => {
+        await runChunked(globalEdgeTasks, async (task) => {
             if (task.type !== 'edge') {
                 throw new Error(`edge renderer got unsupported task type: ${task.type}`);
-            }
-            if (task.taskKind === 'internal_edge') {
-                const fr = RENDER_GROUP_EXPORTS.resolveEdgeEndpointRect(task.edgeDef, 'from', task.routeCtx, task.ctx);
-                const to = RENDER_GROUP_EXPORTS.resolveEdgeEndpointRect(task.edgeDef, 'to', task.routeCtx, task.ctx);
-                if (!fr || !to) {
-                    throw new Error(`internal edge endpoint missing in group ${task.ctx.gid}: ${task.edgeDef.from_child || task.edgeDef.from_port} -> ${task.edgeDef.to_child || task.edgeDef.to_port}`);
-                }
-                const routedEdge = {
-                    __internal: true,
-                    __gid: task.ctx.gid,
-                    from: task.edgeDef.from_port ? (task.ctx.gid + '__' + task.edgeDef.from_port) : task.edgeDef.from_child,
-                    to: task.edgeDef.to_port ? (task.ctx.gid + '__' + task.edgeDef.to_port) : task.edgeDef.to_child,
-                    type: task.edgeDef.type || 'internal',
-                    from_node: task.edgeDef.from_node,
-                    to_node: task.edgeDef.to_node,
-                    parent_class: task.edgeDef.parent_class || task.ctx.g.class_name,
-                    flows: task.edgeDef.flows,
-                };
-                if (!isEdgeVisible(routedEdge)) {
-                    return;
-                }
-                renderEdge({
-                    routingMode: 'intra_group',
-                    fr,
-                    to,
-                    type: task.edgeDef.type,
-                    edgeData: routedEdge,
-                    routeCtx: {
-                        groupLeft: task.routeCtx.groupLeft,
-                        groupRight: task.routeCtx.groupRight,
-                        childLeftEdge: task.routeCtx.childLeftEdge,
-                        childRightEdge: task.routeCtx.childRightEdge,
-                        skipLaneCounter: task.routeCtx.skipLaneCounter,
-                    },
-                });
-                return;
             }
             if (task.taskKind === 'global_edge') {
                 const fromId = resolveCollapsedAncestor(task.edgeData.from);
@@ -2697,8 +2621,7 @@ def _generate_flowchart_html_dual(data_train, data_infer):
     summary = lambda d: {
         "nodes": len(d.get("nodes", [])),
         "groups": len(d.get("groups", [])),
-        "top_edges": len(d.get("edges", [])),
-        "internal_edges": sum(len(g.get("internal_edges", []) or []) for g in d.get("groups", [])),
+        "edges": len(d.get("edges", [])),
     }
     s_train = summary(data_train)
     s_infer = summary(data_infer)
@@ -2730,13 +2653,11 @@ def _generate_flowchart_html_dual(data_train, data_infer):
         '  <button class="iter14-tab active" data-iter14-tab="train" role="tab"'
         ' aria-selected="true" type="button">训练图'
         '<span class="iter14-tab-stats">' + str(s_train["nodes"]) + ' nodes · '
-        + str(s_train["groups"]) + ' groups · ' + str(s_train["top_edges"])
-        + ' top · ' + str(s_train["internal_edges"]) + ' int</span></button>\n'
+        + str(s_train["groups"]) + ' groups · ' + str(s_train["edges"]) + ' edges</span></button>\n'
         '  <button class="iter14-tab" data-iter14-tab="infer" role="tab"'
         ' aria-selected="false" type="button">推理图'
         '<span class="iter14-tab-stats">' + str(s_infer["nodes"]) + ' nodes · '
-        + str(s_infer["groups"]) + ' groups · ' + str(s_infer["top_edges"])
-        + ' top · ' + str(s_infer["internal_edges"]) + ' int</span></button>\n'
+        + str(s_infer["groups"]) + ' groups · ' + str(s_infer["edges"]) + ' edges</span></button>\n'
         '  <div class="iter14-tab-spacer"></div>\n'
         '  <div class="iter14-tab-info">点击 Tab 切换训练/推理 DAG</div>\n'
         '</div>\n'

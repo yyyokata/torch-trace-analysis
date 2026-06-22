@@ -273,7 +273,6 @@ def _build_group_node(
         "call_order": call_order,
         "in_ports": in_ports,
         "out_ports": out_ports,
-        "internal_edges": [],
         **location_fields,
         **_timing_defaults(),
     }
@@ -341,57 +340,8 @@ def _build_non_io_leaf(entry: dict, depth: int) -> dict:
 
 
 def _route_edges(state: _AdapterState) -> list[dict]:
-    def _is_descendant_of(node_id: int, ancestor_group_id: int) -> bool:
-        current = state.parent_group_of_child.get(node_id)
-        while current is not None:
-            if current == ancestor_group_id:
-                return True
-            current = state.parent_group_of_child.get(current)
-        return False
-
-    def _append_internal_edge(
-        *,
-        group_id: int,
-        src_id: int,
-        dst_id: int,
-        src_node: dict,
-        dst_node: dict,
-        edge_type: str,
-        flows: dict | None,
-    ) -> bool:
-        group = state.group_by_id[group_id]
-        internal_edge = {
-            "type": edge_type,
-            "from_node": src_node,
-            "to_node": dst_node,
-            "parent_class": group["class_name"],
-            "flows": flows,
-        }
-        src_port_kind = state.port_kind_by_id.get(src_id)
-        dst_port_kind = state.port_kind_by_id.get(dst_id)
-        if src_port_kind is not None:
-            if src_port_kind != "in":
-                raise RuntimeError(f"edge src_id {src_id} is not a valid group input port")
-            internal_edge["from_port"] = "in"
-        else:
-            internal_edge["from_child"] = src_id
-        if dst_port_kind is not None:
-            if dst_port_kind != "out":
-                raise RuntimeError(f"edge dst_id {dst_id} is not a valid group output port")
-            internal_edge["to_port"] = "out"
-        else:
-            internal_edge["to_child"] = dst_id
-        edge_key = (src_id, dst_id)
-        seen_internal = seen_internal_by_group_id.setdefault(group_id, set())
-        if edge_key in seen_internal:
-            return True
-        seen_internal.add(edge_key)
-        group["internal_edges"].append(internal_edge)
-        return True
-
     global_edges: list[dict] = []
     seen_global: set[tuple[int, int]] = set()
-    seen_internal_by_group_id: dict[int, set[tuple[int, int]]] = {}
     known_ids = set(state.endpoint_by_id)
     for edge in state.raw_edges:
         if "src_id" not in edge:
@@ -410,66 +360,17 @@ def _route_edges(state: _AdapterState) -> list[dict]:
             if dst_id in state.all_serialized_node_ids or edge.get("flows"):
                 continue
             raise RuntimeError(f"edge dst_id {dst_id} not found in node index")
-        edge_type = "dep"
-        src_node = state.endpoint_by_id[src_id]
-        dst_node = state.endpoint_by_id[dst_id]
-        parent_src = state.parent_group_of_child.get(src_id)
-        parent_dst = state.parent_group_of_child.get(dst_id)
-
-        if parent_src is not None and parent_src == parent_dst:
-            _append_internal_edge(
-                group_id=parent_src,
-                src_id=src_id,
-                dst_id=dst_id,
-                src_node=src_node,
-                dst_node=dst_node,
-                edge_type=edge_type,
-                flows=edge.get("flows"),
-            )
-            continue
-
-        src_port_kind = state.port_kind_by_id.get(src_id)
-        dst_port_kind = state.port_kind_by_id.get(dst_id)
-        if src_port_kind is not None:
-            port_parent = state.parent_group_of_child[src_id]
-            if _is_descendant_of(dst_id, port_parent):
-                _append_internal_edge(
-                    group_id=port_parent,
-                    src_id=src_id,
-                    dst_id=dst_id,
-                    src_node=src_node,
-                    dst_node=dst_node,
-                    edge_type=edge_type,
-                    flows=edge.get("flows"),
-                )
-                continue
-        if dst_port_kind is not None:
-            port_parent = state.parent_group_of_child[dst_id]
-            if _is_descendant_of(src_id, port_parent):
-                _append_internal_edge(
-                    group_id=port_parent,
-                    src_id=src_id,
-                    dst_id=dst_id,
-                    src_node=src_node,
-                    dst_node=dst_node,
-                    edge_type=edge_type,
-                    flows=edge.get("flows"),
-                )
-                continue
-
-        resolved_src = state.parent_group_of_child[src_id] if src_id in state.port_kind_by_id else src_id
-        resolved_dst = state.parent_group_of_child[dst_id] if dst_id in state.port_kind_by_id else dst_id
-        edge_key = (resolved_src, resolved_dst)
+        edge_key = (src_id, dst_id)
         if edge_key in seen_global:
             continue
         seen_global.add(edge_key)
         global_edges.append(
             {
-                "from": resolved_src,
-                "to": resolved_dst,
-                "type": edge_type,
-                "from_node": src_node,
-                "to_node": dst_node,
+                "from": src_id,
+                "to": dst_id,
+                "type": "dep",
+                "from_node": state.endpoint_by_id[src_id],
+                "to_node": state.endpoint_by_id[dst_id],
                 "parent_class": "",
                 "flows": edge.get("flows"),
             }
