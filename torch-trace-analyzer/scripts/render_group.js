@@ -1,4 +1,4 @@
-/* global svg, groupMap, groupLayout, nodePortMap, LAYOUT, registerNodeDom, bindGroupHover, toggleGroup, appendGroupInfoButton, formatDur, getGroupBorderColor, isEdgeVisible, renderEdge, renderNodeAt */
+/* global svg, groupMap, groupLayout, nodePortMap, LAYOUT, registerNodeDom, registerGroupDom, bindGroupHover, toggleGroup, appendGroupInfoButton, formatDur, getGroupBorderColor, isEdgeVisible, renderEdge, renderNodeAt */
 // render_group.js
 // Depends on closure variables from the main template:
 //   svg, groupMap, groupLayout, nodePortMap, LAYOUT,
@@ -31,6 +31,7 @@ function renderCollapsedGroupBox(ctx) {
     bindGroupHover(rect, ctx.gid);
     svg.appendChild(rect);
     registerNodeDom(ctx.gid, rect);
+    registerGroupDom(ctx.gid, 'rect', rect);
     return rect;
 }
 
@@ -44,6 +45,7 @@ function renderCollapsedGroupLabel(ctx) {
     labelEl.textContent = labelText;
     bindGroupHover(labelEl, ctx.gid);
     svg.appendChild(labelEl);
+    registerGroupDom(ctx.gid, 'label', labelEl);
     return { labelText, labelEl };
 }
 
@@ -57,6 +59,7 @@ function renderCollapsedGroupTiming(ctx) {
     timingEl.textContent = `Kernel ${ctx.g.pct.toFixed(1)}% · ${formatDur(ctx.g.dur_us)}`;
     bindGroupHover(timingEl, ctx.gid);
     svg.appendChild(timingEl);
+    registerGroupDom(ctx.gid, 'timing', timingEl);
     return timingEl;
 }
 
@@ -99,6 +102,7 @@ function renderExpandedGroupBox(ctx) {
     bindGroupHover(rect, ctx.gid);
     svg.appendChild(rect);
     registerNodeDom(ctx.gid, rect);
+    registerGroupDom(ctx.gid, 'rect', rect);
     return rect;
 }
 
@@ -113,6 +117,7 @@ function renderExpandedGroupHeaderLabel(ctx) {
     labelEl.addEventListener('dblclick', () => toggleGroup(ctx.gid));
     bindGroupHover(labelEl, ctx.gid);
     svg.appendChild(labelEl);
+    registerGroupDom(ctx.gid, 'label', labelEl);
     return { headerText, labelEl };
 }
 
@@ -137,6 +142,7 @@ function renderExpandedGroupTiming(ctx) {
     timingEl.textContent = `Kernel ${ctx.g.pct.toFixed(1)}% · ${formatDur(ctx.g.dur_us)}`;
     bindGroupHover(timingEl, ctx.gid);
     svg.appendChild(timingEl);
+    registerGroupDom(ctx.gid, 'timing', timingEl);
     return timingEl;
 }
 

@@ -83,13 +83,10 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 .dag-svg .edge-path.dep.edge-active { stroke: #7CFFB2 !important; }
 .dag-svg .edge-path.flow.edge-active { stroke: #FFD166 !important; }
 .dag-svg .edge-path.internal.edge-active { stroke: #7FD1FF !important; }
-.dag-svg.svg-has-hover .edge-path { opacity: 0.14; filter: saturate(0.7); }
-.dag-svg.svg-has-hover .edge-path.edge-active { opacity: 1 !important; filter: drop-shadow(0 0 8px rgba(100,181,246,0.35)); }
 .dag-svg .leaf-node.node-dim, .dag-svg .group-box.node-dim, .dag-svg .io-node.node-dim { opacity: 0.25; }
-.dag-svg.svg-has-hover .leaf-node:not(.node-active),
-.dag-svg.svg-has-hover .group-box:not(.node-active),
-.dag-svg.svg-has-hover .io-node:not(.node-active) { opacity: 0.25; }
+.dag-svg .group-label.node-dim, .dag-svg .group-timing.node-dim { opacity: 0.25; }
 .dag-svg .leaf-node.node-active, .dag-svg .group-box.node-active, .dag-svg .io-node.node-active { stroke: #FFD166 !important; stroke-width: 3 !important; filter: drop-shadow(0 0 10px rgba(255,209,102,0.35)); opacity: 1 !important; }
+.dag-svg .group-label.node-active, .dag-svg .group-timing.node-active { opacity: 1 !important; }
 .dag-svg .port { fill: rgba(255,255,255,0.15); stroke: rgba(255,255,255,0.3); stroke-width: 1; }
 .tooltip { position: fixed; background: #16213e; border: 1px solid rgba(100,181,246,0.3); border-radius: 8px; padding: 10px 14px; font-size: 11px; color: #e0e0e0; pointer-events: none; z-index: 1000; max-width: 300px; box-shadow: 0 4px 20px rgba(0,0,0,0.4); opacity: 0; transition: opacity 0.15s; }
 .tooltip.visible { opacity: 1; }
@@ -277,6 +274,7 @@ let hoveredEdgeIdx = 0;
 let hoveredGroupId = null;
 let hoveredNodeId = null;
 let nodeDomRegistry = new Map();
+const groupDomRegistry = new Map();
 let renderGeneration = 0;
 const nodeAncestorGroups = new Map();
 const LONG_EDGE_MIN_SPAN = 260;
@@ -402,6 +400,13 @@ function getAncestorGroups(nodeId) {
     return nodeAncestorGroups.get(nodeId) || [];
 }
 
+function isNodeInGroupScope(nodeId, gid) {
+    if (nodeId == null || gid == null) return false;
+    if (nodeId === gid) return true;
+    const ancs = getAncestorGroups(nodeId);
+    return ancs && ancs.includes(gid);
+}
+
 function isIONodeId(nodeId) {
     if (nodeId === null || nodeId === undefined) return false;
     return (DATA.input_node_ids || []).includes(nodeId)
@@ -465,41 +470,123 @@ function computeActiveNodeIds(activeItems) {
     return new Set([...activeNodeIds, ...activeGroupIds]);
 }
 
-function applyEdgeFocusState() {
-    const newItems = getActiveEdgeItems();
-    const newSet = new Set(newItems.map(item => item.key));
-    const prevSet = new Set(prevActiveItems.map(item => item.key));
-
-    for (const item of prevActiveItems) {
-        if (!newSet.has(item.key)) {
-            item.path.classList.remove('edge-active');
+function applyGroupFocusState(hoveredGid) {
+    if (hoveredGid == null) {
+        for (const item of edgeDomRegistry) {
+            item.path.classList.remove('edge-active', 'edge-dim');
             syncLongEdgeDisplay(item.path, false);
         }
+        for (const els of nodeDomRegistry.values()) {
+            for (const el of els) el.classList.remove('node-active', 'node-dim');
+        }
+        for (const dom of groupDomRegistry.values()) {
+            for (const el of Object.values(dom)) {
+                if (el) el.classList.remove('node-active', 'node-dim');
+            }
+        }
+        return;
     }
-    for (const item of newItems) {
-        if (!prevSet.has(item.key)) {
-            item.path.classList.add('edge-active');
-            syncLongEdgeDisplay(item.path, true);
+
+    const activeEdgeItems = edgeDomRegistry.filter(item => {
+        const f = item.edge.from;
+        const t = item.edge.to;
+        return isNodeInGroupScope(f, hoveredGid) || isNodeInGroupScope(t, hoveredGid);
+    });
+    const activeEdgeKeys = new Set(activeEdgeItems.map(i => i.key));
+
+    const activeNodeIds = new Set();
+    const activeGroupIds = new Set([hoveredGid]);
+    for (const item of activeEdgeItems) {
+        const f = item.edge.from;
+        const t = item.edge.to;
+        if (f != null) {
+            activeNodeIds.add(f);
+            for (const g of getAncestorGroups(f)) activeGroupIds.add(g);
+        }
+        if (t != null) {
+            activeNodeIds.add(t);
+            for (const g of getAncestorGroups(t)) activeGroupIds.add(g);
         }
     }
 
+    for (const item of edgeDomRegistry) {
+        const isActive = activeEdgeKeys.has(item.key);
+        item.path.classList.toggle('edge-active', isActive);
+        item.path.classList.toggle('edge-dim', !isActive);
+        syncLongEdgeDisplay(item.path, isActive);
+    }
+
+    for (const [nid, els] of nodeDomRegistry.entries()) {
+        const isActive = activeNodeIds.has(nid) || activeGroupIds.has(nid);
+        for (const el of els) {
+            el.classList.toggle('node-active', isActive);
+            el.classList.toggle('node-dim', !isActive);
+        }
+    }
+
+    for (const [gid, dom] of groupDomRegistry.entries()) {
+        const isActive = activeGroupIds.has(gid);
+        for (const el of Object.values(dom)) {
+            if (!el) continue;
+            el.classList.toggle('node-active', isActive);
+            el.classList.toggle('node-dim', !isActive);
+        }
+    }
+}
+
+function applyEdgeFocusState() {
+    if (hoveredGroupId != null) {
+        applyGroupFocusState(hoveredGroupId);
+        return;
+    }
+
+    const newItems = getActiveEdgeItems();
+    const activeEdgeKeys = new Set(newItems.map(item => item.key));
     const newNodeIds = computeActiveNodeIds(newItems);
-    for (const id of prevActiveNodeIds) {
-        if (!newNodeIds.has(id)) {
-            const els = nodeDomRegistry.get(id) || [];
-            for (const el of els) el.classList.remove('node-active');
+    const hasActive = newItems.length > 0 || hoveredNodeId != null || focusedEdgePath != null || hoveredEdgeKey != null;
+
+    if (!hasActive) {
+        for (const item of edgeDomRegistry) {
+            item.path.classList.remove('edge-active', 'edge-dim');
+            syncLongEdgeDisplay(item.path, false);
         }
+        for (const els of nodeDomRegistry.values()) {
+            for (const el of els) el.classList.remove('node-active', 'node-dim');
+        }
+        for (const dom of groupDomRegistry.values()) {
+            for (const el of Object.values(dom)) {
+                if (!el) continue;
+                el.classList.remove('node-active', 'node-dim');
+            }
+        }
+        prevActiveItems = [];
+        prevActiveNodeIds = new Set();
+        return;
     }
-    for (const id of newNodeIds) {
-        if (!prevActiveNodeIds.has(id)) {
-            const els = nodeDomRegistry.get(id) || [];
-            for (const el of els) el.classList.add('node-active');
+
+    for (const item of edgeDomRegistry) {
+        const isActive = activeEdgeKeys.has(item.key);
+        item.path.classList.toggle('edge-active', isActive);
+        item.path.classList.toggle('edge-dim', !isActive);
+        syncLongEdgeDisplay(item.path, isActive);
+    }
+
+    for (const [id, els] of nodeDomRegistry.entries()) {
+        const isActive = newNodeIds.has(id);
+        for (const el of els) {
+            el.classList.toggle('node-active', isActive);
+            el.classList.toggle('node-dim', !isActive);
         }
     }
 
-    const hasActive = newItems.length > 0 || hoveredNodeId != null || hoveredGroupId != null;
-    const svg = document.getElementById('dag-svg');
-    if (svg) svg.classList.toggle('svg-has-hover', hasActive);
+    for (const [gid, dom] of groupDomRegistry.entries()) {
+        const isActive = newNodeIds.has(gid);
+        for (const el of Object.values(dom)) {
+            if (!el) continue;
+            el.classList.toggle('node-active', isActive);
+            el.classList.toggle('node-dim', !isActive);
+        }
+    }
 
     prevActiveItems = newItems;
     prevActiveNodeIds = newNodeIds;
@@ -561,6 +648,12 @@ function registerNodeDom(nid, el) {
     if (!nid || !el) return;
     if (!nodeDomRegistry.has(nid)) nodeDomRegistry.set(nid, []);
     nodeDomRegistry.get(nid).push(el);
+}
+
+function registerGroupDom(gid, key, el) {
+    if (!gid || !el) return;
+    if (!groupDomRegistry.has(gid)) groupDomRegistry.set(gid, {});
+    groupDomRegistry.get(gid)[key] = el;
 }
 
 function indexGroupAncestors(groups, ancestors = []) {
@@ -1031,6 +1124,7 @@ async function render() {
         prevActiveItems = [];
         prevActiveNodeIds = new Set();
         nodeDomRegistry = new Map();
+        groupDomRegistry.clear();
         focusedEdgePath = null;
         hoveredEdgeKey = null;
         hoveredEdges = [];
@@ -2522,6 +2616,7 @@ def _generate_flowchart_html_multi(tabs: dict[str, list[dict]]) -> str:
         "    }\n"
         "    try { if (typeof nodeAncestorGroups !== \"undefined\" && nodeAncestorGroups && nodeAncestorGroups.clear) nodeAncestorGroups.clear(); } catch (e) {}\n"
         "    try { if (typeof nodeDomRegistry !== \"undefined\" && nodeDomRegistry && nodeDomRegistry.clear) nodeDomRegistry.clear(); } catch (e) {}\n"
+        "    try { if (typeof groupDomRegistry !== \"undefined\" && groupDomRegistry && groupDomRegistry.clear) groupDomRegistry.clear(); } catch (e) {}\n"
         "    try { if (typeof edgeDomRegistry !== \"undefined\") edgeDomRegistry.length = 0; } catch (e) {}\n"
         "    try { if (typeof edgeByNodeId !== \"undefined\" && edgeByNodeId && edgeByNodeId.clear) edgeByNodeId.clear(); } catch (e) {}\n"
         "    try { if (typeof edgeByGroupId !== \"undefined\" && edgeByGroupId && edgeByGroupId.clear) edgeByGroupId.clear(); } catch (e) {}\n"
@@ -2704,6 +2799,7 @@ def _generate_flowchart_html_dual(data_train, data_infer):
         '    }\n'
         '    try { if (typeof nodeAncestorGroups !== "undefined" && nodeAncestorGroups && nodeAncestorGroups.clear) nodeAncestorGroups.clear(); } catch(e){}\n'
         '    try { if (typeof nodeDomRegistry !== "undefined" && nodeDomRegistry && nodeDomRegistry.clear) nodeDomRegistry.clear(); } catch(e){}\n'
+        '    try { if (typeof groupDomRegistry !== "undefined" && groupDomRegistry && groupDomRegistry.clear) groupDomRegistry.clear(); } catch(e){}\n'
         '    try { if (typeof edgeDomRegistry !== "undefined") edgeDomRegistry.length = 0; } catch(e){}\n'
         '    try { if (typeof edgeByNodeId !== "undefined" && edgeByNodeId && edgeByNodeId.clear) edgeByNodeId.clear(); } catch(e){}\n'
         '    try { if (typeof edgeByGroupId !== "undefined" && edgeByGroupId && edgeByGroupId.clear) edgeByGroupId.clear(); } catch(e){}\n'
