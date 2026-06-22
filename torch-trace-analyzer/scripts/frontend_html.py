@@ -532,8 +532,20 @@ function computeActiveNodeIds(activeItems) {
     return new Set([...activeNodeIds, ...activeGroupIds]);
 }
 
+function clearEdgeHoverFocusState() {
+    for (const item of prevActiveItems) {
+        setEdgeItemFocusState(item, 'clear');
+    }
+    for (const nid of prevActiveNodeIds) {
+        setNodeFocusStateById(nid, 'clear');
+        setGroupFocusStateById(nid, 'clear');
+    }
+    prevActiveItems = [];
+    prevActiveNodeIds = new Set();
+}
+
 function applyGroupFocusState(hoveredGid) {
-    if (hoveredGid === lastHoveredGid) return;
+    clearEdgeHoverFocusState();
     if (hoveredGid == null) {
         for (const key of prevActiveEdgeKeys) {
             setEdgeItemFocusState(edgeDomByKey.get(key), 'clear');
@@ -580,82 +592,54 @@ function applyGroupFocusState(hoveredGid) {
         }
     }
 
-    const isFirstHover = lastHoveredGid == null;
     const combinedActiveNodeIds = new Set([...activeNodeIds, ...activeGroupIds]);
     const nextDimEdgeKeys = new Set();
     const nextDimGroupNodeIds = new Set();
     const nextDimGroupIds = new Set();
 
-    if (isFirstHover) {
-        for (const [key, item] of edgeDomByKey.entries()) {
-            if (activeEdgeKeys.has(key)) {
-                setEdgeItemFocusState(item, 'active');
-            } else {
-                setEdgeItemFocusState(item, 'dim');
-                nextDimEdgeKeys.add(key);
-            }
+    for (const key of prevActiveEdgeKeys) {
+        if (!activeEdgeKeys.has(key)) {
+            setEdgeItemFocusState(edgeDomByKey.get(key), 'dim');
+            nextDimEdgeKeys.add(key);
         }
-        for (const nid of nodeDomRegistry.keys()) {
-            if (combinedActiveNodeIds.has(nid)) {
-                setNodeFocusStateById(nid, 'active');
-            } else {
-                setNodeFocusStateById(nid, 'dim');
-                nextDimGroupNodeIds.add(nid);
-            }
+    }
+    for (const key of activeEdgeKeys) {
+        if (!prevActiveEdgeKeys.has(key) || prevDimEdgeKeys.has(key)) {
+            setEdgeItemFocusState(edgeDomByKey.get(key), 'active');
         }
-        for (const gid of groupDomRegistry.keys()) {
-            if (activeGroupIds.has(gid)) {
-                setGroupFocusStateById(gid, 'active');
-            } else {
-                setGroupFocusStateById(gid, 'dim');
-                nextDimGroupIds.add(gid);
-            }
-        }
-    } else {
-        for (const key of prevActiveEdgeKeys) {
-            if (!activeEdgeKeys.has(key)) {
-                setEdgeItemFocusState(edgeDomByKey.get(key), 'dim');
-                nextDimEdgeKeys.add(key);
-            }
-        }
-        for (const key of activeEdgeKeys) {
-            if (!prevActiveEdgeKeys.has(key)) {
-                setEdgeItemFocusState(edgeDomByKey.get(key), 'active');
-            }
-        }
-        for (const key of prevDimEdgeKeys) {
-            if (!activeEdgeKeys.has(key)) nextDimEdgeKeys.add(key);
-        }
+    }
+    for (const key of prevDimEdgeKeys) {
+        if (!activeEdgeKeys.has(key)) nextDimEdgeKeys.add(key);
+    }
 
-        for (const nid of prevActiveGroupNodeIds) {
-            if (!combinedActiveNodeIds.has(nid)) {
-                setNodeFocusStateById(nid, 'dim');
-                nextDimGroupNodeIds.add(nid);
-            }
+    for (const nid of prevActiveGroupNodeIds) {
+        if (!combinedActiveNodeIds.has(nid)) {
+            setNodeFocusStateById(nid, 'dim');
+            nextDimGroupNodeIds.add(nid);
         }
-        for (const nid of combinedActiveNodeIds) {
-            if (!prevActiveGroupNodeIds.has(nid)) {
-                setNodeFocusStateById(nid, 'active');
-            }
+    }
+    for (const nid of combinedActiveNodeIds) {
+        if (!prevActiveGroupNodeIds.has(nid) || prevDimGroupNodeIds.has(nid)) {
+            setNodeFocusStateById(nid, 'active');
         }
-        for (const nid of prevDimGroupNodeIds) {
-            if (!combinedActiveNodeIds.has(nid)) nextDimGroupNodeIds.add(nid);
-        }
+    }
+    for (const nid of prevDimGroupNodeIds) {
+        if (!combinedActiveNodeIds.has(nid)) nextDimGroupNodeIds.add(nid);
+    }
 
-        for (const gid of prevActiveGroupIds) {
-            if (!activeGroupIds.has(gid)) {
-                setGroupFocusStateById(gid, 'dim');
-                nextDimGroupIds.add(gid);
-            }
+    for (const gid of prevActiveGroupIds) {
+        if (!activeGroupIds.has(gid)) {
+            setGroupFocusStateById(gid, 'dim');
+            nextDimGroupIds.add(gid);
         }
-        for (const gid of activeGroupIds) {
-            if (!prevActiveGroupIds.has(gid)) {
-                setGroupFocusStateById(gid, 'active');
-            }
+    }
+    for (const gid of activeGroupIds) {
+        if (!prevActiveGroupIds.has(gid) || prevDimGroupIds.has(gid)) {
+            setGroupFocusStateById(gid, 'active');
         }
-        for (const gid of prevDimGroupIds) {
-            if (!activeGroupIds.has(gid)) nextDimGroupIds.add(gid);
-        }
+    }
+    for (const gid of prevDimGroupIds) {
+        if (!activeGroupIds.has(gid)) nextDimGroupIds.add(gid);
     }
 
     prevActiveEdgeKeys = activeEdgeKeys;
@@ -672,52 +656,42 @@ function applyEdgeFocusState() {
         applyGroupFocusState(hoveredGroupId);
         return;
     }
+    if (lastHoveredGid != null) {
+        applyGroupFocusState(null);
+    }
 
     const newItems = getActiveEdgeItems();
     const activeEdgeKeys = new Set(newItems.map(item => item.key));
     const newNodeIds = computeActiveNodeIds(newItems);
+    const prevActiveEdgeKeysLocal = new Set(prevActiveItems.map(item => item.key));
     const hasActive = newItems.length > 0 || hoveredNodeId != null || focusedEdgePath != null || hoveredEdgeKey != null;
 
     if (!hasActive) {
-        for (const item of edgeDomRegistry) {
-            item.path.classList.remove('edge-active', 'edge-dim');
-            syncLongEdgeDisplay(item.path, false);
-        }
-        for (const els of nodeDomRegistry.values()) {
-            for (const el of els) el.classList.remove('node-active', 'node-dim');
-        }
-        for (const dom of groupDomRegistry.values()) {
-            for (const el of Object.values(dom)) {
-                if (!el) continue;
-                el.classList.remove('node-active', 'node-dim');
-            }
-        }
-        prevActiveItems = [];
-        prevActiveNodeIds = new Set();
+        clearEdgeHoverFocusState();
         return;
     }
 
-    for (const item of edgeDomRegistry) {
-        const isActive = activeEdgeKeys.has(item.key);
-        item.path.classList.toggle('edge-active', isActive);
-        item.path.classList.toggle('edge-dim', !isActive);
-        syncLongEdgeDisplay(item.path, isActive);
+    for (const item of prevActiveItems) {
+        if (!activeEdgeKeys.has(item.key)) {
+            setEdgeItemFocusState(item, 'clear');
+        }
     }
-
-    for (const [id, els] of nodeDomRegistry.entries()) {
-        const isActive = newNodeIds.has(id);
-        for (const el of els) {
-            el.classList.toggle('node-active', isActive);
-            el.classList.toggle('node-dim', !isActive);
+    for (const item of newItems) {
+        if (!prevActiveEdgeKeysLocal.has(item.key)) {
+            setEdgeItemFocusState(item, 'active');
         }
     }
 
-    for (const [gid, dom] of groupDomRegistry.entries()) {
-        const isActive = newNodeIds.has(gid);
-        for (const el of Object.values(dom)) {
-            if (!el) continue;
-            el.classList.toggle('node-active', isActive);
-            el.classList.toggle('node-dim', !isActive);
+    for (const id of prevActiveNodeIds) {
+        if (!newNodeIds.has(id)) {
+            setNodeFocusStateById(id, 'clear');
+            setGroupFocusStateById(id, 'clear');
+        }
+    }
+    for (const id of newNodeIds) {
+        if (!prevActiveNodeIds.has(id)) {
+            setNodeFocusStateById(id, 'active');
+            setGroupFocusStateById(id, 'active');
         }
     }
 
