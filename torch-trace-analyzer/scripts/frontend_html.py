@@ -570,6 +570,16 @@ function indexGroupAncestors(groups, ancestors = []) {
         for (const nid of (g.children_nodes || [])) {
             nodeAncestorGroups.set(nid, nextAncestors.slice());
         }
+        for (const port of (g.in_ports || [])) {
+            if (port && port.node_id !== null && port.node_id !== undefined) {
+                nodeAncestorGroups.set(port.node_id, nextAncestors.slice());
+            }
+        }
+        for (const port of (g.out_ports || [])) {
+            if (port && port.node_id !== null && port.node_id !== undefined) {
+                nodeAncestorGroups.set(port.node_id, nextAncestors.slice());
+            }
+        }
         indexGroupAncestors((g.children_group_ids || []).map(id => groupMap[id]).filter(g => g != null), nextAncestors);
     }
 }
