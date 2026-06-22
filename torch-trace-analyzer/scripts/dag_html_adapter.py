@@ -242,6 +242,8 @@ def _build_group_node(
             else:
                 children_nodes.append(built.payload["id"])
                 call_order.append({"id": built.payload["id"], "type": "node"})
+        if inner_dag is not None:
+            in_ports, out_ports = _collect_group_ports(inner_dag, state=state, parent_id=node_id)
         node_type = "container_group"
     else:
         inner_dag = entry.get("inner_dag")
