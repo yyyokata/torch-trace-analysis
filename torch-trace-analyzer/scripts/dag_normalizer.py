@@ -148,6 +148,8 @@ def _apply_function_grouping_a(
         if frame_names != scope_frames_prefix:
             continue
         helper_name = frames[len(scope_frames_prefix)].function_name
+        if helper_name == "__call__":
+            continue  # 非 nn.Module 的第三方 class 调用边界，不是用户 helper
         if helper_name not in buckets:
             buckets[helper_name] = []
             bucket_order.append(helper_name)
