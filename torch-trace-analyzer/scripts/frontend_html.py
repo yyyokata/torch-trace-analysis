@@ -512,9 +512,6 @@ function computeActiveNodeIds(activeItems) {
             if (fromIsIO) ioFocusedNodes.add(edge.from);
             if (toIsIO) ioFocusedNodes.add(edge.to);
             const peerNodeId = fromIsIO ? edge.to : edge.from;
-            if (edge.__gid != null) {
-                activeGroupIds.add(edge.__gid);
-            }
             for (const gid of getAncestorGroups(peerNodeId)) {
                 activeGroupIds.add(gid);
             }
@@ -522,9 +519,6 @@ function computeActiveNodeIds(activeItems) {
         }
         activeNodeIds.add(edge.from);
         activeNodeIds.add(edge.to);
-        if (edge.__gid != null) {
-            activeGroupIds.add(edge.__gid);
-        }
         for (const gid of getAncestorGroups(edge.from)) {
             activeGroupIds.add(gid);
         }
@@ -1625,15 +1619,8 @@ async function render() {
             const item = { path, edge: edgeData, key: edgeKey(edgeData) };
             edgeDomRegistry.push(item);
             edgeDomByKey.set(item.key, item);
-            for (const nid of [edgeData.from, edgeData.to]) {
-                if (nid == null) continue;
-                if (!edgeByNodeId.has(nid)) edgeByNodeId.set(nid, []);
-                edgeByNodeId.get(nid).push(item);
-            }
-            if (edgeData.__gid != null) {
-                if (!edgeByGroupId.has(edgeData.__gid)) edgeByGroupId.set(edgeData.__gid, []);
-                edgeByGroupId.get(edgeData.__gid).push(item);
-            }
+            for (const nid of [edgeData.from, edgeData.to]) { if (nid == null) continue; if (!edgeByNodeId.has(nid)) edgeByNodeId.set(nid, []); edgeByNodeId.get(nid).push(item); }
+            for (const nid of [edgeData.from, edgeData.to]) { if (nid == null) continue; for (const gid of (nodeAncestorGroups.get(nid) ?? [])) { if (!edgeByGroupId.has(gid)) edgeByGroupId.set(gid, []); edgeByGroupId.get(gid).push(item); } }
         }
 
         function applyEdgePresentation(path, type, opacity=null) {
