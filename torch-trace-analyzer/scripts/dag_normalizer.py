@@ -157,7 +157,11 @@ def _apply_function_grouping_a(
 
     for helper_name in bucket_order:
         member_ids = buckets[helper_name]
-        if not all(isinstance(registry[node_id].attr, FunctionalAttr) for node_id in member_ids):
+        if not all(
+            isinstance(registry[node_id].attr, FunctionalAttr)
+            or (isinstance(registry[node_id], ModuleNode) and registry[node_id].is_native)
+            for node_id in member_ids
+        ):
             continue
         new_node = _build_function_group_node(
             dag=dag,
@@ -237,10 +241,14 @@ def _apply_function_grouping_b(
     current_key: tuple[str, str] | None = None
     order = list(getattr(dag, "call_order", None) or [])
     has_functional_direct = any(
-        isinstance(registry[node_id].attr, FunctionalAttr) for node_id in dag.direct_nodes
+        isinstance(registry[node_id].attr, FunctionalAttr)
+        or (isinstance(registry[node_id], ModuleNode) and registry[node_id].is_native)
+        for node_id in dag.direct_nodes
     )
     has_nonfunctional_direct = any(
-        not isinstance(registry[node_id].attr, FunctionalAttr) for node_id in dag.direct_nodes
+        not isinstance(registry[node_id].attr, FunctionalAttr)
+        and not (isinstance(registry[node_id], ModuleNode) and registry[node_id].is_native)
+        for node_id in dag.direct_nodes
     )
     if not order and has_functional_direct and has_nonfunctional_direct:
         local_node_ids: set[int] = set(dag.direct_nodes)
@@ -276,7 +284,10 @@ def _apply_function_grouping_b(
         node = registry[node_id]
         frames = node.call_loc.frames if node.call_loc is not None else ()
         if (
-            isinstance(node.attr, FunctionalAttr)
+            (
+                isinstance(node.attr, FunctionalAttr)
+                or (isinstance(node, ModuleNode) and node.is_native)
+            )
             and node.call_loc is not None
             and frames
         ):
