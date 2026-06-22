@@ -1574,8 +1574,21 @@ async function render() {
             return path;
         }
 
-        function finalizeEdgeRendering(path) {
+        function createEdgeHitboxElement(d, key) {
+            const hitbox = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+            hitbox.setAttribute('d', d);
+            hitbox.setAttribute('stroke', 'transparent');
+            hitbox.setAttribute('stroke-width', '20');
+            hitbox.setAttribute('fill', 'none');
+            hitbox.setAttribute('pointer-events', 'stroke');
+            hitbox.setAttribute('opacity', '0');
+            hitbox.setAttribute('data-edge-key', key);
+            return hitbox;
+        }
+
+        function finalizeEdgeRendering(path, hitbox) {
             svg.appendChild(path);
+            if (hitbox) svg.appendChild(hitbox);
             configureLongEdgeDisplay(path);
         }
 
@@ -1589,10 +1602,12 @@ async function render() {
                 throw new Error(`Unknown edge routing mode: ${edgeSpec.routingMode}`);
             }
             if (!pathSpec) return;
+            const key = edgeKey(edgeSpec.edgeData);
             const path = createEdgePathElement(pathSpec.d);
+            const hitbox = createEdgeHitboxElement(pathSpec.d, key);
             applyEdgePresentation(path, edgeSpec.type, pathSpec.opacity ?? null);
-            bindEdgeInteractions(path, edgeSpec.edgeData);
-            finalizeEdgeRendering(path);
+            bindEdgeInteractions(path, hitbox, edgeSpec.edgeData);
+            finalizeEdgeRendering(path, hitbox);
         }
 
         function registerEdgeDom(path, edgeData) {
@@ -1613,6 +1628,7 @@ async function render() {
 
         function applyEdgePresentation(path, type, opacity=null) {
             path.setAttribute('class', `edge-path ${type || ''}`);
+            path.setAttribute('style', 'pointer-events: none');
             if (type === 'dep') {
                 path.setAttribute('marker-end', 'url(#arrowhead-dep)');
             } else if (type === 'internal') {
@@ -1650,29 +1666,29 @@ async function render() {
             badge.textContent = `${hoveredEdgeIdx + 1}/${hoveredEdges.length}  ·  scroll to switch`;
         }
 
-        function bindEdgeInteractions(path, edgeData) {
-            if (!path || !edgeData) return;
-            const key = edgeKey(edgeData);
-            path.style.cursor = 'pointer';
-            path.dataset.edgeKey = key;
-            path.addEventListener('mouseenter', (e) => {
-                const pt = svg.createSVGPoint();
-                pt.x = e.clientX;
-                pt.y = e.clientY;
-                const svgPt = pt.matrixTransform(svg.getScreenCTM().inverse());
-
-                const seen = new Set();
-                hoveredEdges = edgeDomRegistry.filter(item => {
-                    if (!item.path) return false;
-                    const saved = item.path.getAttribute('stroke-width');
-                    item.path.setAttribute('stroke-width', '20');
-                    const hit = item.path.isPointInStroke(svgPt);
-                    item.path.setAttribute('stroke-width', saved ?? '2');
-                    if (!hit) return false;
-                    if (seen.has(item.key)) return false;
-                    seen.add(item.key);
+        function getHoveredEdgesFromEvent(e) {
+            const hitEls = document.elementsFromPoint(e.clientX, e.clientY);
+            const seen = new Set();
+            return hitEls
+                .filter(el => el && typeof el.hasAttribute === 'function' && el.hasAttribute('data-edge-key'))
+                .map(el => el.getAttribute('data-edge-key'))
+                .filter(key => {
+                    if (!key || seen.has(key)) return false;
+                    seen.add(key);
                     return true;
-                });
+                })
+                .map(key => edgeDomByKey.get(key))
+                .filter(Boolean);
+        }
+
+        function bindEdgeInteractions(path, hitbox, edgeData) {
+            if (!path || !edgeData || !hitbox) return;
+            const key = edgeKey(edgeData);
+            const hoverTargets = [path, hitbox];
+            path._hitbox = hitbox;
+
+            const handleMouseEnter = (e) => {
+                hoveredEdges = getHoveredEdgesFromEvent(e);
                 hoveredEdgeIdx = hoveredEdges.findIndex(item => item.key === key);
                 if (hoveredEdgeIdx < 0) hoveredEdgeIdx = 0;
                 hoveredEdgeKey = hoveredEdges.length > 0 ? hoveredEdges[hoveredEdgeIdx].key : key;
@@ -1682,27 +1698,44 @@ async function render() {
                 }
                 applyEdgeFocusState();
                 if (hoveredEdges.length > 1) showOverlapBadge(e, hoveredEdgeIdx, hoveredEdges.length);
-                path._overlapMoveHandler = (ev) => {
+                const handleMouseMove = (ev) => {
+                    const nextHoveredEdges = getHoveredEdgesFromEvent(ev);
+                    if (nextHoveredEdges.length > 0) {
+                        hoveredEdges = nextHoveredEdges;
+                        const matchedIdx = hoveredEdges.findIndex(item => item.key === hoveredEdgeKey);
+                        if (matchedIdx >= 0) {
+                            hoveredEdgeIdx = matchedIdx;
+                        } else if (hoveredEdgeIdx >= hoveredEdges.length) {
+                            hoveredEdgeIdx = hoveredEdges.length - 1;
+                        }
+                    }
                     const badge = document.getElementById('overlap-badge');
                     if (badge && badge.style.display !== 'none') {
                         badge.style.left = (ev.clientX + 14) + 'px';
                         badge.style.top  = (ev.clientY - 10) + 'px';
                     }
                 };
-                path.addEventListener('mousemove', path._overlapMoveHandler);
-            });
-            path.addEventListener('mouseleave', () => {
-                if (path._overlapMoveHandler) {
-                    path.removeEventListener('mousemove', path._overlapMoveHandler);
-                    path._overlapMoveHandler = null;
+                for (const target of hoverTargets) {
+                    target._overlapMoveHandler = handleMouseMove;
+                    target.addEventListener('mousemove', handleMouseMove);
+                }
+            };
+
+            const handleMouseLeave = () => {
+                for (const target of hoverTargets) {
+                    if (target._overlapMoveHandler) {
+                        target.removeEventListener('mousemove', target._overlapMoveHandler);
+                        target._overlapMoveHandler = null;
+                    }
                 }
                 hoveredEdges = [];
                 hoveredEdgeIdx = 0;
                 hoveredEdgeKey = null;
                 hideOverlapBadge();
                 applyEdgeFocusState();
-            });
-            path.addEventListener('wheel', (e) => {
+            };
+
+            const handleWheel = (e) => {
                 if (hoveredEdges.length <= 1) return;
                 e.preventDefault();
                 hoveredEdgeIdx = (hoveredEdgeIdx + (e.deltaY > 0 ? 1 : -1) + hoveredEdges.length) % hoveredEdges.length;
@@ -1712,8 +1745,9 @@ async function render() {
                 applyEdgeFocusState();
                 updateOverlapBadge();
                 showEdgePanel(hoveredEdges[hoveredEdgeIdx].edge);
-            }, { passive: false });
-            path.addEventListener('click', (e) => {
+            };
+
+            const handleClick = (e) => {
                 e.stopPropagation();
                 const alreadyActive = focusedEdgePath === key;
                 if (alreadyActive) {
@@ -1723,7 +1757,14 @@ async function render() {
                     setEdgeFocus(key);
                 }
                 showEdgePanel(edgeData);
-            });
+            };
+
+            for (const target of hoverTargets) {
+                target.addEventListener('mouseenter', handleMouseEnter);
+                target.addEventListener('mouseleave', handleMouseLeave);
+                target.addEventListener('wheel', handleWheel, { passive: false });
+                target.addEventListener('click', handleClick);
+            }
             registerEdgeDom(path, edgeData);
         }
 
