@@ -83,7 +83,12 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 .dag-svg .edge-path.dep.edge-active { stroke: #7CFFB2 !important; }
 .dag-svg .edge-path.flow.edge-active { stroke: #FFD166 !important; }
 .dag-svg .edge-path.internal.edge-active { stroke: #7FD1FF !important; }
+.dag-svg.svg-has-hover .edge-path { opacity: 0.14; filter: saturate(0.7); }
+.dag-svg.svg-has-hover .edge-path.edge-active { opacity: 1 !important; filter: drop-shadow(0 0 8px rgba(100,181,246,0.35)); }
 .dag-svg .leaf-node.node-dim, .dag-svg .group-box.node-dim, .dag-svg .io-node.node-dim { opacity: 0.25; }
+.dag-svg.svg-has-hover .leaf-node:not(.node-active),
+.dag-svg.svg-has-hover .group-box:not(.node-active),
+.dag-svg.svg-has-hover .io-node:not(.node-active) { opacity: 0.25; }
 .dag-svg .leaf-node.node-active, .dag-svg .group-box.node-active, .dag-svg .io-node.node-active { stroke: #FFD166 !important; stroke-width: 3 !important; filter: drop-shadow(0 0 10px rgba(255,209,102,0.35)); opacity: 1 !important; }
 .dag-svg .port { fill: rgba(255,255,255,0.15); stroke: rgba(255,255,255,0.3); stroke-width: 1; }
 .tooltip { position: fixed; background: #16213e; border: 1px solid rgba(100,181,246,0.3); border-radius: 8px; padding: 10px 14px; font-size: 11px; color: #e0e0e0; pointer-events: none; z-index: 1000; max-width: 300px; box-shadow: 0 4px 20px rgba(0,0,0,0.4); opacity: 0; transition: opacity 0.15s; }
@@ -261,6 +266,10 @@ const collapsedState = {};
 let groupLayout = {};
 let nodePortMap = {};
 let edgeDomRegistry = [];
+const edgeByNodeId = new Map();
+const edgeByGroupId = new Map();
+let prevActiveItems = [];
+let prevActiveNodeIds = new Set();
 let focusedEdgePath = null;
 let hoveredEdgeKey = null;
 let hoveredEdges = [];
@@ -371,22 +380,12 @@ function renderBundleWidget(bundleId, cx, cy, direction) {
     return;
 }
 
-function getActiveEdgeKeys() {
-    if (focusedEdgePath) return new Set([focusedEdgePath]);
-    if (hoveredEdgeKey) return new Set([hoveredEdgeKey]);
-    if (hoveredNodeId) {
-        const keys = edgeDomRegistry
-            .filter(item => item.edge && (item.edge.from === hoveredNodeId || item.edge.to === hoveredNodeId))
-            .map(item => item.key);
-        return new Set(keys);
-    }
-    if (hoveredGroupId) {
-        const keys = edgeDomRegistry
-            .filter(item => item.edge && item.edge.__gid === hoveredGroupId)
-            .map(item => item.key);
-        return new Set(keys);
-    }
-    return new Set();
+function getActiveEdgeItems() {
+    if (focusedEdgePath) return edgeDomRegistry.filter(i => i.key === focusedEdgePath);
+    if (hoveredEdgeKey) return edgeDomRegistry.filter(i => i.key === hoveredEdgeKey);
+    if (hoveredNodeId != null) return edgeByNodeId.get(hoveredNodeId) ?? [];
+    if (hoveredGroupId != null) return edgeByGroupId.get(hoveredGroupId) ?? [];
+    return [];
 }
 
 function syncLongEdgeDisplay(path, isActive) {
@@ -428,69 +427,99 @@ function isIONodeId(nodeId) {
         || (DATA.output_node_ids || []).includes(nodeId);
 }
 
-function applyEdgeFocusState() {
-    const activeKeys = getActiveEdgeKeys();
-    const hasActive = activeKeys.size > 0 || !!hoveredNodeId;
-    const relatedNodes = new Set();
-    const relatedGroups = new Set();
+function computeActiveNodeIds(activeItems) {
+    const activeNodeIds = new Set();
+    const activeGroupIds = new Set();
     const ioFocusedNodes = new Set();
     const ioHoverActive = isIONodeId(hoveredNodeId);
-    if (hoveredNodeId) {
+
+    if (hoveredNodeId != null) {
         if (ioHoverActive) {
             ioFocusedNodes.add(hoveredNodeId);
         } else {
-            relatedNodes.add(hoveredNodeId);
+            activeNodeIds.add(hoveredNodeId);
         }
         for (const gid of getAncestorGroups(hoveredNodeId)) {
-            relatedGroups.add(gid);
+            activeGroupIds.add(gid);
         }
     }
-    for (const item of edgeDomRegistry) {
-        const active = activeKeys.has(item.key);
-        item.path.classList.toggle('edge-active', active);
-        item.path.classList.toggle('edge-dim', hasActive && !active);
-        syncLongEdgeDisplay(item.path, active);
-        if (active) {
-            const fromIsIO = isIONodeId(item.edge.from);
-            const toIsIO = isIONodeId(item.edge.to);
-            if (fromIsIO || toIsIO) {
-                if (fromIsIO) ioFocusedNodes.add(item.edge.from);
-                if (toIsIO) ioFocusedNodes.add(item.edge.to);
-                const peerNodeId = fromIsIO ? item.edge.to : item.edge.from;
-                if (item.edge.__gid) {
-                    relatedGroups.add(item.edge.__gid);
-                }
-                for (const gid of getAncestorGroups(peerNodeId)) {
-                    relatedGroups.add(gid);
-                }
-            } else {
-                relatedNodes.add(item.edge.from);
-                relatedNodes.add(item.edge.to);
-                if (item.edge.__gid) {
-                    relatedGroups.add(item.edge.__gid);
-                }
-                for (const gid of getAncestorGroups(item.edge.from)) {
-                    relatedGroups.add(gid);
-                }
-                for (const gid of getAncestorGroups(item.edge.to)) {
-                    relatedGroups.add(gid);
-                }
+
+    for (const item of activeItems) {
+        const edge = item.edge || {};
+        const fromIsIO = isIONodeId(edge.from);
+        const toIsIO = isIONodeId(edge.to);
+        if (fromIsIO || toIsIO) {
+            if (fromIsIO) ioFocusedNodes.add(edge.from);
+            if (toIsIO) ioFocusedNodes.add(edge.to);
+            const peerNodeId = fromIsIO ? edge.to : edge.from;
+            if (edge.__gid != null) {
+                activeGroupIds.add(edge.__gid);
             }
+            for (const gid of getAncestorGroups(peerNodeId)) {
+                activeGroupIds.add(gid);
+            }
+            continue;
+        }
+        activeNodeIds.add(edge.from);
+        activeNodeIds.add(edge.to);
+        if (edge.__gid != null) {
+            activeGroupIds.add(edge.__gid);
+        }
+        for (const gid of getAncestorGroups(edge.from)) {
+            activeGroupIds.add(gid);
+        }
+        for (const gid of getAncestorGroups(edge.to)) {
+            activeGroupIds.add(gid);
         }
     }
+
     for (const nid of ioFocusedNodes) {
-        relatedNodes.add(nid);
+        activeNodeIds.add(nid);
     }
-    if (hoveredGroupId) {
-        relatedGroups.add(hoveredGroupId);
+    if (hoveredGroupId != null) {
+        activeGroupIds.add(hoveredGroupId);
     }
-    for (const [nid, els] of nodeDomRegistry.entries()) {
-        const active = relatedNodes.has(nid) || relatedGroups.has(nid);
-        for (const el of els) {
-            el.classList.toggle('node-active', hasActive && active);
-            el.classList.toggle('node-dim', hasActive && !active);
+    return new Set([...activeNodeIds, ...activeGroupIds]);
+}
+
+function applyEdgeFocusState() {
+    const newItems = getActiveEdgeItems();
+    const newSet = new Set(newItems.map(item => item.key));
+    const prevSet = new Set(prevActiveItems.map(item => item.key));
+
+    for (const item of prevActiveItems) {
+        if (!newSet.has(item.key)) {
+            item.path.classList.remove('edge-active');
+            syncLongEdgeDisplay(item.path, false);
         }
     }
+    for (const item of newItems) {
+        if (!prevSet.has(item.key)) {
+            item.path.classList.add('edge-active');
+            syncLongEdgeDisplay(item.path, true);
+        }
+    }
+
+    const newNodeIds = computeActiveNodeIds(newItems);
+    for (const id of prevActiveNodeIds) {
+        if (!newNodeIds.has(id)) {
+            const els = nodeDomRegistry.get(id) || [];
+            for (const el of els) el.classList.remove('node-active');
+        }
+    }
+    for (const id of newNodeIds) {
+        if (!prevActiveNodeIds.has(id)) {
+            const els = nodeDomRegistry.get(id) || [];
+            for (const el of els) el.classList.add('node-active');
+        }
+    }
+
+    const hasActive = newItems.length > 0 || hoveredNodeId != null || hoveredGroupId != null;
+    const svg = document.getElementById('dag-svg');
+    if (svg) svg.classList.toggle('svg-has-hover', hasActive);
+
+    prevActiveItems = newItems;
+    prevActiveNodeIds = newNodeIds;
 }
 
 function clearEdgeFocus() {
@@ -1007,6 +1036,10 @@ async function render() {
         groupLayout = {};
         nodePortMap = {};
         edgeDomRegistry = [];
+        edgeByNodeId.clear();
+        edgeByGroupId.clear();
+        prevActiveItems = [];
+        prevActiveNodeIds = new Set();
         nodeDomRegistry = new Map();
         focusedEdgePath = null;
         hoveredEdgeKey = null;
@@ -1364,7 +1397,17 @@ async function render() {
 
         function registerEdgeDom(path, edgeData) {
             if (!path || !edgeData) return;
-            edgeDomRegistry.push({ path, edge: edgeData, key: edgeKey(edgeData) });
+            const item = { path, edge: edgeData, key: edgeKey(edgeData) };
+            edgeDomRegistry.push(item);
+            for (const nid of [edgeData.from, edgeData.to]) {
+                if (nid == null) continue;
+                if (!edgeByNodeId.has(nid)) edgeByNodeId.set(nid, []);
+                edgeByNodeId.get(nid).push(item);
+            }
+            if (edgeData.__gid != null) {
+                if (!edgeByGroupId.has(edgeData.__gid)) edgeByGroupId.set(edgeData.__gid, []);
+                edgeByGroupId.get(edgeData.__gid).push(item);
+            }
         }
 
         function applyEdgePresentation(path, type, opacity=null) {
@@ -2540,9 +2583,11 @@ def _generate_flowchart_html_multi(tabs: dict[str, list[dict]]) -> str:
         "    try { if (typeof nodeAncestorGroups !== \"undefined\" && nodeAncestorGroups && nodeAncestorGroups.clear) nodeAncestorGroups.clear(); } catch (e) {}\n"
         "    try { if (typeof nodeDomRegistry !== \"undefined\" && nodeDomRegistry && nodeDomRegistry.clear) nodeDomRegistry.clear(); } catch (e) {}\n"
         "    try { if (typeof edgeDomRegistry !== \"undefined\") edgeDomRegistry.length = 0; } catch (e) {}\n"
+        "    try { if (typeof edgeByNodeId !== \"undefined\" && edgeByNodeId && edgeByNodeId.clear) edgeByNodeId.clear(); } catch (e) {}\n"
+        "    try { if (typeof edgeByGroupId !== \"undefined\" && edgeByGroupId && edgeByGroupId.clear) edgeByGroupId.clear(); } catch (e) {}\n"
         "    try { if (typeof groupLayout !== \"undefined\") { Object.keys(groupLayout).forEach(k => delete groupLayout[k]); } } catch (e) {}\n"
         "    try { if (typeof nodePortMap !== \"undefined\") { Object.keys(nodePortMap).forEach(k => delete nodePortMap[k]); } } catch (e) {}\n"
-        "    try { hoveredEdgeKey = null; hoveredEdges = []; hoveredEdgeIdx = 0; hoveredNodeId = null; hoveredGroupId = null; focusedEdgeKey = null; } catch (e) {}\n"
+        "    try { hoveredEdgeKey = null; hoveredEdges = []; hoveredEdgeIdx = 0; hoveredNodeId = null; hoveredGroupId = null; focusedEdgePath = null; prevActiveItems = []; prevActiveNodeIds = new Set(); } catch (e) {}\n"
         "    try { var sp = document.getElementById(\"side-panel\"); if (sp) sp.classList.remove(\"open\"); } catch (e) {}\n"
         "}\n"
         "function _rebuildIndices() {\n"
@@ -2723,9 +2768,11 @@ def _generate_flowchart_html_dual(data_train, data_infer):
         '    try { if (typeof nodeAncestorGroups !== "undefined" && nodeAncestorGroups && nodeAncestorGroups.clear) nodeAncestorGroups.clear(); } catch(e){}\n'
         '    try { if (typeof nodeDomRegistry !== "undefined" && nodeDomRegistry && nodeDomRegistry.clear) nodeDomRegistry.clear(); } catch(e){}\n'
         '    try { if (typeof edgeDomRegistry !== "undefined") edgeDomRegistry.length = 0; } catch(e){}\n'
+        '    try { if (typeof edgeByNodeId !== "undefined" && edgeByNodeId && edgeByNodeId.clear) edgeByNodeId.clear(); } catch(e){}\n'
+        '    try { if (typeof edgeByGroupId !== "undefined" && edgeByGroupId && edgeByGroupId.clear) edgeByGroupId.clear(); } catch(e){}\n'
         '    try { if (typeof groupLayout !== "undefined") { Object.keys(groupLayout).forEach(k => delete groupLayout[k]); } } catch(e){}\n'
         '    try { if (typeof nodePortMap !== "undefined") { Object.keys(nodePortMap).forEach(k => delete nodePortMap[k]); } } catch(e){}\n'
-        '    try { hoveredEdgeKey = null; hoveredEdges = []; hoveredEdgeIdx = 0; hoveredNodeId = null; hoveredGroupId = null; focusedEdgeKey = null; } catch(e){}\n'
+        '    try { hoveredEdgeKey = null; hoveredEdges = []; hoveredEdgeIdx = 0; hoveredNodeId = null; hoveredGroupId = null; focusedEdgePath = null; prevActiveItems = []; prevActiveNodeIds = new Set(); } catch(e){}\n'
         '    // Close any open side panel from the previous tab.\n'
         '    try { var sp = document.getElementById("side-panel"); if (sp) sp.classList.remove("open"); } catch(e){}\n'
         '  }\n'
@@ -2783,90 +2830,6 @@ def _generate_flowchart_html(data):
     # directly (g.dur_us mirrors kernel_us), so no post-hoc replace is
     # needed.
 
-    # ------------------------------------------------------------------
-    # Iter14-aggr: front-end hover de-dup for synthetic container boundaries.
-    #
-    # Synthetic container groups (ModuleDict / ModuleList / dict / list with
-    # >= 2 expanded children) emit one boundary edge per elem child:
-    #
-    #   container__in  → elem_0   container__in  → elem_1  ...   (× N)
-    #   elem_0 → container__out   elem_1 → container__out  ...   (× N)
-    #
-    # All N edges share the same logical "external source → container"
-    # entry (resp. exit) and all N have the same ``container_aggregated_in``
-    # (resp. ``_out``) marker pointing at the container's group id.  Without
-    # de-duplication, hovering ANY node connected to the container triggers
-    # N simultaneous className mutations on N SVG paths, and the browser
-    # stalls while it re-rasterises N parallel beziers in one frame.
-    #
-    # We surgically patch two spots in the embedded JS template:
-    #
-    #   1. Inside ``applyEdgeFocusState``, just after ``activeKeys`` is
-    #      computed, drop every aggregated edge except the FIRST one seen
-    #      per (container, direction).  This keeps Rule2 / Rule6 happy
-    #      (the data still has all N edges) while ensuring hover paints a
-    #      single representative bezier per container side.
-    #
-    #   2. Wrap the body of ``applyEdgeFocusState`` in
-    #      ``requestAnimationFrame`` so rapid mouseenter/mouseleave events
-    #      coalesce into one DOM toggle pass instead of firing the whole
-    #      iteration on every event tick.
-    #
-    # Both patches are pure JS string substitutions over the loaded
-    # template; they assume the canonical anchors below survive across
-    # template variants (verified for iter11_timing_active.html).  Should
-    # the anchor not be present (older / future templates) the patches
-    # silently no-op and the original template is used as-is — the
-    # underlying Python-side dedup (which also collapses 64× duplicate
-    # internal_edges into a single entry) still eliminates the worst lag.
-    # ------------------------------------------------------------------
-    _aef_anchor = "function applyEdgeFocusState() {\n    const activeKeys = getActiveEdgeKeys();"
-    _aef_replacement = (
-        "function applyEdgeFocusState() {\n"
-        "    // Iter14-aggr: coalesce rapid hover updates via rAF so successive\n"
-        "    // mouseenter/mouseleave events on neighbouring elements merge into\n"
-        "    // one DOM toggle pass instead of N back-to-back iterations over\n"
-        "    // every registered SVG edge path.\n"
-        "    if (applyEdgeFocusState._scheduled) { return; }\n"
-        "    applyEdgeFocusState._scheduled = true;\n"
-        "    const _runAEFNow = () => {\n"
-        "        applyEdgeFocusState._scheduled = false;\n"
-        "        _applyEdgeFocusStateImpl();\n"
-        "    };\n"
-        "    if (typeof requestAnimationFrame === 'function') {\n"
-        "        requestAnimationFrame(_runAEFNow);\n"
-        "    } else {\n"
-        "        _runAEFNow();\n"
-        "    }\n"
-        "}\n"
-        "function _applyEdgeFocusStateImpl() {\n"
-        "    const activeKeys = getActiveEdgeKeys();\n"
-        "    // Iter14-aggr: collapse container-boundary fan-outs.  Every edge\n"
-        "    // tagged with ``container_aggregated_in`` (or ``_out``) belongs to\n"
-        "    // the same logical N-fan boundary; we keep only the FIRST active\n"
-        "    // edge per (container, direction) so hover never paints N parallel\n"
-        "    // beziers simultaneously.\n"
-        "    {\n"
-        "        const _aggrSeenIn = new Map();\n"
-        "        const _aggrSeenOut = new Map();\n"
-        "        const _aggrToDrop = [];\n"
-        "        for (const _item of edgeDomRegistry) {\n"
-        "            if (!activeKeys.has(_item.key)) continue;\n"
-        "            const _e = _item.edge || {};\n"
-        "            const _aIn = _e.container_aggregated_in;\n"
-        "            const _aOut = _e.container_aggregated_out;\n"
-        "            if (_aIn) {\n"
-        "                if (_aggrSeenIn.has(_aIn)) { _aggrToDrop.push(_item.key); }\n"
-        "                else { _aggrSeenIn.set(_aIn, _item.key); }\n"
-        "            } else if (_aOut) {\n"
-        "                if (_aggrSeenOut.has(_aOut)) { _aggrToDrop.push(_item.key); }\n"
-        "                else { _aggrSeenOut.set(_aOut, _item.key); }\n"
-        "            }\n"
-        "        }\n"
-        "        for (const _k of _aggrToDrop) { activeKeys.delete(_k); }\n"
-        "    }"
-    )
-    html_template = html_template.replace(_aef_anchor, _aef_replacement, 1)
 
     # Replace the embedded DATA payload using the stable script markers rather
     # than a naive non-greedy `{...};` regex: the serialized JSON contains many
