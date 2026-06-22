@@ -140,6 +140,77 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 .metric-help-popup { position: fixed; background: #1a2a4a; border: 1px solid rgba(100,181,246,0.5); border-radius: 6px; padding: 7px 10px; font-size: 11px; color: #cde; pointer-events: none; z-index: 9999; max-width: 260px; box-shadow: 0 4px 16px rgba(0,0,0,0.5); line-height: 1.5; display: none; }
 .timing-value { color: #e7eefc; font-variant-numeric: tabular-nums; }
 .truncation-note { font-size: 10px; color: #c77a3c; padding: 6px 18px 0; }
+.iter14-render-progress-overlay {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    background: rgba(26, 26, 46, 0.86);
+    z-index: 3000;
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+    transition: opacity 0.25s ease, visibility 0.25s ease;
+}
+.iter14-render-progress-overlay.visible {
+    opacity: 1;
+    visibility: visible;
+    pointer-events: auto;
+}
+.iter14-render-progress-overlay.closing {
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+}
+.iter14-render-progress-card {
+    width: min(420px, calc(100vw - 48px));
+    padding: 22px 24px;
+    border-radius: 14px;
+    border: 1px solid rgba(124, 131, 253, 0.35);
+    background: rgba(15, 22, 38, 0.94);
+    box-shadow: 0 18px 60px rgba(0,0,0,0.45);
+}
+.iter14-render-progress-title {
+    font-size: 18px;
+    font-weight: 700;
+    color: #ffffff;
+    margin-bottom: 10px;
+}
+.iter14-render-progress-stage {
+    font-size: 13px;
+    color: #8892b0;
+    margin-bottom: 14px;
+}
+.iter14-render-progress-track {
+    width: 100%;
+    height: 8px;
+    overflow: hidden;
+    border-radius: 999px;
+    background: rgba(255,255,255,0.08);
+}
+.iter14-render-progress-bar {
+    width: 0%;
+    height: 100%;
+    border-radius: inherit;
+    background: linear-gradient(90deg, #7c83fd, #64b5f6);
+    transition: width 0.12s ease-out, background 0.18s ease;
+}
+.iter14-render-progress-percent {
+    margin-top: 12px;
+    font-size: 13px;
+    font-weight: 600;
+    color: #e7eefc;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+}
+.iter14-render-progress-overlay.failed .iter14-render-progress-stage {
+    color: #ffb4a8;
+}
+.iter14-render-progress-overlay.failed .iter14-render-progress-bar {
+    background: linear-gradient(90deg, #ff6b6b, #ff8e53);
+}
 </style>
 </head>
 <body>
@@ -169,6 +240,16 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
     <div class="side-panel-body" id="sp-body"></div>
 </div>
 <div class="summary" id="summary"></div>
+<div id="render-progress-overlay" class="iter14-render-progress-overlay" aria-hidden="true">
+    <div class="iter14-render-progress-card">
+        <div class="iter14-render-progress-title">正在渲染 DAG…</div>
+        <div class="iter14-render-progress-stage" id="render-progress-stage">准备中…</div>
+        <div class="iter14-render-progress-track">
+            <div class="iter14-render-progress-bar" id="render-progress-bar"></div>
+        </div>
+        <div class="iter14-render-progress-percent" id="render-progress-percent">0%</div>
+    </div>
+</div>
 
 <script>
 const DATA = __FLOWCHART_DATA_PLACEHOLDER__;
@@ -187,6 +268,7 @@ let hoveredEdgeIdx = 0;
 let hoveredGroupId = null;
 let hoveredNodeId = null;
 let nodeDomRegistry = new Map();
+let renderGeneration = 0;
 const nodeAncestorGroups = new Map();
 const LONG_EDGE_MIN_SPAN = 260;
 
@@ -809,789 +891,1088 @@ function layoutGroup(gid) {
     return { w: groupW, h: groupH };
 }
 
-function render() {
-    // Clear and rebuild groupLayout / edge registry on every render
-    groupLayout = {};
-    nodePortMap = {};
-    edgeDomRegistry = [];
-    nodeDomRegistry = new Map();
-    focusedEdgePath = null;
-    hoveredEdgeKey = null;
-    hoveredEdges = [];
-    hoveredEdgeIdx = 0;
-    hoveredGroupId = null;
-    hoveredNodeId = null;
-    // Layout root groups (RootModule)
-    const rootSizes = DATA.root_groups.map(rid => {
-        const sz = layoutGroup(rid);
-        return { id: rid, ...sz };
-    });
+function nextFrame() {
+    return new Promise((resolve) => requestAnimationFrame(() => resolve()));
+}
 
-    // Top-level layout reserves dedicated rows for 4-class IO pills and root groups.
-    const ioW = 140, ioH = 40;
-    const ioGap = 36;
-    const pillGap = 18;
-    const topIOItems = (DATA.io_groups && DATA.io_groups.length > 0)
-        ? DATA.io_groups
-            .filter(g => g.io_subtype !== 'output')
-            .map(g => ({ isIOGroup: true, ioGroup: g }))
-        : [
-            ...(DATA.input_node_ids || []).map(id => ({ id, label: 'Input', defaultSublabel: 'network input', fillColor: 'rgba(46,204,113,0.55)' })),
-            ...(DATA.param_node_ids || []).map(id => ({ id, label: 'Param', defaultSublabel: 'model param', fillColor: 'rgba(155,89,182,0.55)' })),
-            ...(DATA.const_node_ids || []).map(id => ({ id, label: 'Const', defaultSublabel: 'const value', fillColor: 'rgba(241,196,15,0.55)' })),
-        ];
-    const outputIOGroup = (DATA.io_groups || []).find(g => g.io_subtype === 'output');
-    const bottomIOItems = outputIOGroup
-        ? [{ isIOGroup: true, ioGroup: outputIOGroup }]
-        : (DATA.output_node_ids || []).map(id => ({
-              id, label: 'Result', defaultSublabel: 'result output',
-              fillColor: 'rgba(231,76,60,0.55)'
-          }));
-    const topIORows = topIOItems.length > 0 ? [{ items: topIOItems }] : [];
-    const bottomIORows = bottomIOItems.length > 0 ? [{ items: bottomIOItems }] : [];
-    const allIORows = topIORows.concat(bottomIORows);
-    const maxRootW = rootSizes.length ? Math.max(...rootSizes.map(r => r.w)) : LAYOUT.nodeW;
-    const maxRootH = rootSizes.length ? Math.max(...rootSizes.map(r => r.h)) : LAYOUT.nodeH;
-    const provisionalSvgW = Math.max(maxRootW + 80, 480);
-    const EXPAND_PADDING = 24;
-    const EXPAND_PILL_W = 100;
-    const EXPAND_COLS = 3;
-    const EXPAND_FRAME_PAD = 16;
-    const EXPAND_COL_GAP = 20;
-    const EXPAND_OUTER_PAD = 24;
-    const EXPANDED_IO_H = 28;
-    const EXPANDED_IO_GAP = 16;
-    const COLLAPSE_BUTTON_W = 70;
-    const COLLAPSE_BUTTON_H = 22;
-    const COLLAPSE_BOTTOM_PADDING = 10;
-    const expandedGroupCount = (DATA.io_groups || []).filter(g =>
-        !((g.id in collapsedState) ? collapsedState[g.id] : g.collapsed)
-    ).length;
-    const minIOColW = EXPAND_COLS * EXPAND_PILL_W + (EXPAND_COLS - 1) * pillGap + 2 * EXPAND_FRAME_PAD;
-    const minIOTotalW = expandedGroupCount > 0
-        ? expandedGroupCount * minIOColW + (expandedGroupCount - 1) * EXPAND_COL_GAP + 2 * EXPAND_OUTER_PAD
-        : 0;
-    const computeIOGroupExpandedLayout = (memberCount, availableSvgW = provisionalSvgW) => {
-        if (memberCount === 0) return { cols: EXPAND_COLS, pillW: EXPAND_PILL_W, memberRows: 0, height: 0 };
-        const availableW = availableSvgW - 2 * EXPAND_FRAME_PAD;
-        const cols = Math.max(EXPAND_COLS, Math.floor(availableW / (EXPAND_PILL_W + pillGap)));
-        const pillW = Math.floor((availableW - (cols - 1) * pillGap) / cols);
-        const memberRows = Math.ceil(memberCount / cols);
-        const memberAreaH = memberRows * EXPANDED_IO_H + (memberRows - 1) * EXPANDED_IO_GAP;
-        const height = memberAreaH + EXPANDED_IO_GAP + COLLAPSE_BUTTON_H + COLLAPSE_BOTTOM_PADDING;
-        return { cols, pillW, memberRows, height };
-    };
-    const calcIOGroupExpandedHeight = (ioGroup, availableW = provisionalSvgW) => {
-        const memberCount = (ioGroup.member_ids || []).length;
-        return computeIOGroupExpandedLayout(memberCount, availableW).height;
-    };
-    const calcIORowWidth = (row, availableW = provisionalSvgW) => {
-        if (!row.items || row.items.length === 0) return 0;
-        let width = 0;
-        let pendingInline = 0;
-        const flushInline = () => {
-            if (pendingInline > 0) {
-                width = Math.max(width, pendingInline * ioW + (pendingInline - 1) * pillGap);
-                pendingInline = 0;
+function getRenderProgressElements() {
+    const overlay = document.getElementById('render-progress-overlay');
+    const bar = document.getElementById('render-progress-bar');
+    const stage = document.getElementById('render-progress-stage');
+    const percent = document.getElementById('render-progress-percent');
+    if (!overlay || !bar || !stage || !percent) {
+        throw new Error('render progress overlay DOM is incomplete');
+    }
+    return { overlay, bar, stage, percent };
+}
+
+function setRenderProgress(percent, stageText) {
+    const { overlay, bar, stage, percent: percentEl } = getRenderProgressElements();
+    const normalized = Math.max(0, Math.min(100, Number(percent)));
+    if (!Number.isFinite(normalized)) {
+        throw new Error(`setRenderProgress got invalid percent: ${percent}`);
+    }
+    overlay.dataset.progress = normalized.toFixed(1);
+    bar.style.width = `${normalized}%`;
+    stage.textContent = stageText;
+    percentEl.textContent = `${Math.round(normalized)}%`;
+}
+
+function showRenderProgress(stageText) {
+    const { overlay } = getRenderProgressElements();
+    overlay.classList.remove('closing', 'failed');
+    overlay.classList.add('visible');
+    overlay.setAttribute('aria-hidden', 'false');
+    setRenderProgress(0, stageText);
+}
+
+async function hideRenderProgress() {
+    const { overlay } = getRenderProgressElements();
+    const ownerGeneration = overlay.dataset.renderGeneration || '';
+    setRenderProgress(100, '渲染完成');
+    await nextFrame();
+    if (ownerGeneration !== String(renderGeneration)) {
+        throw new Error(`hideRenderProgress aborted by newer render generation: ${ownerGeneration} -> ${renderGeneration}`);
+    }
+    overlay.classList.add('closing');
+    overlay.classList.remove('visible');
+    await new Promise((resolve) => setTimeout(resolve, 180));
+    if (ownerGeneration !== String(renderGeneration)) {
+        throw new Error(`hideRenderProgress completion overtaken by render generation: ${ownerGeneration} -> ${renderGeneration}`);
+    }
+    overlay.setAttribute('aria-hidden', 'true');
+}
+
+function assertActiveRenderGeneration(generation, stageText) {
+    if (generation !== renderGeneration) {
+        throw new Error(`render generation ${generation} expired during ${stageText}`);
+    }
+}
+
+async function runChunked(items, handler, options) {
+    const opts = options || {};
+    const batchSize = Math.max(1, Number(opts.batchSize || 1));
+    const phaseStart = Number(opts.phaseStart || 0);
+    const phaseEnd = Number(opts.phaseEnd || phaseStart);
+    const stageText = opts.stageText || '正在渲染…';
+    const generation = Number(opts.generation);
+    const allowedTypes = Array.isArray(opts.allowedTypes) && opts.allowedTypes.length > 0
+        ? opts.allowedTypes
+        : ['group', 'node', 'io', 'edge'];
+    const allowedTypeSet = new Set(allowedTypes);
+    assertActiveRenderGeneration(generation, stageText);
+    const total = items.length;
+    if (total === 0) {
+        setRenderProgress(phaseEnd, stageText);
+        await nextFrame();
+        assertActiveRenderGeneration(generation, stageText);
+        return;
+    }
+    let processed = 0;
+    while (processed < total) {
+        assertActiveRenderGeneration(generation, stageText);
+        const upperBound = Math.min(processed + batchSize, total);
+        for (let idx = processed; idx < upperBound; idx++) {
+            const item = items[idx];
+            if (!item || typeof item.type !== 'string' || !allowedTypeSet.has(item.type)) {
+                const actualType = item && typeof item.type === 'string' ? item.type : '<missing>';
+                throw new Error(`runChunked got unknown task type: ${actualType}`);
             }
+            assertActiveRenderGeneration(generation, stageText);
+            await handler(item, idx);
+        }
+        processed = upperBound;
+        const progress = phaseStart + (processed / total) * (phaseEnd - phaseStart);
+        setRenderProgress(progress, stageText);
+        await nextFrame();
+    }
+    assertActiveRenderGeneration(generation, stageText);
+}
+
+function invokeRender() {
+    const promise = render();
+    promise.catch((err) => {
+        setTimeout(() => { throw err; }, 0);
+    });
+    return promise;
+}
+
+async function render() {
+    const generation = ++renderGeneration;
+    showRenderProgress('正在准备渲染状态…');
+    const { overlay } = getRenderProgressElements();
+    overlay.dataset.renderGeneration = String(generation);
+    await nextFrame();
+    try {
+        groupLayout = {};
+        nodePortMap = {};
+        edgeDomRegistry = [];
+        nodeDomRegistry = new Map();
+        focusedEdgePath = null;
+        hoveredEdgeKey = null;
+        hoveredEdges = [];
+        hoveredEdgeIdx = 0;
+        hoveredGroupId = null;
+        hoveredNodeId = null;
+        hideOverlapBadge();
+        assertActiveRenderGeneration(generation, '准备阶段');
+        setRenderProgress(5, '正在准备渲染状态…');
+        await nextFrame();
+
+        const rootSizes = DATA.root_groups.map(rid => {
+            const sz = layoutGroup(rid);
+            return { id: rid, ...sz };
+        });
+
+        const ioW = 140, ioH = 40;
+        const ioGap = 36;
+        const pillGap = 18;
+        const topIOItems = (DATA.io_groups && DATA.io_groups.length > 0)
+            ? DATA.io_groups
+                .filter(g => g.io_subtype !== 'output')
+                .map(g => ({ isIOGroup: true, ioGroup: g }))
+            : [
+                ...(DATA.input_node_ids || []).map(id => ({ id, label: 'Input', defaultSublabel: 'network input', fillColor: 'rgba(46,204,113,0.55)' })),
+                ...(DATA.param_node_ids || []).map(id => ({ id, label: 'Param', defaultSublabel: 'model param', fillColor: 'rgba(155,89,182,0.55)' })),
+                ...(DATA.const_node_ids || []).map(id => ({ id, label: 'Const', defaultSublabel: 'const value', fillColor: 'rgba(241,196,15,0.55)' })),
+            ];
+        const outputIOGroup = (DATA.io_groups || []).find(g => g.io_subtype === 'output');
+        const bottomIOItems = outputIOGroup
+            ? [{ isIOGroup: true, ioGroup: outputIOGroup }]
+            : (DATA.output_node_ids || []).map(id => ({
+                  id, label: 'Result', defaultSublabel: 'result output',
+                  fillColor: 'rgba(231,76,60,0.55)'
+              }));
+        const topIORows = topIOItems.length > 0 ? [{ items: topIOItems }] : [];
+        const bottomIORows = bottomIOItems.length > 0 ? [{ items: bottomIOItems }] : [];
+        const allIORows = topIORows.concat(bottomIORows);
+        const maxRootW = rootSizes.length ? Math.max(...rootSizes.map(r => r.w)) : LAYOUT.nodeW;
+        const maxRootH = rootSizes.length ? Math.max(...rootSizes.map(r => r.h)) : LAYOUT.nodeH;
+        const provisionalSvgW = Math.max(maxRootW + 80, 480);
+        const EXPAND_PADDING = 24;
+        const EXPAND_PILL_W = 100;
+        const EXPAND_COLS = 3;
+        const EXPAND_FRAME_PAD = 16;
+        const EXPAND_COL_GAP = 20;
+        const EXPAND_OUTER_PAD = 24;
+        const EXPANDED_IO_H = 28;
+        const EXPANDED_IO_GAP = 16;
+        const COLLAPSE_BUTTON_W = 70;
+        const COLLAPSE_BUTTON_H = 22;
+        const COLLAPSE_BOTTOM_PADDING = 10;
+        const expandedGroupCount = (DATA.io_groups || []).filter(g =>
+            !((g.id in collapsedState) ? collapsedState[g.id] : g.collapsed)
+        ).length;
+        const minIOColW = EXPAND_COLS * EXPAND_PILL_W + (EXPAND_COLS - 1) * pillGap + 2 * EXPAND_FRAME_PAD;
+        const minIOTotalW = expandedGroupCount > 0
+            ? expandedGroupCount * minIOColW + (expandedGroupCount - 1) * EXPAND_COL_GAP + 2 * EXPAND_OUTER_PAD
+            : 0;
+        const computeIOGroupExpandedLayout = (memberCount, availableSvgW = provisionalSvgW) => {
+            if (memberCount === 0) return { cols: EXPAND_COLS, pillW: EXPAND_PILL_W, memberRows: 0, height: 0 };
+            const availableW = availableSvgW - 2 * EXPAND_FRAME_PAD;
+            const cols = Math.max(EXPAND_COLS, Math.floor(availableW / (EXPAND_PILL_W + pillGap)));
+            const pillW = Math.floor((availableW - (cols - 1) * pillGap) / cols);
+            const memberRows = Math.ceil(memberCount / cols);
+            const memberAreaH = memberRows * EXPANDED_IO_H + (memberRows - 1) * EXPANDED_IO_GAP;
+            const height = memberAreaH + EXPANDED_IO_GAP + COLLAPSE_BUTTON_H + COLLAPSE_BOTTOM_PADDING;
+            return { cols, pillW, memberRows, height };
         };
-        for (const item of row.items) {
-            if (item.isIOGroup === true) {
+        const calcIOGroupExpandedHeight = (ioGroup, availableW = provisionalSvgW) => {
+            const memberCount = (ioGroup.member_ids || []).length;
+            return computeIOGroupExpandedLayout(memberCount, availableW).height;
+        };
+        const calcIORowWidth = (row, availableW = provisionalSvgW) => {
+            if (!row.items || row.items.length === 0) return 0;
+            let width = 0;
+            let pendingInline = 0;
+            const flushInline = () => {
+                if (pendingInline > 0) {
+                    width = Math.max(width, pendingInline * ioW + (pendingInline - 1) * pillGap);
+                    pendingInline = 0;
+                }
+            };
+            for (const item of row.items) {
+                if (item.isIOGroup === true) {
+                    const ioGroup = item.ioGroup;
+                    const isCollapsed = (ioGroup.id in collapsedState) ? collapsedState[ioGroup.id] : ioGroup.collapsed;
+                    if (!isCollapsed) {
+                        flushInline();
+                        const memberCount = (ioGroup.member_ids || []).length;
+                        const expandedW = memberCount > 0
+                            ? Math.min(availableW * 0.85, memberCount * (ioW + pillGap) - pillGap)
+                            : 0;
+                        width = Math.max(width, expandedW);
+                        continue;
+                    }
+                }
+                pendingInline += 1;
+            }
+            flushInline();
+            return width;
+        };
+        const maxIORowW = allIORows.length > 0 ? Math.max(...allIORows.map(row => calcIORowWidth(row))) : 0;
+        const svgW = Math.max(provisionalSvgW, maxIORowW + 80, minIOTotalW);
+        const calcIORowHeight = (row) => {
+            if (!row.items || row.items.length === 0) return 0;
+            const expandedGroups = row.items.filter(item => {
+                if (item.isIOGroup !== true) return false;
                 const ioGroup = item.ioGroup;
                 const isCollapsed = (ioGroup.id in collapsedState) ? collapsedState[ioGroup.id] : ioGroup.collapsed;
-                if (!isCollapsed) {
-                    flushInline();
-                    const memberCount = (ioGroup.member_ids || []).length;
-                    const expandedW = memberCount > 0
-                        ? Math.min(availableW * 0.85, memberCount * (ioW + pillGap) - pillGap)
-                        : 0;
-                    width = Math.max(width, expandedW);
-                    continue;
-                }
-            }
-            pendingInline += 1;
-        }
-        flushInline();
-        return width;
-    };
-    const maxIORowW = allIORows.length > 0 ? Math.max(...allIORows.map(row => calcIORowWidth(row))) : 0;
-    const svgW = Math.max(provisionalSvgW, maxIORowW + 80, minIOTotalW);
-    const calcIORowHeight = (row) => {
-        if (!row.items || row.items.length === 0) return 0;
-        const expandedGroups = row.items.filter(item => {
-            if (item.isIOGroup !== true) return false;
-            const ioGroup = item.ioGroup;
-            const isCollapsed = (ioGroup.id in collapsedState) ? collapsedState[ioGroup.id] : ioGroup.collapsed;
-            return !isCollapsed;
-        });
-        const hasInlineRow = row.items.some(item => {
-            if (item.isIOGroup !== true) return true;
-            const ioGroup = item.ioGroup;
-            const isCollapsed = (ioGroup.id in collapsedState) ? collapsedState[ioGroup.id] : ioGroup.collapsed;
-            return isCollapsed;
-        });
-        let height = hasInlineRow ? ioH : 0;
-        if (expandedGroups.length > 0) {
-            const groupCount = expandedGroups.length;
-            const colW = (svgW - (groupCount - 1) * EXPAND_COL_GAP) / groupCount;
-            const expandedH = Math.max(...expandedGroups.map(item => calcIOGroupExpandedHeight(item.ioGroup, colW)));
-            height += (height > 0 ? ioGap : 0) + expandedH;
-        }
-        return height;
-    };
-    const topIOHeight = topIORows.length > 0 ? topIORows.reduce((acc, row, idx) => acc + calcIORowHeight(row) + (idx > 0 ? ioGap : 0), 0) : 0;
-    const bottomIOHeight = bottomIORows.length > 0 ? bottomIORows.reduce((acc, row, idx) => acc + calcIORowHeight(row) + (idx > 0 ? ioGap : 0), 0) : 0;
-
-    const rootStartY = 30 + (topIOHeight > 0 ? topIOHeight + ioGap : 0);
-    const svgH = 30 + topIOHeight + (topIOHeight > 0 ? ioGap : 0) + maxRootH + (bottomIOHeight > 0 ? ioGap + bottomIOHeight : 0) + 40;
-
-    const svg = document.getElementById('dag-svg');
-    svg.addEventListener('click', () => clearEdgeFocus());
-    svg.setAttribute('width', svgW);
-    svg.setAttribute('height', svgH);
-    svg.innerHTML = `<defs>
-        <marker id="arrowhead" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
-            <polygon points="0 0, 8 3, 0 6" fill="rgba(255,255,255,0.3)"/>
-        </marker>
-        <marker id="arrowhead-blue" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
-            <polygon points="0 0, 8 3, 0 6" fill="rgba(100,181,246,0.5)"/>
-        </marker>
-        <marker id="arrowhead-dep" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
-            <polygon points="0 0, 8 3, 0 6" fill="rgba(46,204,113,0.6)"/>
-        </marker>
-    </defs>`;
-
-    // Position the (single) RootModule centered horizontally.
-    const rootPositions = [];
-    if (rootSizes.length > 0) {
-        const rs = rootSizes[0];
-        const rx = (svgW - rs.w) / 2;
-        const ry = rootStartY;
-        rootPositions.push({ id: rs.id, x: rx, y: ry, w: rs.w, h: rs.h });
-    }
-
-    // Render groups recursively
-    const edgeList = [];
-
-    function appendGroupInfoButton(g, cx, cy, titleText = '') {
-        if (!g || !g.src_file) return;
-        const hit = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
-        hit.setAttribute('cx', cx);
-        hit.setAttribute('cy', cy - 1);
-        hit.setAttribute('r', 9);
-        hit.setAttribute('class', 'group-info-hit');
-        hit.addEventListener('click', (e) => {
-            e.stopPropagation();
-            showSourcePanel(g);
-        });
-        svg.appendChild(hit);
-
-        const info = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-        info.setAttribute('x', cx);
-        info.setAttribute('y', cy - 1);
-        info.setAttribute('class', 'group-toggle group-info-text');
-        info.textContent = 'i';
-        if (titleText) {
-            const titleEl = document.createElementNS('http://www.w3.org/2000/svg', 'title');
-            titleEl.textContent = titleText;
-            info.appendChild(titleEl);
-        }
-        svg.appendChild(info);
-    }
-
-    __RENDER_GROUP_JS_PLACEHOLDER__
-
-    function renderNodeAt(nid, nx, ny, w, h) {
-        const n = nodeMap[nid];
-        if (!n) return;
-        const color = getNodeColor(n);
-
-        const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-        rect.setAttribute('x', nx); rect.setAttribute('y', ny);
-        rect.setAttribute('width', w); rect.setAttribute('height', h);
-        rect.setAttribute('class', 'leaf-node');
-        rect.setAttribute('fill', color);
-        rect.setAttribute('stroke', 'rgba(255,255,255,0.15)');
-        rect.style.cursor = 'pointer';
-        rect.dataset.nid = nid;
-        rect.addEventListener('mouseenter', (e) => showTooltip(e, n));
-        rect.addEventListener('mouseleave', hideTooltip);
-        rect.addEventListener('click', (e) => { e.stopPropagation(); showSourcePanel(n); });
-        svg.appendChild(rect);
-        registerNodeDom(nid, rect);
-
-        // Label: class_name only
-        const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-        label.setAttribute('x', nx + w/2); label.setAttribute('y', ny + h/2);
-        label.setAttribute('class', 'node-label');
-        label.style.pointerEvents = 'none';
-        label.textContent = n.class_name;
-        svg.appendChild(label);
-
-        // Sublabel: timing only
-        let subText = '';
-        if (n.has_timing) subText = `${n.pct.toFixed(1)}%`;
-        if (subText) {
-            const sub = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-            sub.setAttribute('x', nx + w/2); sub.setAttribute('y', ny + h/2 + 11);
-            sub.setAttribute('class', 'node-sublabel');
-            sub.style.pointerEvents = 'none';
-            sub.textContent = subText;
-            svg.appendChild(sub);
-        }
-
-        // Register nodePortMap coordinates for edges
-        nodePortMap[nid] = { cx: nx + w/2, cy: ny + h/2 };
-        nodePortMap[nid + '__in'] = { cx: nx + w/2, cy: ny };
-        nodePortMap[nid + '__out'] = { cx: nx + w/2, cy: ny + h };
-    }
-
-    function configureLongEdgeDisplay(path) {
-        if (!path) return;
-        let total = NaN;
-        try {
-            total = path.getTotalLength();
-        } catch (err) {
-            total = NaN;
-        }
-        if (!Number.isFinite(total) || total < LONG_EDGE_MIN_SPAN) return;
-        const originalDasharray = path.getAttribute('stroke-dasharray') || '';
-        const originalDashoffset = path.getAttribute('stroke-dashoffset') || '';
-        const stubLen = Math.max(40, Math.min(72, total * 0.12));
-        const gapLen = Math.max(80, total - stubLen * 2);
-        path.dataset.longEdge = '1';
-        path.dataset.fullDasharray = originalDasharray;
-        path.dataset.fullDashoffset = originalDashoffset;
-        path.dataset.truncatedDasharray = `${stubLen} ${gapLen} ${stubLen}`;
-        if (originalDashoffset) {
-            path.dataset.truncatedDashoffset = originalDashoffset;
-        }
-        path.classList.add('long-edge');
-        path.setAttribute('stroke-dasharray', path.dataset.truncatedDasharray);
-    }
-
-    function buildDirectEdgePath(x1, y1, x2, y2, routeMeta) {
-        const dy = y2 - y1;
-        const dx = x2 - x1;
-        if (Math.abs(dy) < 3 && Math.abs(dx) < 3) return null;
-        const meta = routeMeta || {};
-        const offset = meta.bundleOffset || 0;
-        const sourceFanout = meta.sourceFanout || 1;
-        const targetFanin = meta.targetFanin || 1;
-        const sideBias = offset === 0 ? (dx >= 0 ? 1 : -1) : (offset > 0 ? 1 : -1);
-        let d;
-        if (dy > 8) {
-            const cp = Math.max(24, Math.min(Math.abs(dy) * 0.34 + Math.abs(offset) * 0.7, 96));
-            const c1x = x1 + offset;
-            const c2x = x2 + offset;
-            d = `M${x1},${y1} C${c1x},${y1+cp} ${c2x},${y2-cp} ${x2},${y2}`;
-        } else if (dy < -8) {
-            const horizontal = sideBias * Math.max(52, Math.abs(dx) * 0.42 + 34 + Math.abs(offset));
-            const rise = Math.max(18, Math.min(72, Math.abs(offset) + 24));
-            d = `M${x1},${y1} C${x1+horizontal},${y1-rise} ${x2+horizontal},${y2+rise} ${x2},${y2}`;
-        } else {
-            const midX = (x1 + x2) / 2 + offset;
-            const midY = (y1 + y2) / 2 + 14 + Math.abs(offset) * 0.28;
-            d = `M${x1},${y1} Q${midX},${midY} ${x2},${y2}`;
-        }
-        return { d };
-    }
-
-    // Rank-aware edge routing for intra-group edges.
-    // - Same-rank edges (rare; usually a layout artifact) are drawn as a
-    //   horizontal-ish curve below the row.
-    // - Adjacent-rank edges go straight down with a gentle bezier.
-    // - Skip-rank edges (span > 1 row) are routed around the intermediate
-    //   rows by bending sideways, choosing the side closest to the source/dest
-    //   x. Each skip edge gets its own lane offset to avoid overlap.
-    function buildIntraGroupEdgePath(fr, to, routeCtx, edgeData) {
-        const { groupLeft, groupRight, childLeftEdge, childRightEdge, skipLaneCounter } = routeCtx;
-        // Source: bottom-center of the from rect; Dest: top-center of the to rect
-        const x1 = fr.x + fr.w / 2, y1 = fr.y + fr.h;
-        const x2 = to.x + to.w / 2, y2 = to.y;
-        const fromRank = fr.rank, toRank = to.rank;
-        const routeMeta = EDGE_BUNDLE_META.get(edgeKey(edgeData)) || null;
-        if (toRank < 0) {
-            return buildDirectEdgePath(x1, y1, x2, y2, routeMeta);
-        }
-        const span = Math.abs(toRank - fromRank);
-
-        if (span <= 1 && y2 > y1) {
-            return buildDirectEdgePath(x1, y1, x2, y2, routeMeta);
-        }
-        if (span === 0) {
-            return {
-                d: `M${x1},${y1} C${x1},${y1+14} ${x2},${y2+14} ${x2},${y2}`,
-            };
-        }
-
-        const groupMidX = (childLeftEdge + childRightEdge) / 2;
-        const avgX = (x1 + x2) / 2;
-        const preferRight = avgX >= groupMidX;
-        let laneIndex;
-        if (preferRight) {
-            laneIndex = skipLaneCounter.right++;
-        } else {
-            laneIndex = skipLaneCounter.left++;
-        }
-        const laneStep = 9;
-        const laneX = preferRight
-            ? Math.min(groupRight - 4, childRightEdge + 14 + (laneIndex % 4) * laneStep)
-            : Math.max(groupLeft + 4, childLeftEdge - 14 - (laneIndex % 4) * laneStep);
-
-        const verticalApproach = 18;
-        const d = [
-            `M${x1},${y1}`,
-            `C${x1},${y1 + verticalApproach} ${laneX},${y1 + verticalApproach} ${laneX},${y1 + verticalApproach + 10}`,
-            `L${laneX},${y2 - verticalApproach - 10}`,
-            `C${laneX},${y2 - verticalApproach} ${x2},${y2 - verticalApproach} ${x2},${y2}`
-        ].join(' ');
-        return { d, opacity: '0.7' };
-    }
-
-    function createEdgePathElement(d) {
-        const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-        path.setAttribute('d', d);
-        return path;
-    }
-
-    function finalizeEdgeRendering(path) {
-        svg.appendChild(path);
-        configureLongEdgeDisplay(path);
-    }
-
-    function renderEdge(edgeSpec) {
-        let pathSpec = null;
-        if (edgeSpec.routingMode === 'direct') {
-            pathSpec = buildDirectEdgePath(edgeSpec.x1, edgeSpec.y1, edgeSpec.x2, edgeSpec.y2, edgeSpec.routeMeta);
-        } else if (edgeSpec.routingMode === 'intra_group') {
-            pathSpec = buildIntraGroupEdgePath(edgeSpec.fr, edgeSpec.to, edgeSpec.routeCtx, edgeSpec.edgeData);
-        } else {
-            throw new Error(`Unknown edge routing mode: ${edgeSpec.routingMode}`);
-        }
-        if (!pathSpec) return;
-        const path = createEdgePathElement(pathSpec.d);
-        applyEdgePresentation(path, edgeSpec.type, pathSpec.opacity ?? null);
-        bindEdgeInteractions(path, edgeSpec.edgeData);
-        finalizeEdgeRendering(path);
-    }
-
-    function registerEdgeDom(path, edgeData) {
-        if (!path || !edgeData) return;
-        edgeDomRegistry.push({ path, edge: edgeData, key: edgeKey(edgeData) });
-    }
-
-    function applyEdgePresentation(path, type, opacity=null) {
-        path.setAttribute('class', `edge-path ${type || ''}`);
-        if (type === 'dep') {
-            path.setAttribute('marker-end', 'url(#arrowhead-dep)');
-        } else if (type === 'internal') {
-            path.setAttribute('marker-end', 'url(#arrowhead-blue)');
-        } else {
-            path.setAttribute('marker-end', 'url(#arrowhead)');
-        }
-        if (opacity !== null) {
-            path.setAttribute('opacity', opacity);
-        }
-    }
-
-    function showOverlapBadge(e, idx, total) {
-        let badge = document.getElementById('overlap-badge');
-        if (!badge) {
-            badge = document.createElement('div');
-            badge.id = 'overlap-badge';
-            badge.style.cssText = 'position:fixed;background:rgba(30,30,40,0.92);color:#e0e0e0;'
-                + 'font-size:12px;padding:3px 8px;border-radius:4px;pointer-events:none;'
-                + 'z-index:9999;white-space:nowrap;border:1px solid rgba(255,255,255,0.15);';
-            document.body.appendChild(badge);
-        }
-        badge.textContent = `${idx + 1}/${total}  ·  scroll to switch`;
-        badge.style.left = (e.clientX + 14) + 'px';
-        badge.style.top  = (e.clientY - 10) + 'px';
-        badge.style.display = 'block';
-    }
-    function hideOverlapBadge() {
-        const badge = document.getElementById('overlap-badge');
-        if (badge) badge.style.display = 'none';
-    }
-    function updateOverlapBadge() {
-        const badge = document.getElementById('overlap-badge');
-        if (!badge || hoveredEdges.length <= 1) return;
-        badge.textContent = `${hoveredEdgeIdx + 1}/${hoveredEdges.length}  ·  scroll to switch`;
-    }
-
-    function bindEdgeInteractions(path, edgeData) {
-        if (!path || !edgeData) return;
-        const key = edgeKey(edgeData);
-        path.style.cursor = 'pointer';
-        path.dataset.edgeKey = key;
-        path.addEventListener('mouseenter', (e) => {
-            const pt = svg.createSVGPoint();
-            pt.x = e.clientX;
-            pt.y = e.clientY;
-            const svgPt = pt.matrixTransform(svg.getScreenCTM().inverse());
-
-            const seen = new Set();
-            hoveredEdges = edgeDomRegistry.filter(item => {
-                if (!item.path) return false;
-                const saved = item.path.getAttribute('stroke-width');
-                item.path.setAttribute('stroke-width', '20');
-                const hit = item.path.isPointInStroke(svgPt);
-                item.path.setAttribute('stroke-width', saved ?? '2');
-                if (!hit) return false;
-                if (seen.has(item.key)) return false;
-                seen.add(item.key);
-                return true;
+                return !isCollapsed;
             });
-            hoveredEdgeIdx = hoveredEdges.findIndex(item => item.key === key);
-            if (hoveredEdgeIdx < 0) hoveredEdgeIdx = 0;
-            hoveredEdgeKey = hoveredEdges.length > 0 ? hoveredEdges[hoveredEdgeIdx].key : key;
-            applyEdgeFocusState();
-            if (hoveredEdges.length > 1) showOverlapBadge(e, hoveredEdgeIdx, hoveredEdges.length);
-            path._overlapMoveHandler = (ev) => {
-                const badge = document.getElementById('overlap-badge');
-                if (badge && badge.style.display !== 'none') {
-                    badge.style.left = (ev.clientX + 14) + 'px';
-                    badge.style.top  = (ev.clientY - 10) + 'px';
-                }
-            };
-            path.addEventListener('mousemove', path._overlapMoveHandler);
-        });
-        path.addEventListener('mouseleave', () => {
-            if (path._overlapMoveHandler) {
-                path.removeEventListener('mousemove', path._overlapMoveHandler);
-                path._overlapMoveHandler = null;
+            const hasInlineRow = row.items.some(item => {
+                if (item.isIOGroup !== true) return true;
+                const ioGroup = item.ioGroup;
+                const isCollapsed = (ioGroup.id in collapsedState) ? collapsedState[ioGroup.id] : ioGroup.collapsed;
+                return isCollapsed;
+            });
+            let height = hasInlineRow ? ioH : 0;
+            if (expandedGroups.length > 0) {
+                const groupCount = expandedGroups.length;
+                const colW = (svgW - (groupCount - 1) * EXPAND_COL_GAP) / groupCount;
+                const expandedH = Math.max(...expandedGroups.map(item => calcIOGroupExpandedHeight(item.ioGroup, colW)));
+                height += (height > 0 ? ioGap : 0) + expandedH;
             }
-            hoveredEdges = [];
-            hoveredEdgeIdx = 0;
-            hoveredEdgeKey = null;
-            hideOverlapBadge();
-            applyEdgeFocusState();
-        });
-        path.addEventListener('wheel', (e) => {
-            if (hoveredEdges.length <= 1) return;
-            e.preventDefault();
-            hoveredEdgeIdx = (hoveredEdgeIdx + (e.deltaY > 0 ? 1 : -1) + hoveredEdges.length) % hoveredEdges.length;
-            hoveredEdgeKey = hoveredEdges[hoveredEdgeIdx].key;
-            applyEdgeFocusState();
-            updateOverlapBadge();
-            showEdgePanel(hoveredEdges[hoveredEdgeIdx].edge);
-        }, { passive: false });
-        path.addEventListener('click', (e) => {
-            e.stopPropagation();
-            const alreadyActive = focusedEdgePath === key;
-            if (alreadyActive) {
-                focusedEdgePath = null;
-                applyEdgeFocusState();
-            } else {
-                setEdgeFocus(key);
+            return height;
+        };
+        const topIOHeight = topIORows.length > 0 ? topIORows.reduce((acc, row, idx) => acc + calcIORowHeight(row) + (idx > 0 ? ioGap : 0), 0) : 0;
+        const bottomIOHeight = bottomIORows.length > 0 ? bottomIORows.reduce((acc, row, idx) => acc + calcIORowHeight(row) + (idx > 0 ? ioGap : 0), 0) : 0;
+        const rootStartY = 30 + (topIOHeight > 0 ? topIOHeight + ioGap : 0);
+        const svgH = 30 + topIOHeight + (topIOHeight > 0 ? ioGap : 0) + maxRootH + (bottomIOHeight > 0 ? ioGap + bottomIOHeight : 0) + 40;
+        assertActiveRenderGeneration(generation, '布局阶段');
+        setRenderProgress(25, '正在计算 DAG 布局…');
+        await nextFrame();
+
+        const svg = document.getElementById('dag-svg');
+        svg.onclick = () => clearEdgeFocus();
+        svg.setAttribute('width', svgW);
+        svg.setAttribute('height', svgH);
+        svg.innerHTML = `<defs>
+            <marker id="arrowhead" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+                <polygon points="0 0, 8 3, 0 6" fill="rgba(255,255,255,0.3)"/>
+            </marker>
+            <marker id="arrowhead-blue" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+                <polygon points="0 0, 8 3, 0 6" fill="rgba(100,181,246,0.5)"/>
+            </marker>
+            <marker id="arrowhead-dep" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+                <polygon points="0 0, 8 3, 0 6" fill="rgba(46,204,113,0.6)"/>
+            </marker>
+        </defs>`;
+        assertActiveRenderGeneration(generation, 'SVG 初始化阶段');
+        setRenderProgress(30, '正在初始化画布…');
+        await nextFrame();
+
+        const rootPositions = [];
+        if (rootSizes.length > 0) {
+            const rs = rootSizes[0];
+            const rx = (svgW - rs.w) / 2;
+            const ry = rootStartY;
+            rootPositions.push({ id: rs.id, x: rx, y: ry, w: rs.w, h: rs.h });
+        }
+
+        function appendGroupInfoButton(g, cx, cy, titleText = '') {
+            if (!g || !g.src_file) return;
+            const hit = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+            hit.setAttribute('cx', cx);
+            hit.setAttribute('cy', cy - 1);
+            hit.setAttribute('r', 9);
+            hit.setAttribute('class', 'group-info-hit');
+            hit.addEventListener('click', (e) => {
+                e.stopPropagation();
+                showSourcePanel(g);
+            });
+            svg.appendChild(hit);
+
+            const info = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+            info.setAttribute('x', cx);
+            info.setAttribute('y', cy - 1);
+            info.setAttribute('class', 'group-toggle group-info-text');
+            info.textContent = 'i';
+            if (titleText) {
+                const titleEl = document.createElementNS('http://www.w3.org/2000/svg', 'title');
+                titleEl.textContent = titleText;
+                info.appendChild(titleEl);
             }
-            showEdgePanel(edgeData);
-        });
-        registerEdgeDom(path, edgeData);
-    }
+            svg.appendChild(info);
+        }
 
-    // Render root groups
-    for (const rp of rootPositions) {
-        renderGroupAt(rp.id, rp.x, rp.y);
-    }
+        __RENDER_GROUP_JS_PLACEHOLDER__
 
-    // Render top-level synthetic IO pill nodes
-    function renderIOPill(nid, cx, cy, w, h, label, sublabel, fillColor) {
-        const n = nodeMap[nid];
-        const x = cx - w/2;
-        const y = cy - h/2;
-        const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-        rect.setAttribute('x', x); rect.setAttribute('y', y);
-        rect.setAttribute('width', w); rect.setAttribute('height', h);
-        rect.setAttribute('rx', h / 2); rect.setAttribute('ry', h / 2);
-        rect.setAttribute('class', 'io-node');
-        rect.setAttribute('fill', fillColor);
-        rect.setAttribute('stroke', 'rgba(255,255,255,0.35)');
-        rect.setAttribute('stroke-width', '1.5');
-        if (n) {
+        function renderNodeAt(nid, nx, ny, w, h) {
+            const n = nodeMap[nid];
+            if (!n) return;
+            const color = getNodeColor(n);
+
+            const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+            rect.setAttribute('x', nx); rect.setAttribute('y', ny);
+            rect.setAttribute('width', w); rect.setAttribute('height', h);
+            rect.setAttribute('class', 'leaf-node');
+            rect.setAttribute('fill', color);
+            rect.setAttribute('stroke', 'rgba(255,255,255,0.15)');
+            rect.style.cursor = 'pointer';
             rect.dataset.nid = nid;
             rect.addEventListener('mouseenter', (e) => showTooltip(e, n));
             rect.addEventListener('mouseleave', hideTooltip);
-            bindIONodeHover(rect, nid);
+            rect.addEventListener('click', (e) => { e.stopPropagation(); showSourcePanel(n); });
+            svg.appendChild(rect);
+            registerNodeDom(nid, rect);
+
+            const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+            label.setAttribute('x', nx + w/2); label.setAttribute('y', ny + h/2);
+            label.setAttribute('class', 'node-label');
+            label.style.pointerEvents = 'none';
+            label.textContent = n.class_name;
+            svg.appendChild(label);
+
+            let subText = '';
+            if (n.has_timing) subText = `${n.pct.toFixed(1)}%`;
+            if (subText) {
+                const sub = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+                sub.setAttribute('x', nx + w/2); sub.setAttribute('y', ny + h/2 + 11);
+                sub.setAttribute('class', 'node-sublabel');
+                sub.style.pointerEvents = 'none';
+                sub.textContent = subText;
+                svg.appendChild(sub);
+            }
+
+            nodePortMap[nid] = { cx: nx + w/2, cy: ny + h/2 };
+            nodePortMap[nid + '__in'] = { cx: nx + w/2, cy: ny };
+            nodePortMap[nid + '__out'] = { cx: nx + w/2, cy: ny + h };
         }
-        svg.appendChild(rect);
-        registerNodeDom(nid, rect);
 
-        const lab = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-        lab.setAttribute('x', cx); lab.setAttribute('y', sublabel ? cy - 2 : cy + 4);
-        lab.setAttribute('class', 'node-label');
-        lab.setAttribute('font-weight', '700');
-        lab.textContent = label;
-        svg.appendChild(lab);
-
-        if (sublabel) {
-            const sub = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-            sub.setAttribute('x', cx); sub.setAttribute('y', cy + 11);
-            sub.setAttribute('class', 'node-sublabel');
-            sub.textContent = sublabel;
-            svg.appendChild(sub);
+        function configureLongEdgeDisplay(path) {
+            if (!path) return;
+            let total = NaN;
+            try {
+                total = path.getTotalLength();
+            } catch (err) {
+                total = NaN;
+            }
+            if (!Number.isFinite(total) || total < LONG_EDGE_MIN_SPAN) return;
+            const originalDasharray = path.getAttribute('stroke-dasharray') || '';
+            const originalDashoffset = path.getAttribute('stroke-dashoffset') || '';
+            const stubLen = Math.max(40, Math.min(72, total * 0.12));
+            const gapLen = Math.max(80, total - stubLen * 2);
+            path.dataset.longEdge = '1';
+            path.dataset.fullDasharray = originalDasharray;
+            path.dataset.fullDashoffset = originalDashoffset;
+            path.dataset.truncatedDasharray = `${stubLen} ${gapLen} ${stubLen}`;
+            if (originalDashoffset) {
+                path.dataset.truncatedDashoffset = originalDashoffset;
+            }
+            path.classList.add('long-edge');
+            path.setAttribute('stroke-dasharray', path.dataset.truncatedDasharray);
         }
 
-        nodePortMap[nid] = { cx, cy };
-        nodePortMap[nid + '__in'] = { cx, cy: y };
-        nodePortMap[nid + '__out'] = { cx, cy: y + h };
-    }
+        function buildDirectEdgePath(x1, y1, x2, y2, routeMeta) {
+            const dy = y2 - y1;
+            const dx = x2 - x1;
+            if (Math.abs(dy) < 3 && Math.abs(dx) < 3) return null;
+            const meta = routeMeta || {};
+            const offset = meta.bundleOffset || 0;
+            const sourceFanout = meta.sourceFanout || 1;
+            const targetFanin = meta.targetFanin || 1;
+            const sideBias = offset === 0 ? (dx >= 0 ? 1 : -1) : (offset > 0 ? 1 : -1);
+            let d;
+            if (dy > 8) {
+                const cp = Math.max(24, Math.min(Math.abs(dy) * 0.34 + Math.abs(offset) * 0.7, 96));
+                const c1x = x1 + offset;
+                const c2x = x2 + offset;
+                d = `M${x1},${y1} C${c1x},${y1+cp} ${c2x},${y2-cp} ${x2},${y2}`;
+            } else if (dy < -8) {
+                const horizontal = sideBias * Math.max(52, Math.abs(dx) * 0.42 + 34 + Math.abs(offset));
+                const rise = Math.max(18, Math.min(72, Math.abs(offset) + 24));
+                d = `M${x1},${y1} C${x1+horizontal},${y1-rise} ${x2+horizontal},${y2+rise} ${x2},${y2}`;
+            } else {
+                const midX = (x1 + x2) / 2 + offset;
+                const midY = (y1 + y2) / 2 + 14 + Math.abs(offset) * 0.28;
+                d = `M${x1},${y1} Q${midX},${midY} ${x2},${y2}`;
+            }
+            return { d };
+        }
 
-    const IO_GROUP_FILL = {
-        input: 'rgba(46,204,113,0.55)',
-        param: 'rgba(155,89,182,0.55)',
-        const: 'rgba(241,196,15,0.55)',
-        output: 'rgba(231,76,60,0.55)',
-    };
-    const IO_GROUP_MEMBER_LABEL = { input: 'Input', param: 'Param', const: 'Const', output: 'Result' };
+        function buildIntraGroupEdgePath(fr, to, routeCtx, edgeData) {
+            const { groupLeft, groupRight, childLeftEdge, childRightEdge, skipLaneCounter } = routeCtx;
+            const x1 = fr.x + fr.w / 2, y1 = fr.y + fr.h;
+            const x2 = to.x + to.w / 2, y2 = to.y;
+            const fromRank = fr.rank, toRank = to.rank;
+            const routeMeta = EDGE_BUNDLE_META.get(edgeKey(edgeData)) || null;
+            if (toRank < 0) {
+                return buildDirectEdgePath(x1, y1, x2, y2, routeMeta);
+            }
+            const span = Math.abs(toRank - fromRank);
 
-    function renderIOGroupPill(ioGroup, cx, cy, w, h, availableW = svgW) {
-        const fillColor = IO_GROUP_FILL[ioGroup.io_subtype] || 'rgba(127,140,141,0.55)';
-        const memberLabel = IO_GROUP_MEMBER_LABEL[ioGroup.io_subtype] || ioGroup.io_subtype;
-        const isCollapsed = (ioGroup.id in collapsedState) ? collapsedState[ioGroup.id] : ioGroup.collapsed;
-        const renderCollapseButton = (bcx, bcy) => {
-            const bx = bcx - COLLAPSE_BUTTON_W / 2;
-            const by = bcy - COLLAPSE_BUTTON_H / 2;
+            if (span <= 1 && y2 > y1) {
+                return buildDirectEdgePath(x1, y1, x2, y2, routeMeta);
+            }
+            if (span === 0) {
+                return {
+                    d: `M${x1},${y1} C${x1},${y1+14} ${x2},${y2+14} ${x2},${y2}`,
+                };
+            }
+
+            const groupMidX = (childLeftEdge + childRightEdge) / 2;
+            const avgX = (x1 + x2) / 2;
+            const preferRight = avgX >= groupMidX;
+            let laneIndex;
+            if (preferRight) {
+                laneIndex = skipLaneCounter.right++;
+            } else {
+                laneIndex = skipLaneCounter.left++;
+            }
+            const laneStep = 9;
+            const laneX = preferRight
+                ? Math.min(groupRight - 4, childRightEdge + 14 + (laneIndex % 4) * laneStep)
+                : Math.max(groupLeft + 4, childLeftEdge - 14 - (laneIndex % 4) * laneStep);
+
+            const verticalApproach = 18;
+            const d = [
+                `M${x1},${y1}`,
+                `C${x1},${y1 + verticalApproach} ${laneX},${y1 + verticalApproach} ${laneX},${y1 + verticalApproach + 10}`,
+                `L${laneX},${y2 - verticalApproach - 10}`,
+                `C${laneX},${y2 - verticalApproach} ${x2},${y2 - verticalApproach} ${x2},${y2}`
+            ].join(' ');
+            return { d, opacity: '0.7' };
+        }
+
+        function createEdgePathElement(d) {
+            const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+            path.setAttribute('d', d);
+            return path;
+        }
+
+        function finalizeEdgeRendering(path) {
+            svg.appendChild(path);
+            configureLongEdgeDisplay(path);
+        }
+
+        function renderEdge(edgeSpec) {
+            let pathSpec = null;
+            if (edgeSpec.routingMode === 'direct') {
+                pathSpec = buildDirectEdgePath(edgeSpec.x1, edgeSpec.y1, edgeSpec.x2, edgeSpec.y2, edgeSpec.routeMeta);
+            } else if (edgeSpec.routingMode === 'intra_group') {
+                pathSpec = buildIntraGroupEdgePath(edgeSpec.fr, edgeSpec.to, edgeSpec.routeCtx, edgeSpec.edgeData);
+            } else {
+                throw new Error(`Unknown edge routing mode: ${edgeSpec.routingMode}`);
+            }
+            if (!pathSpec) return;
+            const path = createEdgePathElement(pathSpec.d);
+            applyEdgePresentation(path, edgeSpec.type, pathSpec.opacity ?? null);
+            bindEdgeInteractions(path, edgeSpec.edgeData);
+            finalizeEdgeRendering(path);
+        }
+
+        function registerEdgeDom(path, edgeData) {
+            if (!path || !edgeData) return;
+            edgeDomRegistry.push({ path, edge: edgeData, key: edgeKey(edgeData) });
+        }
+
+        function applyEdgePresentation(path, type, opacity=null) {
+            path.setAttribute('class', `edge-path ${type || ''}`);
+            if (type === 'dep') {
+                path.setAttribute('marker-end', 'url(#arrowhead-dep)');
+            } else if (type === 'internal') {
+                path.setAttribute('marker-end', 'url(#arrowhead-blue)');
+            } else {
+                path.setAttribute('marker-end', 'url(#arrowhead)');
+            }
+            if (opacity !== null) {
+                path.setAttribute('opacity', opacity);
+            }
+        }
+
+        function showOverlapBadge(e, idx, total) {
+            let badge = document.getElementById('overlap-badge');
+            if (!badge) {
+                badge = document.createElement('div');
+                badge.id = 'overlap-badge';
+                badge.style.cssText = 'position:fixed;background:rgba(30,30,40,0.92);color:#e0e0e0;'
+                    + 'font-size:12px;padding:3px 8px;border-radius:4px;pointer-events:none;'
+                    + 'z-index:9999;white-space:nowrap;border:1px solid rgba(255,255,255,0.15);';
+                document.body.appendChild(badge);
+            }
+            badge.textContent = `${idx + 1}/${total}  ·  scroll to switch`;
+            badge.style.left = (e.clientX + 14) + 'px';
+            badge.style.top  = (e.clientY - 10) + 'px';
+            badge.style.display = 'block';
+        }
+        function hideOverlapBadge() {
+            const badge = document.getElementById('overlap-badge');
+            if (badge) badge.style.display = 'none';
+        }
+        function updateOverlapBadge() {
+            const badge = document.getElementById('overlap-badge');
+            if (!badge || hoveredEdges.length <= 1) return;
+            badge.textContent = `${hoveredEdgeIdx + 1}/${hoveredEdges.length}  ·  scroll to switch`;
+        }
+
+        function bindEdgeInteractions(path, edgeData) {
+            if (!path || !edgeData) return;
+            const key = edgeKey(edgeData);
+            path.style.cursor = 'pointer';
+            path.dataset.edgeKey = key;
+            path.addEventListener('mouseenter', (e) => {
+                const pt = svg.createSVGPoint();
+                pt.x = e.clientX;
+                pt.y = e.clientY;
+                const svgPt = pt.matrixTransform(svg.getScreenCTM().inverse());
+
+                const seen = new Set();
+                hoveredEdges = edgeDomRegistry.filter(item => {
+                    if (!item.path) return false;
+                    const saved = item.path.getAttribute('stroke-width');
+                    item.path.setAttribute('stroke-width', '20');
+                    const hit = item.path.isPointInStroke(svgPt);
+                    item.path.setAttribute('stroke-width', saved ?? '2');
+                    if (!hit) return false;
+                    if (seen.has(item.key)) return false;
+                    seen.add(item.key);
+                    return true;
+                });
+                hoveredEdgeIdx = hoveredEdges.findIndex(item => item.key === key);
+                if (hoveredEdgeIdx < 0) hoveredEdgeIdx = 0;
+                hoveredEdgeKey = hoveredEdges.length > 0 ? hoveredEdges[hoveredEdgeIdx].key : key;
+                applyEdgeFocusState();
+                if (hoveredEdges.length > 1) showOverlapBadge(e, hoveredEdgeIdx, hoveredEdges.length);
+                path._overlapMoveHandler = (ev) => {
+                    const badge = document.getElementById('overlap-badge');
+                    if (badge && badge.style.display !== 'none') {
+                        badge.style.left = (ev.clientX + 14) + 'px';
+                        badge.style.top  = (ev.clientY - 10) + 'px';
+                    }
+                };
+                path.addEventListener('mousemove', path._overlapMoveHandler);
+            });
+            path.addEventListener('mouseleave', () => {
+                if (path._overlapMoveHandler) {
+                    path.removeEventListener('mousemove', path._overlapMoveHandler);
+                    path._overlapMoveHandler = null;
+                }
+                hoveredEdges = [];
+                hoveredEdgeIdx = 0;
+                hoveredEdgeKey = null;
+                hideOverlapBadge();
+                applyEdgeFocusState();
+            });
+            path.addEventListener('wheel', (e) => {
+                if (hoveredEdges.length <= 1) return;
+                e.preventDefault();
+                hoveredEdgeIdx = (hoveredEdgeIdx + (e.deltaY > 0 ? 1 : -1) + hoveredEdges.length) % hoveredEdges.length;
+                hoveredEdgeKey = hoveredEdges[hoveredEdgeIdx].key;
+                applyEdgeFocusState();
+                updateOverlapBadge();
+                showEdgePanel(hoveredEdges[hoveredEdgeIdx].edge);
+            }, { passive: false });
+            path.addEventListener('click', (e) => {
+                e.stopPropagation();
+                const alreadyActive = focusedEdgePath === key;
+                if (alreadyActive) {
+                    focusedEdgePath = null;
+                    applyEdgeFocusState();
+                } else {
+                    setEdgeFocus(key);
+                }
+                showEdgePanel(edgeData);
+            });
+            registerEdgeDom(path, edgeData);
+        }
+
+        function renderGroupTask(task) {
+            if (task.type === 'node') {
+                renderNodeAt(task.nid, task.x, task.y, task.w, task.h);
+                return;
+            }
+            if (task.type !== 'group') {
+                throw new Error(`renderGroupTask got unsupported task type: ${task.type}`);
+            }
+            const ctx = task.ctx;
+            if (!ctx || !ctx.g || !ctx.pos) {
+                throw new Error(`renderGroupTask got invalid context for task: ${task.taskKind || '<missing>'}`);
+            }
+            if (task.taskKind === 'collapsed_group') {
+                RENDER_GROUP_EXPORTS.renderCollapsedGroupBox(ctx);
+                RENDER_GROUP_EXPORTS.renderCollapsedGroupLabel(ctx);
+                RENDER_GROUP_EXPORTS.renderCollapsedGroupTiming(ctx);
+                RENDER_GROUP_EXPORTS.renderCollapsedGroupInfoButton(ctx);
+                RENDER_GROUP_EXPORTS.registerCollapsedGroupPorts(ctx);
+                return;
+            }
+            if (task.taskKind === 'expanded_group_shell') {
+                RENDER_GROUP_EXPORTS.renderExpandedGroupBox(ctx);
+                const { headerText } = RENDER_GROUP_EXPORTS.renderExpandedGroupHeaderLabel(ctx);
+                RENDER_GROUP_EXPORTS.renderExpandedGroupInfoButton(ctx, headerText);
+                RENDER_GROUP_EXPORTS.renderExpandedGroupTiming(ctx);
+                return;
+            }
+            if (task.taskKind === 'expanded_group_ports') {
+                RENDER_GROUP_EXPORTS.registerExpandedGroupPorts(ctx);
+                return;
+            }
+            throw new Error(`renderGroupTask got unknown taskKind: ${task.taskKind}`);
+        }
+
+        function collectGroupRenderTasks(items) {
+            const tasks = [];
+            function visitGroup(gid, ox, oy) {
+                const ctx = RENDER_GROUP_EXPORTS.getGroupRenderContext(gid, ox, oy);
+                if (!ctx || !ctx.pos) {
+                    throw new Error(`collectGroupRenderTasks missing layout for group: ${gid}`);
+                }
+                if (ctx.pos.collapsed) {
+                    tasks.push({ type: 'group', taskKind: 'collapsed_group', ctx });
+                    return;
+                }
+                tasks.push({ type: 'group', taskKind: 'expanded_group_shell', ctx });
+                for (const child of (ctx.pos.childPositions || [])) {
+                    if (child.type === 'node') {
+                        tasks.push({
+                            type: 'node',
+                            taskKind: 'node',
+                            nid: child.id,
+                            x: ctx.ox + child.x,
+                            y: ctx.oy + child.y,
+                            w: child.w,
+                            h: child.h,
+                        });
+                    } else if (child.type === 'group') {
+                        visitGroup(child.id, ctx.ox + child.x, ctx.oy + child.y);
+                    } else {
+                        throw new Error(`collectGroupRenderTasks got unknown child type: ${child.type}`);
+                    }
+                }
+                tasks.push({ type: 'group', taskKind: 'expanded_group_ports', ctx });
+            }
+            for (const item of items) {
+                visitGroup(item.id, item.x, item.y);
+            }
+            return tasks;
+        }
+
+        function collectInternalEdgeTasks(items) {
+            const tasks = [];
+            function visitGroup(gid, ox, oy) {
+                const ctx = RENDER_GROUP_EXPORTS.getGroupRenderContext(gid, ox, oy);
+                if (!ctx || !ctx.pos) {
+                    throw new Error(`collectInternalEdgeTasks missing layout for group: ${gid}`);
+                }
+                if (ctx.pos.collapsed) {
+                    return;
+                }
+                for (const child of (ctx.pos.childPositions || [])) {
+                    if (child.type === 'group') {
+                        visitGroup(child.id, ctx.ox + child.x, ctx.oy + child.y);
+                    }
+                }
+                const routeCtx = RENDER_GROUP_EXPORTS.buildInternalEdgeRoutingContext(ctx);
+                for (const edgeDef of (ctx.g.internal_edges || [])) {
+                    tasks.push({ type: 'edge', taskKind: 'internal_edge', ctx, routeCtx, edgeDef });
+                }
+            }
+            for (const item of items) {
+                visitGroup(item.id, item.x, item.y);
+            }
+            return tasks;
+        }
+
+        function renderIOPill(nid, cx, cy, w, h, label, sublabel, fillColor) {
+            const n = nodeMap[nid];
+            const x = cx - w/2;
+            const y = cy - h/2;
             const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-            rect.setAttribute('x', bx); rect.setAttribute('y', by);
-            rect.setAttribute('width', COLLAPSE_BUTTON_W); rect.setAttribute('height', COLLAPSE_BUTTON_H);
-            rect.setAttribute('rx', COLLAPSE_BUTTON_H / 2); rect.setAttribute('ry', COLLAPSE_BUTTON_H / 2);
+            rect.setAttribute('x', x); rect.setAttribute('y', y);
+            rect.setAttribute('width', w); rect.setAttribute('height', h);
+            rect.setAttribute('rx', h / 2); rect.setAttribute('ry', h / 2);
+            rect.setAttribute('class', 'io-node');
+            rect.setAttribute('fill', fillColor);
+            rect.setAttribute('stroke', 'rgba(255,255,255,0.35)');
+            rect.setAttribute('stroke-width', '1.5');
+            if (n) {
+                rect.dataset.nid = nid;
+                rect.addEventListener('mouseenter', (e) => showTooltip(e, n));
+                rect.addEventListener('mouseleave', hideTooltip);
+                bindIONodeHover(rect, nid);
+            }
+            svg.appendChild(rect);
+            registerNodeDom(nid, rect);
+
+            const lab = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+            lab.setAttribute('x', cx); lab.setAttribute('y', sublabel ? cy - 2 : cy + 4);
+            lab.setAttribute('class', 'node-label');
+            lab.setAttribute('font-weight', '700');
+            lab.textContent = label;
+            svg.appendChild(lab);
+
+            if (sublabel) {
+                const sub = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+                sub.setAttribute('x', cx); sub.setAttribute('y', cy + 11);
+                sub.setAttribute('class', 'node-sublabel');
+                sub.textContent = sublabel;
+                svg.appendChild(sub);
+            }
+
+            nodePortMap[nid] = { cx, cy };
+            nodePortMap[nid + '__in'] = { cx, cy: y };
+            nodePortMap[nid + '__out'] = { cx, cy: y + h };
+        }
+
+        const IO_GROUP_FILL = {
+            input: 'rgba(46,204,113,0.55)',
+            param: 'rgba(155,89,182,0.55)',
+            const: 'rgba(241,196,15,0.55)',
+            output: 'rgba(231,76,60,0.55)',
+        };
+        const IO_GROUP_MEMBER_LABEL = { input: 'Input', param: 'Param', const: 'Const', output: 'Result' };
+
+        function renderIOGroupPill(ioGroup, cx, cy, w, h, availableW = svgW) {
+            const fillColor = IO_GROUP_FILL[ioGroup.io_subtype] || 'rgba(127,140,141,0.55)';
+            const memberLabel = IO_GROUP_MEMBER_LABEL[ioGroup.io_subtype] || ioGroup.io_subtype;
+            const isCollapsed = (ioGroup.id in collapsedState) ? collapsedState[ioGroup.id] : ioGroup.collapsed;
+            const renderCollapseButton = (bcx, bcy) => {
+                const bx = bcx - COLLAPSE_BUTTON_W / 2;
+                const by = bcy - COLLAPSE_BUTTON_H / 2;
+                const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+                rect.setAttribute('x', bx); rect.setAttribute('y', by);
+                rect.setAttribute('width', COLLAPSE_BUTTON_W); rect.setAttribute('height', COLLAPSE_BUTTON_H);
+                rect.setAttribute('rx', COLLAPSE_BUTTON_H / 2); rect.setAttribute('ry', COLLAPSE_BUTTON_H / 2);
+                rect.setAttribute('class', 'io-node io-group');
+                rect.setAttribute('fill', 'transparent');
+                rect.setAttribute('stroke', 'rgba(255,255,255,0.45)');
+                rect.setAttribute('stroke-width', '1.5');
+                rect.style.cursor = 'pointer';
+                rect.dataset.ioGroupId = ioGroup.id;
+                rect.addEventListener('dblclick', (e) => {
+                    e.stopPropagation();
+                    collapsedState[ioGroup.id] = true;
+                    invokeRender();
+                });
+                svg.appendChild(rect);
+
+                const lab = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+                lab.setAttribute('x', bcx); lab.setAttribute('y', bcy + 4);
+                lab.setAttribute('class', 'node-label');
+                lab.setAttribute('font-weight', '700');
+                lab.textContent = '▲ 收起';
+                lab.style.pointerEvents = 'none';
+                svg.appendChild(lab);
+            };
+            if (!isCollapsed) {
+                const members = ioGroup.member_ids || [];
+                if (members.length === 0) return 0;
+                const { cols, pillW, memberRows, height: expandedHeight } = computeIOGroupExpandedLayout(members.length, availableW);
+                const startY = cy - EXPANDED_IO_H / 2;
+                const frameX = cx - availableW / 2 + EXPAND_FRAME_PAD - 8;
+                const frameY = startY - 8;
+                const frameW = availableW - 2 * (EXPAND_FRAME_PAD - 8);
+                const frameH = expandedHeight + 8;
+                const frame = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+                frame.setAttribute('x', frameX); frame.setAttribute('y', frameY);
+                frame.setAttribute('width', frameW); frame.setAttribute('height', frameH);
+                frame.setAttribute('rx', 10); frame.setAttribute('ry', 10);
+                frame.setAttribute('fill', 'rgba(255,255,255,0.03)');
+                frame.setAttribute('stroke', fillColor);
+                frame.setAttribute('stroke-width', '1.5');
+                frame.setAttribute('stroke-dasharray', '5,4');
+                svg.appendChild(frame);
+
+                const truncateSublabel = (text) => {
+                    const limit = Math.max(1, Math.floor(pillW / 6.5));
+                    return text.length > limit ? `${text.slice(0, Math.max(0, limit - 1))}…` : text;
+                };
+                for (let rowIdx = 0; rowIdx < memberRows; rowIdx++) {
+                    const first = rowIdx * cols;
+                    const rowMemberCount = Math.max(0, Math.min(cols, members.length - first));
+                    const rowWidth = rowMemberCount * pillW + (rowMemberCount - 1) * pillGap;
+                    let left = cx - rowWidth / 2;
+                    const rowCy = startY + rowIdx * (EXPANDED_IO_H + EXPANDED_IO_GAP) + EXPANDED_IO_H / 2;
+                    for (let idx = 0; idx < rowMemberCount; idx++) {
+                        const memberId = members[first + idx];
+                        const node = nodeMap[memberId];
+                        const baseText = node ? node.class_name : memberLabel;
+                        const sublabel = (node && node.has_timing)
+                            ? `${baseText} · ${node.pct.toFixed(1)}%`
+                            : baseText;
+                        renderIOPill(memberId, left + pillW / 2, rowCy, pillW, EXPANDED_IO_H, memberLabel, truncateSublabel(sublabel), fillColor);
+                        left += pillW + pillGap;
+                    }
+                }
+                const collapseRowCy = frameY + frameH - COLLAPSE_BOTTOM_PADDING - COLLAPSE_BUTTON_H / 2;
+                renderCollapseButton(cx, collapseRowCy);
+                return expandedHeight;
+            }
+            const x = cx - w / 2;
+            const y = cy - h / 2;
+            const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+            rect.setAttribute('x', x); rect.setAttribute('y', y);
+            rect.setAttribute('width', w); rect.setAttribute('height', h);
+            rect.setAttribute('rx', h / 2); rect.setAttribute('ry', h / 2);
             rect.setAttribute('class', 'io-node io-group');
-            rect.setAttribute('fill', 'transparent');
-            rect.setAttribute('stroke', 'rgba(255,255,255,0.45)');
+            rect.setAttribute('fill', fillColor);
+            rect.setAttribute('stroke', 'rgba(255,255,255,0.35)');
             rect.setAttribute('stroke-width', '1.5');
             rect.style.cursor = 'pointer';
             rect.dataset.ioGroupId = ioGroup.id;
             rect.addEventListener('dblclick', (e) => {
                 e.stopPropagation();
-                collapsedState[ioGroup.id] = true;
-                render();
+                collapsedState[ioGroup.id] = false;
+                invokeRender();
             });
             svg.appendChild(rect);
 
             const lab = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-            lab.setAttribute('x', bcx); lab.setAttribute('y', bcy + 4);
+            lab.setAttribute('x', cx); lab.setAttribute('y', cy + 4);
             lab.setAttribute('class', 'node-label');
             lab.setAttribute('font-weight', '700');
-            lab.textContent = '▲ 收起';
+            lab.textContent = `▶ ${ioGroup.label}`;
             lab.style.pointerEvents = 'none';
             svg.appendChild(lab);
-        };
-        if (!isCollapsed) {
-            const members = ioGroup.member_ids || [];
-            if (members.length === 0) return 0;
-            const { cols, pillW, memberRows, height: expandedHeight } = computeIOGroupExpandedLayout(members.length, availableW);
-            const startY = cy - EXPANDED_IO_H / 2;
-            const frameX = cx - availableW / 2 + EXPAND_FRAME_PAD - 8;
-            const frameY = startY - 8;
-            const frameW = availableW - 2 * (EXPAND_FRAME_PAD - 8);
-            const frameH = expandedHeight + 8;
-            const frame = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-            frame.setAttribute('x', frameX); frame.setAttribute('y', frameY);
-            frame.setAttribute('width', frameW); frame.setAttribute('height', frameH);
-            frame.setAttribute('rx', 10); frame.setAttribute('ry', 10);
-            frame.setAttribute('fill', 'rgba(255,255,255,0.03)');
-            frame.setAttribute('stroke', fillColor);
-            frame.setAttribute('stroke-width', '1.5');
-            frame.setAttribute('stroke-dasharray', '5,4');
-            svg.appendChild(frame);
 
-            const truncateSublabel = (text) => {
-                const limit = Math.max(1, Math.floor(pillW / 6.5));
-                return text.length > limit ? `${text.slice(0, Math.max(0, limit - 1))}…` : text;
-            };
-            for (let rowIdx = 0; rowIdx < memberRows; rowIdx++) {
-                const first = rowIdx * cols;
-                const rowMemberCount = Math.max(0, Math.min(cols, members.length - first));
-                const rowWidth = rowMemberCount * pillW + (rowMemberCount - 1) * pillGap;
-                let left = cx - rowWidth / 2;
-                const rowCy = startY + rowIdx * (EXPANDED_IO_H + EXPANDED_IO_GAP) + EXPANDED_IO_H / 2;
-                for (let idx = 0; idx < rowMemberCount; idx++) {
-                    const memberId = members[first + idx];
-                    const node = nodeMap[memberId];
-                    const baseText = node ? node.class_name : memberLabel;
-                    const sublabel = (node && node.has_timing)
-                        ? `${baseText} · ${node.pct.toFixed(1)}%`
-                        : baseText;
-                    renderIOPill(memberId, left + pillW / 2, rowCy, pillW, EXPANDED_IO_H, memberLabel, truncateSublabel(sublabel), fillColor);
-                    left += pillW + pillGap;
-                }
-            }
-            const collapseRowCy = frameY + frameH - COLLAPSE_BOTTOM_PADDING - COLLAPSE_BUTTON_H / 2;
-            renderCollapseButton(cx, collapseRowCy);
-            return expandedHeight;
-        }
-        // Collapsed: single pill representing the whole IO group
-        const x = cx - w / 2;
-        const y = cy - h / 2;
-        const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-        rect.setAttribute('x', x); rect.setAttribute('y', y);
-        rect.setAttribute('width', w); rect.setAttribute('height', h);
-        rect.setAttribute('rx', h / 2); rect.setAttribute('ry', h / 2);
-        rect.setAttribute('class', 'io-node io-group');
-        rect.setAttribute('fill', fillColor);
-        rect.setAttribute('stroke', 'rgba(255,255,255,0.35)');
-        rect.setAttribute('stroke-width', '1.5');
-        rect.style.cursor = 'pointer';
-        rect.dataset.ioGroupId = ioGroup.id;
-        rect.addEventListener('dblclick', (e) => {
-            e.stopPropagation();
-            collapsedState[ioGroup.id] = false;
-            render();
-        });
-        svg.appendChild(rect);
-
-        const lab = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-        lab.setAttribute('x', cx); lab.setAttribute('y', cy + 4);
-        lab.setAttribute('class', 'node-label');
-        lab.setAttribute('font-weight', '700');
-        lab.textContent = `▶ ${ioGroup.label}`;
-        lab.style.pointerEvents = 'none';
-        svg.appendChild(lab);
-
-        nodePortMap[ioGroup.id] = { cx, cy };
-        nodePortMap[ioGroup.id + '__in'] = { cx, cy: y };
-        nodePortMap[ioGroup.id + '__out'] = { cx, cy: y + h };
-        return h;
-    }
-
-    function renderIOPillRow(row, startY) {
-        if (!row || !row.items || row.items.length === 0) return 0;
-        let y = startY;
-        const inlineItems = [];
-        const expandedItems = [];
-        for (const item of row.items) {
-            if (item.isIOGroup === true) {
-                const ioGroup = item.ioGroup;
-                const isCollapsed = (ioGroup.id in collapsedState) ? collapsedState[ioGroup.id] : ioGroup.collapsed;
-                if (!isCollapsed) {
-                    expandedItems.push(item);
-                    continue;
-                }
-            }
-            inlineItems.push(item);
+            nodePortMap[ioGroup.id] = { cx, cy };
+            nodePortMap[ioGroup.id + '__in'] = { cx, cy: y };
+            nodePortMap[ioGroup.id + '__out'] = { cx, cy: y + h };
+            return h;
         }
 
-        if (inlineItems.length > 0) {
-            const rowWidth = inlineItems.length * ioW + (inlineItems.length - 1) * pillGap;
-            let left = (svgW - rowWidth) / 2;
-            const cy = y + ioH / 2;
-            for (const item of inlineItems) {
+        function collectIORenderTasks(row, startY) {
+            if (!row || !row.items || row.items.length === 0) return { tasks: [], height: 0 };
+            let y = startY;
+            const tasks = [];
+            const inlineItems = [];
+            const expandedItems = [];
+            for (const item of row.items) {
                 if (item.isIOGroup === true) {
-                    renderIOGroupPill(item.ioGroup, left + ioW / 2, cy, ioW, ioH);
-                    left += ioW + pillGap;
-                    continue;
+                    const ioGroup = item.ioGroup;
+                    const isCollapsed = (ioGroup.id in collapsedState) ? collapsedState[ioGroup.id] : ioGroup.collapsed;
+                    if (!isCollapsed) {
+                        expandedItems.push(item);
+                        continue;
+                    }
                 }
-                const nid = item.id;
-                const node = nodeMap[nid];
-                const baseText = node ? node.class_name : item.defaultSublabel;
-                const sublabel = (node && node.has_timing)
-                    ? `${baseText} · ${node.pct.toFixed(1)}%`
-                    : baseText;
-                renderIOPill(nid, left + ioW / 2, cy, ioW, ioH, item.label, sublabel, item.fillColor);
-                left += ioW + pillGap;
+                inlineItems.push(item);
             }
-            y += ioH;
-        }
 
-        if (expandedItems.length > 0) {
-            if (y > startY) y += ioGap;
-            const groupCount = expandedItems.length;
-            const colW = (svgW - (groupCount - 1) * EXPAND_COL_GAP) / groupCount;
-            const expandedHeight = Math.max(...expandedItems.map(item => calcIOGroupExpandedHeight(item.ioGroup, colW)));
-            let left = 0;
-            for (const item of expandedItems) {
-                renderIOGroupPill(item.ioGroup, left + colW / 2, y + EXPANDED_IO_H / 2, ioW, ioH, colW);
-                left += colW + EXPAND_COL_GAP;
+            if (inlineItems.length > 0) {
+                const rowWidth = inlineItems.length * ioW + (inlineItems.length - 1) * pillGap;
+                let left = (svgW - rowWidth) / 2;
+                const cy = y + ioH / 2;
+                for (const item of inlineItems) {
+                    if (item.isIOGroup === true) {
+                        tasks.push({ type: 'io', taskKind: 'io_group', ioGroup: item.ioGroup, cx: left + ioW / 2, cy, w: ioW, h: ioH, availableW: svgW });
+                    } else {
+                        const nid = item.id;
+                        const node = nodeMap[nid];
+                        const baseText = node ? node.class_name : item.defaultSublabel;
+                        const sublabel = (node && node.has_timing)
+                            ? `${baseText} · ${node.pct.toFixed(1)}%`
+                            : baseText;
+                        tasks.push({ type: 'io', taskKind: 'io_pill', nid, cx: left + ioW / 2, cy, w: ioW, h: ioH, label: item.label, sublabel, fillColor: item.fillColor });
+                    }
+                    left += ioW + pillGap;
+                }
+                y += ioH;
             }
-            y += expandedHeight;
+
+            if (expandedItems.length > 0) {
+                if (y > startY) y += ioGap;
+                const groupCount = expandedItems.length;
+                const colW = (svgW - (groupCount - 1) * EXPAND_COL_GAP) / groupCount;
+                const expandedHeight = Math.max(...expandedItems.map(item => calcIOGroupExpandedHeight(item.ioGroup, colW)));
+                let left = 0;
+                for (const item of expandedItems) {
+                    tasks.push({ type: 'io', taskKind: 'io_group', ioGroup: item.ioGroup, cx: left + colW / 2, cy: y + EXPANDED_IO_H / 2, w: ioW, h: ioH, availableW: colW });
+                    left += colW + EXPAND_COL_GAP;
+                }
+                y += expandedHeight;
+            }
+            return { tasks, height: y - startY };
         }
-        return y - startY;
-    }
 
-    let topIOY = 30;
-    for (const row of topIORows) {
-        const renderedHeight = renderIOPillRow(row, topIOY);
-        topIOY += renderedHeight + ioGap;
-    }
-
-    const rootEntry = rootPositions[0];
-    let bottomIOY = rootEntry ? (rootEntry.y + rootEntry.h + ioGap) : (rootStartY + maxRootH + ioGap);
-    for (const row of bottomIORows) {
-        const renderedHeight = renderIOPillRow(row, bottomIOY);
-        bottomIOY += renderedHeight + ioGap;
-    }
-
-
-    // Global edge pass: draw all data dependency edges using registered nodePortMap coordinates
-    for (const edge of DATA.edges) {
-        if (!isEdgeVisible(edge)) continue;
-        const fromId = resolveCollapsedAncestor(edge.from);
-        const toId   = resolveCollapsedAncestor(edge.to);
-        if (fromId === toId) continue;
-        const fromPos = nodePortMap[fromId + '__out'] || nodePortMap[fromId];
-        const toPos   = nodePortMap[toId   + '__in']  || nodePortMap[toId];
-        if (fromPos && toPos) {
-            renderEdge({
-                routingMode: 'direct',
-                x1: fromPos.cx, y1: fromPos.cy,
-                x2: toPos.cx, y2: toPos.cy,
-                type: edge.type || 'dep',
-                edgeData: edge,
-                routeMeta: EDGE_BUNDLE_META.get(edgeKey(edge)) || null,
-            });
+        function renderIOTask(task) {
+            if (task.type !== 'io') {
+                throw new Error(`renderIOTask got unsupported task type: ${task.type}`);
+            }
+            if (task.taskKind === 'io_group') {
+                renderIOGroupPill(task.ioGroup, task.cx, task.cy, task.w, task.h, task.availableW);
+                return;
+            }
+            if (task.taskKind === 'io_pill') {
+                renderIOPill(task.nid, task.cx, task.cy, task.w, task.h, task.label, task.sublabel, task.fillColor);
+                return;
+            }
+            throw new Error(`renderIOTask got unknown taskKind: ${task.taskKind}`);
         }
-    }
 
-    // Header info
-    const meta = DATA.meta;
-    if (DATA.has_timing) {
-        document.getElementById('mode-badge').innerHTML = '<span class="mode-badge mode-timing">📊 Structure + Timing</span>';
-        document.getElementById('meta-info').textContent = `Device: ${meta.device} | Step: ${meta.step_dur_str} | Modules: ${meta.num_modules}`;
-    } else {
-        document.getElementById('mode-badge').innerHTML = '<span class="mode-badge mode-structure">🏗️ Static Structure (source code)</span>';
-        document.getElementById('meta-info').textContent = `Modules: ${meta.num_modules} | Root: ${meta.roots ? meta.roots.join(", ") : "N/A"}`;
-    }
+        const groupTasks = collectGroupRenderTasks(rootPositions);
+        const ioTasks = [];
+        let topIOY = 30;
+        for (const row of topIORows) {
+            const plan = collectIORenderTasks(row, topIOY);
+            ioTasks.push(...plan.tasks);
+            topIOY += plan.height + ioGap;
+        }
+        const rootEntry = rootPositions[0];
+        let bottomIOY = rootEntry ? (rootEntry.y + rootEntry.h + ioGap) : (rootStartY + maxRootH + ioGap);
+        for (const row of bottomIORows) {
+            const plan = collectIORenderTasks(row, bottomIOY);
+            ioTasks.push(...plan.tasks);
+            bottomIOY += plan.height + ioGap;
+        }
 
-    // Legend
-    const legendDiv = document.getElementById('legend');
-    if (DATA.has_timing) {
-        legendDiv.innerHTML = `
-            <div class="legend-item"><div class="legend-dot" style="background:#2980b9"></div>&gt;20%</div>
-            <div class="legend-item"><div class="legend-dot" style="background:#27ae60"></div>10-20%</div>
-            <div class="legend-item"><div class="legend-dot" style="background:#8e44ad"></div>5-10%</div>
-            <div class="legend-item"><div class="legend-dot" style="background:#5a6c7d"></div>&lt;5%</div>
-            <div class="legend-item"><div class="legend-dot" style="background:#e74c3c"></div>Worker &gt;20%</div>
-            <div class="legend-item"><div class="legend-dot" style="background:#e67e22"></div>Worker 10-20%</div>`;
-    } else {
-        legendDiv.innerHTML = `
-            <div class="legend-item"><div class="legend-dot" style="background:#4a6fa5"></div>Depth 0</div>
-            <div class="legend-item"><div class="legend-dot" style="background:#5b8c5a"></div>Depth 1</div>
-            <div class="legend-item"><div class="legend-dot" style="background:#8e6fad"></div>Depth 2</div>
-            <div class="legend-item"><div class="legend-dot" style="background:#c77a3c"></div>Depth 3+</div>
-            <div class="legend-item" style="margin-left: 12px;"><span style="color:#64b5f6">▶</span> Click to expand</div>
-            <div class="legend-item" style="margin-left: 12px;"><span style="color:rgba(46,204,113,0.8)">━━▶</span> Data dependency</div>
-            <div class="legend-item"><span style="color:rgba(255,255,255,0.3)">╌╌▶</span> Sequential (fallback)</div>`;
-    }
+        await runChunked(groupTasks.concat(ioTasks), async (task) => {
+            if (task.type === 'io') {
+                renderIOTask(task);
+                return;
+            }
+            renderGroupTask(task);
+        }, {
+            batchSize: 80,
+            phaseStart: 30,
+            phaseEnd: 60,
+            stageText: '正在渲染模块节点…',
+            generation,
+            allowedTypes: ['group', 'node', 'io'],
+        });
 
-    // Summary
-    const summaryDiv = document.getElementById('summary');
-    const allNodes = DATA.nodes;
-    const allGroups = DATA.groups;
-    if (DATA.has_timing) {
-        const topN = [...allNodes, ...allGroups].filter(x => x.has_timing).sort((a,b) => b.pct - a.pct).slice(0,5);
-        summaryDiv.innerHTML = `<h3>📊 Top Modules by Time</h3><p>${
-            topN.map(x => `<b>${x.label || x.class_name}</b> ${x.pct.toFixed(1)}%`).join(' → ')
-        }</p>`;
-    } else {
-        summaryDiv.innerHTML = `<h3>🏗️ Architecture Summary</h3><p>Module count: ${allNodes.length + allGroups.length} | Expandable containers: ${allGroups.length} | Leaf nodes: ${allNodes.length}<br><i>Click ▶ collapsed containers to expand. Provide --trace-file for timing overlay.</i></p>`;
+        const internalEdgeTasks = collectInternalEdgeTasks(rootPositions);
+        const globalEdgeTasks = [];
+        for (const edge of DATA.edges) {
+            if (!isEdgeVisible(edge)) continue;
+            globalEdgeTasks.push({ type: 'edge', taskKind: 'global_edge', edgeData: edge });
+        }
+
+        await runChunked(internalEdgeTasks.concat(globalEdgeTasks), async (task) => {
+            if (task.type !== 'edge') {
+                throw new Error(`edge renderer got unsupported task type: ${task.type}`);
+            }
+            if (task.taskKind === 'internal_edge') {
+                const fr = RENDER_GROUP_EXPORTS.resolveEdgeEndpointRect(task.edgeDef, 'from', task.routeCtx, task.ctx);
+                const to = RENDER_GROUP_EXPORTS.resolveEdgeEndpointRect(task.edgeDef, 'to', task.routeCtx, task.ctx);
+                if (!fr || !to) {
+                    throw new Error(`internal edge endpoint missing in group ${task.ctx.gid}: ${task.edgeDef.from_child || task.edgeDef.from_port} -> ${task.edgeDef.to_child || task.edgeDef.to_port}`);
+                }
+                const routedEdge = {
+                    __internal: true,
+                    __gid: task.ctx.gid,
+                    from: task.edgeDef.from_port ? (task.ctx.gid + '__' + task.edgeDef.from_port) : task.edgeDef.from_child,
+                    to: task.edgeDef.to_port ? (task.ctx.gid + '__' + task.edgeDef.to_port) : task.edgeDef.to_child,
+                    type: task.edgeDef.type || 'internal',
+                    from_node: task.edgeDef.from_node,
+                    to_node: task.edgeDef.to_node,
+                    parent_class: task.edgeDef.parent_class || task.ctx.g.class_name,
+                    flows: task.edgeDef.flows,
+                };
+                if (!isEdgeVisible(routedEdge)) {
+                    return;
+                }
+                renderEdge({
+                    routingMode: 'intra_group',
+                    fr,
+                    to,
+                    type: task.edgeDef.type,
+                    edgeData: routedEdge,
+                    routeCtx: {
+                        groupLeft: task.routeCtx.groupLeft,
+                        groupRight: task.routeCtx.groupRight,
+                        childLeftEdge: task.routeCtx.childLeftEdge,
+                        childRightEdge: task.routeCtx.childRightEdge,
+                        skipLaneCounter: task.routeCtx.skipLaneCounter,
+                    },
+                });
+                return;
+            }
+            if (task.taskKind === 'global_edge') {
+                const fromId = resolveCollapsedAncestor(task.edgeData.from);
+                const toId = resolveCollapsedAncestor(task.edgeData.to);
+                if (fromId === toId) {
+                    return;
+                }
+                const fromPos = nodePortMap[fromId + '__out'] || nodePortMap[fromId];
+                const toPos = nodePortMap[toId + '__in'] || nodePortMap[toId];
+                if (!fromPos || !toPos) {
+                    throw new Error(`global edge endpoint missing: ${task.edgeData.from} -> ${task.edgeData.to}`);
+                }
+                renderEdge({
+                    routingMode: 'direct',
+                    x1: fromPos.cx, y1: fromPos.cy,
+                    x2: toPos.cx, y2: toPos.cy,
+                    type: task.edgeData.type || 'dep',
+                    edgeData: task.edgeData,
+                    routeMeta: EDGE_BUNDLE_META.get(edgeKey(task.edgeData)) || null,
+                });
+                return;
+            }
+            throw new Error(`edge renderer got unknown taskKind: ${task.taskKind}`);
+        }, {
+            batchSize: 180,
+            phaseStart: 60,
+            phaseEnd: 90,
+            stageText: '正在渲染依赖边…',
+            generation,
+            allowedTypes: ['edge'],
+        });
+
+        setRenderProgress(90, '正在更新图例和摘要…');
+        await nextFrame();
+        const meta = DATA.meta;
+        if (DATA.has_timing) {
+            document.getElementById('mode-badge').innerHTML = '<span class="mode-badge mode-timing">📊 Structure + Timing</span>';
+            document.getElementById('meta-info').textContent = `Device: ${meta.device} | Step: ${meta.step_dur_str} | Modules: ${meta.num_modules}`;
+        } else {
+            document.getElementById('mode-badge').innerHTML = '<span class="mode-badge mode-structure">🏗️ Static Structure (source code)</span>';
+            document.getElementById('meta-info').textContent = `Modules: ${meta.num_modules} | Root: ${meta.roots ? meta.roots.join(", ") : "N/A"}`;
+        }
+
+        const legendDiv = document.getElementById('legend');
+        if (DATA.has_timing) {
+            legendDiv.innerHTML = `
+                <div class="legend-item"><div class="legend-dot" style="background:#2980b9"></div>&gt;20%</div>
+                <div class="legend-item"><div class="legend-dot" style="background:#27ae60"></div>10-20%</div>
+                <div class="legend-item"><div class="legend-dot" style="background:#8e44ad"></div>5-10%</div>
+                <div class="legend-item"><div class="legend-dot" style="background:#5a6c7d"></div>&lt;5%</div>
+                <div class="legend-item"><div class="legend-dot" style="background:#e74c3c"></div>Worker &gt;20%</div>
+                <div class="legend-item"><div class="legend-dot" style="background:#e67e22"></div>Worker 10-20%</div>`;
+        } else {
+            legendDiv.innerHTML = `
+                <div class="legend-item"><div class="legend-dot" style="background:#4a6fa5"></div>Depth 0</div>
+                <div class="legend-item"><div class="legend-dot" style="background:#5b8c5a"></div>Depth 1</div>
+                <div class="legend-item"><div class="legend-dot" style="background:#8e6fad"></div>Depth 2</div>
+                <div class="legend-item"><div class="legend-dot" style="background:#c77a3c"></div>Depth 3+</div>
+                <div class="legend-item" style="margin-left: 12px;"><span style="color:#64b5f6">▶</span> Click to expand</div>
+                <div class="legend-item" style="margin-left: 12px;"><span style="color:rgba(46,204,113,0.8)">━━▶</span> Data dependency</div>
+                <div class="legend-item"><span style="color:rgba(255,255,255,0.3)">╌╌▶</span> Sequential (fallback)</div>`;
+        }
+
+        const summaryDiv = document.getElementById('summary');
+        const allNodes = DATA.nodes;
+        const allGroups = DATA.groups;
+        if (DATA.has_timing) {
+            const topN = [...allNodes, ...allGroups].filter(x => x.has_timing).sort((a,b) => b.pct - a.pct).slice(0,5);
+            summaryDiv.innerHTML = `<h3>📊 Top Modules by Time</h3><p>${
+                topN.map(x => `<b>${x.label || x.class_name}</b> ${x.pct.toFixed(1)}%`).join(' → ')
+            }</p>`;
+        } else {
+            summaryDiv.innerHTML = `<h3>🏗️ Architecture Summary</h3><p>Module count: ${allNodes.length + allGroups.length} | Expandable containers: ${allGroups.length} | Leaf nodes: ${allNodes.length}<br><i>Click ▶ collapsed containers to expand. Provide --trace-file for timing overlay.</i></p>`;
+        }
+        assertActiveRenderGeneration(generation, '收尾阶段');
+        setRenderProgress(98, '正在更新图例和摘要…');
+        await nextFrame();
+        assertActiveRenderGeneration(generation, '完成阶段');
+        await hideRenderProgress();
+    } catch (err) {
+        if (renderGeneration === generation) {
+            const progressEls = getRenderProgressElements();
+            progressEls.overlay.classList.remove('closing');
+            progressEls.overlay.classList.add('visible', 'failed');
+            progressEls.overlay.setAttribute('aria-hidden', 'false');
+            const lastProgress = Number(progressEls.overlay.dataset.progress || 0);
+            setRenderProgress(Number.isFinite(lastProgress) ? Math.min(99, lastProgress) : 0, '渲染失败，请查看 Console 错误');
+        }
+        throw err;
     }
 }
 
 function toggleGroup(gid) {
     collapsedState[gid] = !collapsedState[gid];
-    render();
+    invokeRender();
 }
 
 function computeSelfMs(item) {
@@ -1859,11 +2240,11 @@ document.addEventListener('keydown', (e) => {
 
 document.getElementById('btn-expand-all').addEventListener('click', () => {
     DATA.groups.forEach(g => collapsedState[g.id] = false);
-    render();
+    invokeRender();
 });
 document.getElementById('btn-collapse-all').addEventListener('click', () => {
     DATA.groups.forEach(g => { if (g.depth >= 1) collapsedState[g.id] = true; });
-    render();
+    invokeRender();
 });
 document.getElementById('btn-fit').addEventListener('click', () => {
     const container = document.getElementById('dag-container');
@@ -1878,7 +2259,7 @@ document.getElementById('btn-fit').addEventListener('click', () => {
     }
 });
 
-render();
+invokeRender();
 
 // ── metric-help custom tooltip ──────────────────────────────────────────────
 (function() {
@@ -2205,7 +2586,7 @@ def _generate_flowchart_html_multi(tabs: dict[str, list[dict]]) -> str:
         "    }\n"
         "    _ensureDagShell();\n"
         "    _rebuildIndices();\n"
-        "    render();\n"
+        "    invokeRender();\n"
         "}\n"
         "</script>\n"
     )
@@ -2368,7 +2749,7 @@ def _generate_flowchart_html_dual(data_train, data_infer):
         '    _resetSharedState();\n'
         '    DATA = nextData;\n'
         '    _rebuildIndices();\n'
-        '    if (typeof render === "function") render();\n'
+        '    if (typeof invokeRender === "function") invokeRender();\n'
         '  }\n'
         '  document.querySelectorAll(".iter14-tab").forEach(function(b){\n'
         '    b.addEventListener("click", function(){\n'
