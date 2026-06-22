@@ -399,14 +399,16 @@ def _route_edges(state: _AdapterState) -> list[dict]:
             group["internal_edges"].append(internal_edge)
             continue
 
-        edge_key = (src_id, dst_id)
+        resolved_src = state.parent_group_of_child[src_id] if src_id in state.port_kind_by_id else src_id
+        resolved_dst = state.parent_group_of_child[dst_id] if dst_id in state.port_kind_by_id else dst_id
+        edge_key = (resolved_src, resolved_dst)
         if edge_key in seen_global:
             continue
         seen_global.add(edge_key)
         global_edges.append(
             {
-                "from": src_id,
-                "to": dst_id,
+                "from": resolved_src,
+                "to": resolved_dst,
                 "type": edge_type,
                 "from_node": src_node,
                 "to_node": dst_node,
