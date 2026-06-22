@@ -79,13 +79,13 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 .dag-svg .edge-path.dep { stroke: rgba(46,204,113,0.62); stroke-width: 1.9; }
 .dag-svg .edge-path.flow { stroke: rgba(255,255,255,0.28); stroke-width: 1.35; stroke-dasharray: 4,3; }
 .dag-svg .edge-path.edge-dim { opacity: 0.14 !important; filter: saturate(0.7); }
-.dag-svg .edge-path.edge-active { opacity: 1 !important; stroke-width: 4.4 !important; filter: drop-shadow(0 0 8px rgba(100,181,246,0.35)); }
+.dag-svg .edge-path.edge-active { opacity: 1 !important; }
 .dag-svg .edge-path.dep.edge-active { stroke: #7CFFB2 !important; }
 .dag-svg .edge-path.flow.edge-active { stroke: #FFD166 !important; }
 .dag-svg .edge-path.internal.edge-active { stroke: #7FD1FF !important; }
 .dag-svg .leaf-node.node-dim, .dag-svg .group-box.node-dim, .dag-svg .io-node.node-dim { opacity: 0.25; }
 .dag-svg .group-label.node-dim, .dag-svg .group-timing.node-dim { opacity: 0.25; }
-.dag-svg .leaf-node.node-active, .dag-svg .group-box.node-active, .dag-svg .io-node.node-active { stroke: #FFD166 !important; stroke-width: 3 !important; filter: drop-shadow(0 0 10px rgba(255,209,102,0.35)); opacity: 1 !important; }
+.dag-svg .leaf-node.node-active, .dag-svg .group-box.node-active, .dag-svg .io-node.node-active { stroke: #FFD166 !important; stroke-width: 3 !important; opacity: 1 !important; }
 .dag-svg .group-label.node-active, .dag-svg .group-timing.node-active { opacity: 1 !important; }
 .dag-svg .port { fill: rgba(255,255,255,0.15); stroke: rgba(255,255,255,0.3); stroke-width: 1; }
 .tooltip { position: fixed; background: #16213e; border: 1px solid rgba(100,181,246,0.3); border-radius: 8px; padding: 10px 14px; font-size: 11px; color: #e0e0e0; pointer-events: none; z-index: 1000; max-width: 300px; box-shadow: 0 4px 20px rgba(0,0,0,0.4); opacity: 0; transition: opacity 0.15s; }
@@ -265,8 +265,16 @@ let nodePortMap = {};
 let edgeDomRegistry = [];
 const edgeByNodeId = new Map();
 const edgeByGroupId = new Map();
+const edgeDomByKey = new Map();
 let prevActiveItems = [];
 let prevActiveNodeIds = new Set();
+let prevActiveEdgeKeys = new Set();
+let prevActiveGroupNodeIds = new Set();
+let prevActiveGroupIds = new Set();
+let prevDimEdgeKeys = new Set();
+let prevDimGroupNodeIds = new Set();
+let prevDimGroupIds = new Set();
+let lastHoveredGid = null;
 let focusedEdgePath = null;
 let hoveredEdgeKey = null;
 let hoveredEdges = [];
@@ -367,6 +375,60 @@ function getActiveEdgeItems() {
     if (hoveredNodeId != null) return edgeByNodeId.get(hoveredNodeId) ?? [];
     if (hoveredGroupId != null) return edgeByGroupId.get(hoveredGroupId) ?? [];
     return [];
+}
+
+function setEdgeItemFocusState(item, state) {
+    if (!item || !item.path) return;
+    if (state === 'active') {
+        item.path.classList.add('edge-active');
+        item.path.classList.remove('edge-dim');
+        syncLongEdgeDisplay(item.path, true);
+        return;
+    }
+    if (state === 'dim') {
+        item.path.classList.remove('edge-active');
+        item.path.classList.add('edge-dim');
+        syncLongEdgeDisplay(item.path, false);
+        return;
+    }
+    item.path.classList.remove('edge-active', 'edge-dim');
+    syncLongEdgeDisplay(item.path, false);
+}
+
+function setNodeFocusStateById(nodeId, state) {
+    const els = nodeDomRegistry.get(nodeId) || [];
+    for (const el of els) {
+        if (state === 'active') {
+            el.classList.add('node-active');
+            el.classList.remove('node-dim');
+            continue;
+        }
+        if (state === 'dim') {
+            el.classList.remove('node-active');
+            el.classList.add('node-dim');
+            continue;
+        }
+        el.classList.remove('node-active', 'node-dim');
+    }
+}
+
+function setGroupFocusStateById(gid, state) {
+    const dom = groupDomRegistry.get(gid);
+    if (!dom) return;
+    for (const el of Object.values(dom)) {
+        if (!el) continue;
+        if (state === 'active') {
+            el.classList.add('node-active');
+            el.classList.remove('node-dim');
+            continue;
+        }
+        if (state === 'dim') {
+            el.classList.remove('node-active');
+            el.classList.add('node-dim');
+            continue;
+        }
+        el.classList.remove('node-active', 'node-dim');
+    }
 }
 
 function syncLongEdgeDisplay(path, isActive) {
@@ -471,29 +533,38 @@ function computeActiveNodeIds(activeItems) {
 }
 
 function applyGroupFocusState(hoveredGid) {
+    if (hoveredGid === lastHoveredGid) return;
     if (hoveredGid == null) {
-        for (const item of edgeDomRegistry) {
-            item.path.classList.remove('edge-active', 'edge-dim');
-            syncLongEdgeDisplay(item.path, false);
+        for (const key of prevActiveEdgeKeys) {
+            setEdgeItemFocusState(edgeDomByKey.get(key), 'clear');
         }
-        for (const els of nodeDomRegistry.values()) {
-            for (const el of els) el.classList.remove('node-active', 'node-dim');
+        for (const key of prevDimEdgeKeys) {
+            setEdgeItemFocusState(edgeDomByKey.get(key), 'clear');
         }
-        for (const dom of groupDomRegistry.values()) {
-            for (const el of Object.values(dom)) {
-                if (el) el.classList.remove('node-active', 'node-dim');
-            }
+        for (const nid of prevActiveGroupNodeIds) {
+            setNodeFocusStateById(nid, 'clear');
         }
+        for (const nid of prevDimGroupNodeIds) {
+            setNodeFocusStateById(nid, 'clear');
+        }
+        for (const gid of prevActiveGroupIds) {
+            setGroupFocusStateById(gid, 'clear');
+        }
+        for (const gid of prevDimGroupIds) {
+            setGroupFocusStateById(gid, 'clear');
+        }
+        prevActiveEdgeKeys = new Set();
+        prevActiveGroupNodeIds = new Set();
+        prevActiveGroupIds = new Set();
+        prevDimEdgeKeys = new Set();
+        prevDimGroupNodeIds = new Set();
+        prevDimGroupIds = new Set();
+        lastHoveredGid = null;
         return;
     }
 
-    const activeEdgeItems = edgeDomRegistry.filter(item => {
-        const f = item.edge.from;
-        const t = item.edge.to;
-        return isNodeInGroupScope(f, hoveredGid) || isNodeInGroupScope(t, hoveredGid);
-    });
+    const activeEdgeItems = edgeByGroupId.get(hoveredGid) ?? [];
     const activeEdgeKeys = new Set(activeEdgeItems.map(i => i.key));
-
     const activeNodeIds = new Set();
     const activeGroupIds = new Set([hoveredGid]);
     for (const item of activeEdgeItems) {
@@ -509,29 +580,91 @@ function applyGroupFocusState(hoveredGid) {
         }
     }
 
-    for (const item of edgeDomRegistry) {
-        const isActive = activeEdgeKeys.has(item.key);
-        item.path.classList.toggle('edge-active', isActive);
-        item.path.classList.toggle('edge-dim', !isActive);
-        syncLongEdgeDisplay(item.path, isActive);
-    }
+    const isFirstHover = lastHoveredGid == null;
+    const combinedActiveNodeIds = new Set([...activeNodeIds, ...activeGroupIds]);
+    const nextDimEdgeKeys = new Set();
+    const nextDimGroupNodeIds = new Set();
+    const nextDimGroupIds = new Set();
 
-    for (const [nid, els] of nodeDomRegistry.entries()) {
-        const isActive = activeNodeIds.has(nid) || activeGroupIds.has(nid);
-        for (const el of els) {
-            el.classList.toggle('node-active', isActive);
-            el.classList.toggle('node-dim', !isActive);
+    if (isFirstHover) {
+        for (const [key, item] of edgeDomByKey.entries()) {
+            if (activeEdgeKeys.has(key)) {
+                setEdgeItemFocusState(item, 'active');
+            } else {
+                setEdgeItemFocusState(item, 'dim');
+                nextDimEdgeKeys.add(key);
+            }
+        }
+        for (const nid of nodeDomRegistry.keys()) {
+            if (combinedActiveNodeIds.has(nid)) {
+                setNodeFocusStateById(nid, 'active');
+            } else {
+                setNodeFocusStateById(nid, 'dim');
+                nextDimGroupNodeIds.add(nid);
+            }
+        }
+        for (const gid of groupDomRegistry.keys()) {
+            if (activeGroupIds.has(gid)) {
+                setGroupFocusStateById(gid, 'active');
+            } else {
+                setGroupFocusStateById(gid, 'dim');
+                nextDimGroupIds.add(gid);
+            }
+        }
+    } else {
+        for (const key of prevActiveEdgeKeys) {
+            if (!activeEdgeKeys.has(key)) {
+                setEdgeItemFocusState(edgeDomByKey.get(key), 'dim');
+                nextDimEdgeKeys.add(key);
+            }
+        }
+        for (const key of activeEdgeKeys) {
+            if (!prevActiveEdgeKeys.has(key)) {
+                setEdgeItemFocusState(edgeDomByKey.get(key), 'active');
+            }
+        }
+        for (const key of prevDimEdgeKeys) {
+            if (!activeEdgeKeys.has(key)) nextDimEdgeKeys.add(key);
+        }
+
+        for (const nid of prevActiveGroupNodeIds) {
+            if (!combinedActiveNodeIds.has(nid)) {
+                setNodeFocusStateById(nid, 'dim');
+                nextDimGroupNodeIds.add(nid);
+            }
+        }
+        for (const nid of combinedActiveNodeIds) {
+            if (!prevActiveGroupNodeIds.has(nid)) {
+                setNodeFocusStateById(nid, 'active');
+            }
+        }
+        for (const nid of prevDimGroupNodeIds) {
+            if (!combinedActiveNodeIds.has(nid)) nextDimGroupNodeIds.add(nid);
+        }
+
+        for (const gid of prevActiveGroupIds) {
+            if (!activeGroupIds.has(gid)) {
+                setGroupFocusStateById(gid, 'dim');
+                nextDimGroupIds.add(gid);
+            }
+        }
+        for (const gid of activeGroupIds) {
+            if (!prevActiveGroupIds.has(gid)) {
+                setGroupFocusStateById(gid, 'active');
+            }
+        }
+        for (const gid of prevDimGroupIds) {
+            if (!activeGroupIds.has(gid)) nextDimGroupIds.add(gid);
         }
     }
 
-    for (const [gid, dom] of groupDomRegistry.entries()) {
-        const isActive = activeGroupIds.has(gid);
-        for (const el of Object.values(dom)) {
-            if (!el) continue;
-            el.classList.toggle('node-active', isActive);
-            el.classList.toggle('node-dim', !isActive);
-        }
-    }
+    prevActiveEdgeKeys = activeEdgeKeys;
+    prevActiveGroupNodeIds = combinedActiveNodeIds;
+    prevActiveGroupIds = activeGroupIds;
+    prevDimEdgeKeys = nextDimEdgeKeys;
+    prevDimGroupNodeIds = nextDimGroupNodeIds;
+    prevDimGroupIds = nextDimGroupIds;
+    lastHoveredGid = hoveredGid;
 }
 
 function applyEdgeFocusState() {
@@ -613,6 +746,7 @@ function bindGroupHover(el, gid) {
     if (!el || !gid) return;
     el.addEventListener('mouseenter', (e) => {
         e.stopPropagation();
+        if (hoveredGroupId === gid) return;
         hoveredNodeId = null;
         hoveredGroupId = gid;
         showTooltip(e, groupMap[gid]);
@@ -1121,8 +1255,16 @@ async function render() {
         edgeDomRegistry = [];
         edgeByNodeId.clear();
         edgeByGroupId.clear();
+        edgeDomByKey.clear();
         prevActiveItems = [];
         prevActiveNodeIds = new Set();
+        prevActiveEdgeKeys = new Set();
+        prevActiveGroupNodeIds = new Set();
+        prevActiveGroupIds = new Set();
+        prevDimEdgeKeys = new Set();
+        prevDimGroupNodeIds = new Set();
+        prevDimGroupIds = new Set();
+        lastHoveredGid = null;
         nodeDomRegistry = new Map();
         groupDomRegistry.clear();
         focusedEdgePath = null;
@@ -1483,6 +1625,7 @@ async function render() {
             if (!path || !edgeData) return;
             const item = { path, edge: edgeData, key: edgeKey(edgeData) };
             edgeDomRegistry.push(item);
+            edgeDomByKey.set(item.key, item);
             for (const nid of [edgeData.from, edgeData.to]) {
                 if (nid == null) continue;
                 if (!edgeByNodeId.has(nid)) edgeByNodeId.set(nid, []);
@@ -2620,9 +2763,10 @@ def _generate_flowchart_html_multi(tabs: dict[str, list[dict]]) -> str:
         "    try { if (typeof edgeDomRegistry !== \"undefined\") edgeDomRegistry.length = 0; } catch (e) {}\n"
         "    try { if (typeof edgeByNodeId !== \"undefined\" && edgeByNodeId && edgeByNodeId.clear) edgeByNodeId.clear(); } catch (e) {}\n"
         "    try { if (typeof edgeByGroupId !== \"undefined\" && edgeByGroupId && edgeByGroupId.clear) edgeByGroupId.clear(); } catch (e) {}\n"
+        "    try { if (typeof edgeDomByKey !== \"undefined\" && edgeDomByKey && edgeDomByKey.clear) edgeDomByKey.clear(); } catch (e) {}\n"
         "    try { if (typeof groupLayout !== \"undefined\") { Object.keys(groupLayout).forEach(k => delete groupLayout[k]); } } catch (e) {}\n"
         "    try { if (typeof nodePortMap !== \"undefined\") { Object.keys(nodePortMap).forEach(k => delete nodePortMap[k]); } } catch (e) {}\n"
-        "    try { hoveredEdgeKey = null; hoveredEdges = []; hoveredEdgeIdx = 0; hoveredNodeId = null; hoveredGroupId = null; focusedEdgePath = null; prevActiveItems = []; prevActiveNodeIds = new Set(); } catch (e) {}\n"
+        "    try { hoveredEdgeKey = null; hoveredEdges = []; hoveredEdgeIdx = 0; hoveredNodeId = null; hoveredGroupId = null; focusedEdgePath = null; prevActiveItems = []; prevActiveNodeIds = new Set(); prevActiveEdgeKeys = new Set(); prevActiveGroupNodeIds = new Set(); prevActiveGroupIds = new Set(); prevDimEdgeKeys = new Set(); prevDimGroupNodeIds = new Set(); prevDimGroupIds = new Set(); lastHoveredGid = null; } catch (e) {}\n"
         "    try { var sp = document.getElementById(\"side-panel\"); if (sp) sp.classList.remove(\"open\"); } catch (e) {}\n"
         "}\n"
         "function _rebuildIndices() {\n"
@@ -2803,9 +2947,10 @@ def _generate_flowchart_html_dual(data_train, data_infer):
         '    try { if (typeof edgeDomRegistry !== "undefined") edgeDomRegistry.length = 0; } catch(e){}\n'
         '    try { if (typeof edgeByNodeId !== "undefined" && edgeByNodeId && edgeByNodeId.clear) edgeByNodeId.clear(); } catch(e){}\n'
         '    try { if (typeof edgeByGroupId !== "undefined" && edgeByGroupId && edgeByGroupId.clear) edgeByGroupId.clear(); } catch(e){}\n'
+        '    try { if (typeof edgeDomByKey !== "undefined" && edgeDomByKey && edgeDomByKey.clear) edgeDomByKey.clear(); } catch(e){}\n'
         '    try { if (typeof groupLayout !== "undefined") { Object.keys(groupLayout).forEach(k => delete groupLayout[k]); } } catch(e){}\n'
         '    try { if (typeof nodePortMap !== "undefined") { Object.keys(nodePortMap).forEach(k => delete nodePortMap[k]); } } catch(e){}\n'
-        '    try { hoveredEdgeKey = null; hoveredEdges = []; hoveredEdgeIdx = 0; hoveredNodeId = null; hoveredGroupId = null; focusedEdgePath = null; prevActiveItems = []; prevActiveNodeIds = new Set(); } catch(e){}\n'
+        '    try { hoveredEdgeKey = null; hoveredEdges = []; hoveredEdgeIdx = 0; hoveredNodeId = null; hoveredGroupId = null; focusedEdgePath = null; prevActiveItems = []; prevActiveNodeIds = new Set(); prevActiveEdgeKeys = new Set(); prevActiveGroupNodeIds = new Set(); prevActiveGroupIds = new Set(); prevDimEdgeKeys = new Set(); prevDimGroupNodeIds = new Set(); prevDimGroupIds = new Set(); lastHoveredGid = null; } catch(e){}\n'
         '    // Close any open side panel from the previous tab.\n'
         '    try { var sp = document.getElementById("side-panel"); if (sp) sp.classList.remove("open"); } catch(e){}\n'
         '  }\n'
