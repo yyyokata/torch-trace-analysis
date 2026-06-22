@@ -71,9 +71,17 @@ function renderCollapsedGroupInfoButton(ctx) {
 }
 
 function registerCollapsedGroupPorts(ctx) {
-    nodePortMap[ctx.gid + '__in'] = { cx: ctx.ox + ctx.pos.w / 2, cy: ctx.oy };
-    nodePortMap[ctx.gid + '__out'] = { cx: ctx.ox + ctx.pos.w / 2, cy: ctx.oy + ctx.pos.h };
+    const inPoint = { cx: ctx.ox + ctx.pos.w / 2, cy: ctx.oy };
+    const outPoint = { cx: ctx.ox + ctx.pos.w / 2, cy: ctx.oy + ctx.pos.h };
+    nodePortMap[ctx.gid + '__in'] = inPoint;
+    nodePortMap[ctx.gid + '__out'] = outPoint;
     nodePortMap[ctx.gid + '__center'] = { cx: ctx.ox + ctx.pos.w / 2, cy: ctx.oy + ctx.pos.h / 2 };
+    for (const port of (ctx.g.in_ports || [])) {
+        nodePortMap[port.node_id] = inPoint;
+    }
+    for (const port of (ctx.g.out_ports || [])) {
+        nodePortMap[port.node_id] = outPoint;
+    }
 }
 
 function renderExpandedGroupBox(ctx) {
