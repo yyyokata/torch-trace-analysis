@@ -29,7 +29,8 @@
  * it).
  */
 /* global layoutGroup, groupMap, nodeMap, groupLayout, LAYOUT,
-   getNodeColor, formatDur, nodePortMap */
+   getNodeColor, formatDur, nodePortMap,
+   isEdgeVisible, resolveCollapsedAncestor, edgeKey, EDGE_BUNDLE_META */
 (function (global) {
     'use strict';
 
@@ -137,6 +138,7 @@
             usingHeadlessPixi: PIXI.__isHeadlessMock === true,
             nodes: [],
             groups: [],
+            edges: [],
             viewport: { scale: 1, x: 0, y: 0, worldWidth: 0, worldHeight: 0 }
         };
     }
@@ -170,6 +172,18 @@
     function lookupNodePortMap() { return (typeof nodePortMap !== 'undefined') ? nodePortMap : null; }
     function nodeColorOf(n) { return (typeof getNodeColor === 'function') ? getNodeColor(n) : '#4a6fa5'; }
     function formatDurOf(us) { return (typeof formatDur === 'function') ? formatDur(us) : String(us); }
+
+    // Edge-orchestration globals (also classic-script lexical bindings from the
+    // inline template): the visibility filter, collapse redirect, bundle-offset
+    // map and edge-key helper.  Read by bare name at draw time, exactly like the
+    // layout globals above.  drawGlobalEdges() only runs from the production
+    // canvasRenderPhase1() path (after the inline template has loaded), so these
+    // are always defined when it executes; a missing one is a hard error there,
+    // never a silent skip.
+    function lookupIsEdgeVisible() { return (typeof isEdgeVisible === 'function') ? isEdgeVisible : null; }
+    function lookupResolveCollapsedAncestor() { return (typeof resolveCollapsedAncestor === 'function') ? resolveCollapsedAncestor : null; }
+    function lookupEdgeKey() { return (typeof edgeKey === 'function') ? edgeKey : null; }
+    function lookupEdgeBundleMeta() { return (typeof EDGE_BUNDLE_META !== 'undefined') ? EDGE_BUNDLE_META : null; }
 
     // ── pixi glyph factories ───────────────────────────────────────────────
     function makeGraphics(name) {
@@ -311,6 +325,246 @@
         registerExpandedGroupPorts(g, gid, ox, oy, pos);
     }
 
+    // ── EdgeRoute (pure geometry) ──────────────────────────────────────────
+    // Faithful Canvas port of frontend_html.py's SVG `buildDirectEdgePath`
+    // (the only routing the production pipeline ever used).  The control-point
+    // formulas are copied verbatim; the Bezier is then sampled at a fixed step
+    // count so the result is a polyline `[{x,y}...]` whose endpoints are exactly
+    // (x1,y1)/(x2,y2).  Sampling the *same* curve means each sample equals the
+    // legacy Bezier at the same parameter t (point distance 0 -> well under the
+    // 0.5px equivalence bound), see UT P1-11.
+    const EDGE_SAMPLE_STEPS = 24;
+
+    // Long-edge dash threshold.  Same source constant as the legacy
+    // `LONG_EDGE_MIN_SPAN` in frontend_html.py (260): the SVG path used
+    // getTotalLength() >= 260; the Canvas route uses the sampled polyline length,
+    // which is numerically equivalent for these short, smooth curves.
+    const LONG_EDGE_MIN_SPAN = 260;
+
+    // Stroke styles ported 1:1 from the deleted `.edge-path*` CSS rules
+    // (frontend_html.py): rgba colour -> 0xRRGGBB + alpha, plus the matching
+    // SVG <marker> fill alpha for the arrow head.
+    const EDGE_STYLE = {
+        dep:      { color: 0x2ecc71, width: 1.9,  alpha: 0.62, arrowAlpha: 0.6 },
+        internal: { color: 0x64b5f6, width: 1.35, alpha: 0.46, arrowAlpha: 0.5 },
+        default:  { color: 0xffffff, width: 1.7,  alpha: 0.2,  arrowAlpha: 0.3 }
+    };
+
+    function colorKeyForType(type) {
+        if (type === 'dep') { return 'dep'; }
+        if (type === 'internal') { return 'internal'; }
+        return 'default';
+    }
+
+    function sampleCubic(p0, p1, p2, p3, steps) {
+        const pts = [];
+        for (let i = 0; i <= steps; i++) {
+            const t = i / steps;
+            const mt = 1 - t;
+            const a = mt * mt * mt;
+            const b = 3 * mt * mt * t;
+            const c = 3 * mt * t * t;
+            const d = t * t * t;
+            pts.push({
+                x: a * p0.x + b * p1.x + c * p2.x + d * p3.x,
+                y: a * p0.y + b * p1.y + c * p2.y + d * p3.y
+            });
+        }
+        return pts;
+    }
+
+    function sampleQuad(p0, p1, p2, steps) {
+        const pts = [];
+        for (let i = 0; i <= steps; i++) {
+            const t = i / steps;
+            const mt = 1 - t;
+            const a = mt * mt;
+            const b = 2 * mt * t;
+            const c = t * t;
+            pts.push({
+                x: a * p0.x + b * p1.x + c * p2.x,
+                y: a * p0.y + b * p1.y + c * p2.y
+            });
+        }
+        return pts;
+    }
+
+    function polylineLength(points) {
+        let total = 0;
+        for (let i = 1; i < points.length; i++) {
+            total += Math.hypot(points[i].x - points[i - 1].x, points[i].y - points[i - 1].y);
+        }
+        return total;
+    }
+
+    const EdgeRoute = {
+        // Direct route: returns {points,branch,dashed} or null (degenerate).
+        // branch ∈ {'down','back','quad'} mirrors the legacy dy>8 / dy<-8 / else
+        // selection.  Returns null for the degenerate |dy|<3 && |dx|<3 case so no
+        // edge is produced (identical to legacy returning a null path string).
+        direct: function (x1, y1, x2, y2, routeMeta) {
+            const dy = y2 - y1;
+            const dx = x2 - x1;
+            if (Math.abs(dy) < 3 && Math.abs(dx) < 3) { return null; }
+            const meta = routeMeta || {};
+            const offset = meta.bundleOffset || 0;
+            const sideBias = offset === 0 ? (dx >= 0 ? 1 : -1) : (offset > 0 ? 1 : -1);
+            let points;
+            let branch;
+            if (dy > 8) {
+                const cp = Math.max(24, Math.min(Math.abs(dy) * 0.34 + Math.abs(offset) * 0.7, 96));
+                const c1x = x1 + offset;
+                const c2x = x2 + offset;
+                points = sampleCubic(
+                    { x: x1, y: y1 }, { x: c1x, y: y1 + cp },
+                    { x: c2x, y: y2 - cp }, { x: x2, y: y2 }, EDGE_SAMPLE_STEPS
+                );
+                branch = 'down';
+            } else if (dy < -8) {
+                const horizontal = sideBias * Math.max(52, Math.abs(dx) * 0.42 + 34 + Math.abs(offset));
+                const rise = Math.max(18, Math.min(72, Math.abs(offset) + 24));
+                points = sampleCubic(
+                    { x: x1, y: y1 }, { x: x1 + horizontal, y: y1 - rise },
+                    { x: x2 + horizontal, y: y2 + rise }, { x: x2, y: y2 }, EDGE_SAMPLE_STEPS
+                );
+                branch = 'back';
+            } else {
+                const midX = (x1 + x2) / 2 + offset;
+                const midY = (y1 + y2) / 2 + 14 + Math.abs(offset) * 0.28;
+                points = sampleQuad(
+                    { x: x1, y: y1 }, { x: midX, y: midY }, { x: x2, y: y2 }, EDGE_SAMPLE_STEPS
+                );
+                branch = 'quad';
+            }
+            const dashed = polylineLength(points) >= LONG_EDGE_MIN_SPAN;
+            return { points: points, branch: branch, dashed: dashed };
+        },
+        // Routing-mode dispatcher.  Unknown modes are a hard error (no silent
+        // return), matching the legacy renderEdge() `throw new Error('Unknown
+        // edge routing mode')`.
+        compute: function (routingMode, x1, y1, x2, y2, routeMeta) {
+            if (routingMode === 'direct') {
+                return EdgeRoute.direct(x1, y1, x2, y2, routeMeta);
+            }
+            throw new Error('render_canvas.js: unknown edge routing mode: ' + routingMode);
+        }
+    };
+
+    // ── EdgeBatch (type-bucketed batched stroke + arrow head) ───────────────
+    // Painting primitives (lineStyle/moveTo/lineTo/drawPolygon) are invoked only
+    // when the resolved Graphics implementation provides them.  The Stage 1.1
+    // minimal bundle (and the headless mock) build the object graph but draw
+    // nothing -- the geometry contract lives in engine.edges / the snapshot, and
+    // the real WebGL Pixi bundle paints it.  This is the same dual-backend shape
+    // used by resolvePixi() and is NOT an error fallback.
+    function EdgeBatch() {
+        this.buckets = { dep: [], internal: [], default: [] };
+    }
+    EdgeBatch.prototype.collect = function (edge, start, end, routeMeta, routingMode) {
+        const mode = routingMode || 'direct';
+        const route = EdgeRoute.compute(mode, start.cx, start.cy, end.cx, end.cy, routeMeta);
+        if (!route) { return; }  // degenerate route: produce no edge (legacy parity)
+        const type = edge.type || 'dep';
+        const colorKey = colorKeyForType(type);
+        this.buckets[colorKey].push({ points: route.points, dashed: route.dashed });
+        engine.edges.push({
+            from: edge.from, to: edge.to, type: type, colorKey: colorKey,
+            start: { cx: start.cx, cy: start.cy },
+            end: { cx: end.cx, cy: end.cy },
+            branch: route.branch, dashed: route.dashed, arrow: true
+        });
+    };
+    EdgeBatch.prototype.flush = function () {
+        const self = this;
+        Object.keys(self.buckets).forEach(function (colorKey) {
+            const items = self.buckets[colorKey];
+            if (!items.length) { return; }
+            const style = EDGE_STYLE[colorKey];
+            const strokeG = makeGraphics('edge-stroke:' + colorKey);
+            const arrowG = makeGraphics('edge-arrow:' + colorKey);
+            items.forEach(function (item) {
+                strokePolyline(strokeG, item.points, style);
+                drawArrowHead(arrowG, item.points, style);
+            });
+            engine.layers.l1.addChild(strokeG);
+            engine.layers.l1.addChild(arrowG);
+        });
+    };
+
+    function strokePolyline(g, points, style) {
+        if (typeof g.lineStyle !== 'function' || typeof g.moveTo !== 'function' || typeof g.lineTo !== 'function') {
+            return;  // object-graph-only backend; painting deferred to real Pixi
+        }
+        g.lineStyle(style.width, style.color, style.alpha);
+        g.moveTo(points[0].x, points[0].y);
+        for (let i = 1; i < points.length; i++) {
+            g.lineTo(points[i].x, points[i].y);
+        }
+    }
+
+    // Triangular arrow head at the route end, oriented along the terminal
+    // tangent (the marker-end equivalent).  Size 7 matches the legacy
+    // <marker markerWidth="7" markerHeight="7">.
+    function drawArrowHead(g, points, style) {
+        const n = points.length;
+        const tip = points[n - 1];
+        const prev = points[n - 2] || points[0];
+        let ux = tip.x - prev.x;
+        let uy = tip.y - prev.y;
+        const len = Math.hypot(ux, uy) || 1;
+        ux /= len;
+        uy /= len;
+        const size = 7;
+        const half = size / 2;
+        const px = -uy;
+        const py = ux;
+        const baseX = tip.x - ux * size;
+        const baseY = tip.y - uy * size;
+        if (typeof g.beginFill !== 'function' || typeof g.drawPolygon !== 'function') {
+            return;  // object-graph-only backend; painting deferred to real Pixi
+        }
+        g.beginFill(style.color, style.arrowAlpha);
+        g.drawPolygon([
+            tip.x, tip.y,
+            baseX + px * half, baseY + py * half,
+            baseX - px * half, baseY - py * half
+        ]);
+        if (typeof g.endFill === 'function') { g.endFill(); }
+    }
+
+    // Global edge orchestration.  Reuses the inline-template edge model 1:1:
+    // visibility filter -> collapse redirect -> self-skip -> port resolution
+    // (out/in slot with center fallback) -> missing-endpoint hard error -> bundle
+    // offset lookup -> EdgeBatch.collect, then a single flush per type bucket.
+    function drawGlobalEdges(data) {
+        const edges = (data && Array.isArray(data.edges)) ? data.edges : [];
+        if (edges.length === 0) { return; }
+        const portMap = lookupNodePortMap();
+        const isVisible = lookupIsEdgeVisible();
+        const resolveAncestor = lookupResolveCollapsedAncestor();
+        const keyOf = lookupEdgeKey();
+        const bundleMeta = lookupEdgeBundleMeta();
+        if (!portMap || !isVisible || !resolveAncestor || !keyOf || !bundleMeta) {
+            // Hard error: the production path must have these inline globals.
+            throw new Error('render_canvas.js: inline edge globals unavailable while drawing edges');
+        }
+        const batch = new EdgeBatch();
+        for (const edge of edges) {
+            if (!isVisible(edge)) { continue; }
+            const fromId = resolveAncestor(edge.from);
+            const toId = resolveAncestor(edge.to);
+            if (fromId === toId) { continue; }  // self after redirect: skip
+            const fromPos = portMap[fromId + '__out'] || portMap[fromId];
+            const toPos = portMap[toId + '__in'] || portMap[toId];
+            if (!fromPos || !toPos) {
+                throw new Error('global edge endpoint missing: ' + edge.from + ' -> ' + edge.to);
+            }
+            const routeMeta = bundleMeta.get(keyOf(edge)) || null;
+            batch.collect(edge, fromPos, toPos, routeMeta, 'direct');
+        }
+        batch.flush();
+    }
+
     // ── scene reset + draw orchestration ───────────────────────────────────
     function resetScene() {
         LAYER_KEYS.forEach(function (key) {
@@ -321,6 +575,7 @@
         });
         engine.nodes = [];
         engine.groups = [];
+        engine.edges = [];
         const map = lookupNodePortMap();
         if (map) {
             Object.keys(map).forEach(function (k) { delete map[k]; });
@@ -356,6 +611,7 @@
         resetScene();
         if (data && Array.isArray(data.root_groups) && data.root_groups.length > 0) {
             layoutAndDrawRoots(data);
+            drawGlobalEdges(data);
         }
         return Promise.resolve(buildSnapshot());
     }
@@ -393,7 +649,14 @@
             groups: (engine.groups || []).map(function (g) {
                 return { id: g.id, collapsed: g.collapsed, x: g.x, y: g.y, w: g.w, h: g.h, has_header: g.has_header, has_info: g.has_info, has_timing: g.has_timing };
             }),
-            edges: [],
+            edges: (engine.edges || []).map(function (e) {
+                return {
+                    from: e.from, to: e.to, type: e.type, colorKey: e.colorKey,
+                    start: { cx: e.start.cx, cy: e.start.cy },
+                    end: { cx: e.end.cx, cy: e.end.cy },
+                    branch: e.branch, dashed: e.dashed, arrow: e.arrow
+                };
+            }),
             ports: clonePorts(lookupNodePortMap()),
             io_pills: [],
             viewport: {
@@ -416,6 +679,12 @@
     global.__canvasRenderPhase1 = canvasRenderPhase1;
     global.__initCanvasEngine = initCanvasEngine;
     global.__canvasEnginePhase1 = function () { return engine; };
+    // Pure geometry, exposed for UT (P1-11 / P1-11b / P1-E3): EdgeRoute.direct
+    // returns the sampled polyline and EdgeRoute.compute validates routing mode.
+    global.__EdgeRoute = EdgeRoute;
+    // Edge stroke/arrow style table, exposed for UT (P1-13): asserts the colour
+    // constants equal the (deleted) CSS `.edge-path*` values.
+    global.__EDGE_STYLE = EDGE_STYLE;
     global.__renderSnapshot = function () {
         ensureEngine();
         return buildSnapshot();
