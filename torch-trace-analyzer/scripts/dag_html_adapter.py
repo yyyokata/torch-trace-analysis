@@ -304,6 +304,7 @@ def _build_io_leaf(entry: dict, io_subtype: str, depth: int) -> dict:
         "node_type": io_subtype,
         "attr_name": attr_name,
         "class_name": class_name,
+        "call_loc": call_loc,
         **_call_loc_to_src_fields(call_loc),
         **_timing_defaults(),
     }
@@ -322,6 +323,7 @@ def _build_non_io_leaf(entry: dict, depth: int) -> dict:
         "node_type": attr_type,
         "attr_name": _require_field(entry, "attr_name"),
         "class_name": _require_field(entry, "class_name"),
+        "call_loc": entry.get("call_loc"),
         **_call_loc_to_src_fields(entry.get("call_loc")),
         **_timing_defaults(),
     }
