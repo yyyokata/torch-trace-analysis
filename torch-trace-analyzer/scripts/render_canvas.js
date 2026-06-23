@@ -459,18 +459,18 @@
         const padding = (numericOrNull(opts.padding) !== null && opts.padding >= 0) ? Number(opts.padding) : 40;
         const vp = this.owner.viewport;
         const availW = Math.max(1, cw - 2 * padding);
-        const availH = Math.max(1, ch - 2 * padding);
-        // Joint width+height fit: take the smaller axis ratio so the whole graph
-        // fits in both dimensions, then clamp into the viewport zoom range.
-        const scaleX = availW / bounds.w;
-        const scaleY = availH / bounds.h;
-        let scale = Math.min(scaleX, scaleY);
+        // Width-only fit (matches the legacy SVG semantics): scale so the graph
+        // width fills the available container width, then clamp into the viewport
+        // zoom range.  Height is NOT constrained — when the scaled graph is taller
+        // than the viewport the overflow is reached by vertical scrolling / panning.
+        let scale = availW / bounds.w;
         scale = Math.max(vp.minScale, Math.min(vp.maxScale, scale));
         scale = Number(scale.toFixed(3));
         vp.scale = scale;
-        // Center the scaled world inside the container.
+        // Center horizontally; top-align vertically so the graph starts at the top
+        // padding and grows downward into the scrollable overflow.
         vp.x = (cw - bounds.w * scale) / 2 - bounds.x * scale;
-        vp.y = (ch - bounds.h * scale) / 2 - bounds.y * scale;
+        vp.y = padding - bounds.y * scale;
         applyViewport();
         return vp;
     };
@@ -1085,8 +1085,18 @@
         engine.viewport.worldWidth = layoutInfo.svgW;
         engine.viewport.worldHeight = layoutInfo.svgH;
         engine.worldBounds = { x: 0, y: 0, w: layoutInfo.svgW, h: layoutInfo.svgH };
+        // The canvas/renderer must stay sized to the visible viewport (container),
+        // NOT to the full world.  The world (engine.world) is scaled + translated by
+        // the viewport so the whole DAG fits inside this fixed canvas.  Sizing the
+        // renderer to svgW x svgH blows the canvas up to the entire graph and pushes
+        // everything off-screen, which defeats the first-screen auto-fit.
+        const cw = getContainerWidth(engine.container);
+        const ch = getContainerHeight(engine.container);
+        if (cw === null || cw <= 0 || ch === null || ch <= 0) {
+            throw new Error('render_canvas.js: applyWorldLayout requires positive container dimensions');
+        }
         if (engine.app && engine.app.renderer && typeof engine.app.renderer.resize === 'function') {
-            engine.app.renderer.resize(Math.ceil(layoutInfo.svgW), Math.ceil(layoutInfo.svgH));
+            engine.app.renderer.resize(Math.ceil(cw), Math.ceil(ch));
         }
         applyViewport();
     }
@@ -1110,7 +1120,18 @@
         if (cw === null || cw <= 0 || ch === null || ch <= 0) {
             throw new Error('render_canvas.js: auto-fit requires positive container dimensions');
         }
-        engine.viewportController.fitToView(engine.worldBounds, cw, ch);
+        const FIT_PADDING = 40;
+        const vp = engine.viewportController.fitToView(engine.worldBounds, cw, ch, { padding: FIT_PADDING });
+        // Width-only fit: the canvas width fills the container so there is no
+        // horizontal scroll.  The height is grown to the full scaled content so a
+        // graph taller than the viewport overflows into the .dag-stage's vertical
+        // scroll (matches the legacy SVG semantics) instead of being squeezed.
+        const contentHeight = Math.ceil(engine.worldBounds.h * vp.scale + 2 * FIT_PADDING);
+        const canvasHeight = Math.max(Math.ceil(ch), contentHeight);
+        if (engine.app && engine.app.renderer && typeof engine.app.renderer.resize === 'function') {
+            engine.app.renderer.resize(Math.ceil(cw), canvasHeight);
+        }
+        return vp;
     }
 
     function updateLegendAndSummary(data) {
