@@ -1503,20 +1503,20 @@ async function runChunked(items, handler, options) {
     assertActiveRenderGeneration(generation, stageText);
 }
 
-function invokeRender() {
-    const promise = render();
+function invokeRender(renderOpts) {
+    const promise = render(renderOpts);
     promise.catch((err) => {
         setTimeout(() => { throw err; }, 0);
     });
     return promise;
 }
 
-async function render() {
+async function render(renderOpts) {
     if (typeof window !== 'undefined' && window.__phase1NoInteractionMode === true) {
         if (typeof window.__canvasRenderPhase1 !== 'function') {
             throw new Error('Canvas render entry __canvasRenderPhase1 is missing while phase1 no-interaction mode is enabled');
         }
-        return window.__canvasRenderPhase1(DATA);
+        return window.__canvasRenderPhase1(DATA, renderOpts);
     }
     throw new Error('Legacy SVG render path has been removed; Canvas Phase 1 requires render_canvas.js');
 }
@@ -1791,11 +1791,11 @@ document.addEventListener('keydown', (e) => {
 
 document.getElementById('btn-expand-all').addEventListener('click', () => {
     DATA.groups.forEach(g => collapsedState[g.id] = false);
-    invokeRender();
+    invokeRender({ autoFit: true });
 });
 document.getElementById('btn-collapse-all').addEventListener('click', () => {
     DATA.groups.forEach(g => { if (g.depth >= 1) collapsedState[g.id] = true; });
-    invokeRender();
+    invokeRender({ autoFit: true });
 });
 document.getElementById('btn-fit').addEventListener('click', () => {
     if (typeof window.__canvasEnginePhase1 !== 'function') {
@@ -1807,7 +1807,8 @@ document.getElementById('btn-fit').addEventListener('click', () => {
     }
     const container = document.getElementById('dag-container');
     const containerWidth = container && Number(container.clientWidth);
-    engine.viewportController.fitToView(engine.worldBounds, containerWidth);
+    const containerHeight = container && Number(container.clientHeight);
+    engine.viewportController.fitToView(engine.worldBounds, containerWidth, containerHeight);
 });
 
 invokeRender();

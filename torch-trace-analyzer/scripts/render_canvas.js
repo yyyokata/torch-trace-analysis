@@ -35,6 +35,18 @@
         output: 'Result'
     };
 
+    // Stage 1.5: Text styles for the v8 Text builder.  Plain style objects are
+    // accepted directly by both real PixiJS v8 Text and the headless mock.
+    const TEXT_STYLE = {
+        nodeTitle:   { fontFamily: 'Menlo, Consolas, monospace', fontSize: 12, fontWeight: '600', fill: 0xffffff },
+        nodeSub:     { fontFamily: 'Menlo, Consolas, monospace', fontSize: 10, fill: 0xcfe3ff },
+        groupHeader: { fontFamily: 'Menlo, Consolas, monospace', fontSize: 13, fontWeight: '700', fill: 0xffffff },
+        groupTiming: { fontFamily: 'Menlo, Consolas, monospace', fontSize: 10, fill: 0xffe08a },
+        info:        { fontFamily: 'Menlo, Consolas, monospace', fontSize: 11, fontWeight: '700', fill: 0xffffff },
+        ioTitle:     { fontFamily: 'Menlo, Consolas, monospace', fontSize: 11, fontWeight: '600', fill: 0xffffff },
+        ioSub:       { fontFamily: 'Menlo, Consolas, monospace', fontSize: 9, fill: 0xeafff0 }
+    };
+
     // ── engine factory ─────────────────────────────────────────────────────
     function resolvePixi() {
         if (global.PIXI && typeof global.PIXI.Application === 'function' && typeof global.PIXI.Container === 'function') {
@@ -70,13 +82,25 @@
         }
         Graphics.prototype = Object.create(Container.prototype);
         Graphics.prototype.constructor = Graphics;
-        ['clear', 'lineStyle', 'moveTo', 'lineTo', 'beginFill', 'drawPolygon', 'endFill', 'drawRoundedRect', 'drawCircle', 'drawRect']
+        ['clear', 'roundRect', 'rect', 'circle', 'ellipse', 'poly', 'fill', 'stroke',
+         'setStrokeStyle', 'setFillStyle', 'moveTo', 'lineTo', 'closePath', 'beginPath']
             .forEach(function (name) {
                 Graphics.prototype[name] = function () { return this; };
             });
-        function Text(text) {
+        function Text(arg) {
             Container.call(this);
-            this.text = (text === undefined || text === null) ? '' : String(text);
+            const opts = (arg && typeof arg === 'object') ? arg : { text: arg };
+            this.text = (opts.text === undefined || opts.text === null) ? '' : String(opts.text);
+            this.style = opts.style || {};
+            this.resolution = opts.resolution || 1;
+            this.anchor = {
+                x: 0,
+                y: 0,
+                set: function (ax, ay) {
+                    this.x = ax;
+                    this.y = (ay === undefined ? ax : ay);
+                }
+            };
             this.__isHeadlessText = true;
         }
         Text.prototype = Object.create(Container.prototype);
@@ -93,6 +117,14 @@
                 }
             };
         }
+        // PixiJS v8 init() is async; the headless mock mirrors the contract so the
+        // renderer's `ensureStageMounted()` await works identically in node + browser.
+        Application.prototype.init = function (options) {
+            const opts = options || {};
+            this.screen = { x: 0, y: 0, width: opts.width || 0, height: opts.height || 0 };
+            return Promise.resolve(this);
+        };
+        Application.prototype.render = function () { return this; };
         Application.prototype.destroy = function () { this.stage = new Container(); };
         return {
             Application: Application,
@@ -117,13 +149,17 @@
 
     function buildEngine(container) {
         const PIXI = resolvePixi();
-        const app = new PIXI.Application({ width: 0, height: 0, antialias: true, backgroundAlpha: 0 });
-        if (app.canvas && typeof container.appendChild === 'function') {
-            container.appendChild(app.canvas);
-        }
+        // PixiJS v8 splits construction (sync) from `app.init()` (async, sets up
+        // the WebGL renderer + canvas).  We only build the detached scene graph
+        // here so the synchronous `__renderSnapshot()` skeleton probe keeps working
+        // headless; `ensureStageMounted()` performs the async init lazily on the
+        // first real render and appends the canvas to the container.
+        const app = new PIXI.Application();
         const world = new PIXI.Container();
         world.name = 'world';
-        app.stage.addChild(world);
+        if (app.stage && typeof app.stage.addChild === 'function') {
+            app.stage.addChild(world);
+        }
 
         const layers = {};
         LAYER_KEYS.forEach(function (key) {
@@ -140,11 +176,15 @@
             layers: layers,
             container: container,
             usingHeadlessPixi: PIXI.__isHeadlessMock === true,
+            initialized: false,
+            initPromise: null,
+            hasRenderedOnce: false,
             nodes: [],
             groups: [],
             edges: [],
             io_pills: [],
             labelsCreated: 0,
+            labels: [],
             cullingEnabled: true,
             worldBounds: null,
             viewport: {
@@ -176,6 +216,38 @@
             initCanvasEngine();
         }
         return engine;
+    }
+
+    // Stage 1.5: perform the async PixiJS v8 `app.init()` lazily on the first real
+    // render.  Idempotent via `initPromise`; the headless mock resolves instantly.
+    async function ensureStageMounted() {
+        const eng = ensureEngine();
+        if (eng.initialized) { return eng; }
+        if (!eng.initPromise) {
+            eng.initPromise = (async function () {
+                if (typeof eng.app.init === 'function') {
+                    await eng.app.init({
+                        backgroundAlpha: 0,
+                        antialias: true,
+                        autoDensity: true,
+                        resolution: (global.devicePixelRatio || 1),
+                        preference: 'webgl',
+                        width: Math.max(1, getContainerWidth(eng.container) || 1280),
+                        height: Math.max(1, getContainerHeight(eng.container) || 720)
+                    });
+                }
+                if (eng.app.canvas && typeof eng.container.appendChild === 'function') {
+                    eng.container.appendChild(eng.app.canvas);
+                }
+                // `init()` may (re)create app.stage; (re-)attach the world graph.
+                if (eng.app.stage && typeof eng.app.stage.addChild === 'function') {
+                    eng.app.stage.addChild(eng.world);
+                }
+                eng.initialized = true;
+            })();
+        }
+        await eng.initPromise;
+        return eng;
     }
 
     // ── lazy accessors for inline-template globals ─────────────────────────
@@ -237,15 +309,51 @@
         return g;
     }
 
-    function makeText(value, name) {
-        const t = new engine.pixi.Text(value);
+    function makeText(value, name, style) {
+        const t = new engine.pixi.Text({
+            text: (value === undefined || value === null) ? '' : String(value),
+            style: style || TEXT_STYLE.nodeSub,
+            resolution: (global.devicePixelRatio || 1)
+        });
         if (name) { t.name = name; }
         return t;
     }
 
-    function addLabel(layer, value, name) {
+    function addLabel(layer, value, name, x, y, style, anchor) {
+        const ax = (anchor && anchor.ax !== undefined) ? anchor.ax : 0;
+        const ay = (anchor && anchor.ay !== undefined) ? anchor.ay : 0;
+        const px = numericOrNull(x);
+        const py = numericOrNull(y);
+        if (px === null || py === null) {
+            throw new Error('render_canvas.js: addLabel requires numeric x/y for ' + name);
+        }
+        const t = makeText(value, name, style);
+        if (t.anchor && typeof t.anchor.set === 'function') {
+            t.anchor.set(ax, ay);
+        } else {
+            t.anchor = { x: ax, y: ay };
+        }
+        t.x = px;
+        t.y = py;
+        layer.addChild(t);
         engine.labelsCreated += 1;
-        layer.addChild(makeText(value, name));
+        engine.labels.push({ name: name, x: px, y: py });
+        return t;
+    }
+
+    // Stage 1.5: shared rounded-box painter on the v8 Graphics builder.  `fill` /
+    // `stroke` accept a CSS color string or a numeric color, matching v8.
+    function fillStrokeBox(g, x, y, w, h, opts) {
+        const o = opts || {};
+        const r = (o.radius !== undefined) ? o.radius : 8;
+        g.roundRect(x, y, w, h, r);
+        if (o.fill !== undefined && o.fill !== null) {
+            g.fill({ color: o.fill, alpha: (o.fillAlpha !== undefined ? o.fillAlpha : 1) });
+        }
+        if (o.stroke !== undefined && o.stroke !== null) {
+            g.stroke({ color: o.stroke, width: (o.strokeWidth || 1), alpha: (o.strokeAlpha !== undefined ? o.strokeAlpha : 1) });
+        }
+        return g;
     }
 
     // ── viewport / culling ─────────────────────────────────────────────────
@@ -337,18 +445,34 @@
         }
         return this.zoomTo(this.owner.viewport.scale * value);
     };
-    ViewportController.prototype.fitToView = function (worldBounds, containerWidth) {
+    ViewportController.prototype.fitToView = function (worldBounds, containerWidth, containerHeight, options) {
         const bounds = normalizeWorldBounds(worldBounds);
         const cw = numericOrNull(containerWidth);
+        const ch = numericOrNull(containerHeight);
         if (cw === null || cw <= 0) {
             throw new Error('render_canvas.js: fitToView requires a positive containerWidth');
         }
-        const scale = bounds.w > cw ? Number((cw / bounds.w).toFixed(3)) : 1;
-        this.owner.viewport.scale = scale;
-        this.owner.viewport.x = -bounds.x * scale;
-        this.owner.viewport.y = -bounds.y * scale;
+        if (ch === null || ch <= 0) {
+            throw new Error('render_canvas.js: fitToView requires a positive containerHeight');
+        }
+        const opts = options || {};
+        const padding = (numericOrNull(opts.padding) !== null && opts.padding >= 0) ? Number(opts.padding) : 40;
+        const vp = this.owner.viewport;
+        const availW = Math.max(1, cw - 2 * padding);
+        const availH = Math.max(1, ch - 2 * padding);
+        // Joint width+height fit: take the smaller axis ratio so the whole graph
+        // fits in both dimensions, then clamp into the viewport zoom range.
+        const scaleX = availW / bounds.w;
+        const scaleY = availH / bounds.h;
+        let scale = Math.min(scaleX, scaleY);
+        scale = Math.max(vp.minScale, Math.min(vp.maxScale, scale));
+        scale = Number(scale.toFixed(3));
+        vp.scale = scale;
+        // Center the scaled world inside the container.
+        vp.x = (cw - bounds.w * scale) / 2 - bounds.x * scale;
+        vp.y = (ch - bounds.h * scale) / 2 - bounds.y * scale;
         applyViewport();
-        return this.owner.viewport;
+        return vp;
     };
     ViewportController.prototype.currentBounds = function () {
         const vp = this.owner.viewport;
@@ -432,11 +556,20 @@
         const rect = { x: x, y: y, w: w, h: h };
         const visible = shouldCreateLabel(rect);
 
-        engine.layers.l3.addChild(makeGraphics('node-box:' + nid));
+        const box = makeGraphics('node-box:' + nid);
+        fillStrokeBox(box, x, y, w, h, {
+            radius: 7, fill: color, fillAlpha: 0.95,
+            stroke: 0xffffff, strokeAlpha: 0.14, strokeWidth: 1
+        });
+        engine.layers.l3.addChild(box);
         if (visible) {
-            addLabel(engine.layers.l3, label, 'node-label:' + nid);
+            const cx = x + w / 2;
+            const cy = y + h / 2;
+            addLabel(engine.layers.l3, label, 'node-label:' + nid,
+                cx, sublabel ? cy - 7 : cy, TEXT_STYLE.nodeTitle, { ax: 0.5, ay: 0.5 });
             if (sublabel) {
-                addLabel(engine.layers.l3, sublabel, 'node-sublabel:' + nid);
+                addLabel(engine.layers.l3, sublabel, 'node-sublabel:' + nid,
+                    cx, cy + 8, TEXT_STYLE.nodeSub, { ax: 0.5, ay: 0.5 });
             }
         }
 
@@ -454,18 +587,31 @@
         const rect = { x: ox, y: oy, w: pos.w, h: pos.h };
         const visible = shouldCreateLabel(rect);
 
-        engine.layers.l2.addChild(makeGraphics('group-box:' + gid));
+        const groupColor = nodeColorOf(g);
+        const box = makeGraphics('group-box:' + gid);
+        fillStrokeBox(box, ox, oy, pos.w, pos.h, {
+            radius: 8, fill: groupColor, fillAlpha: 0.22,
+            stroke: groupColor, strokeAlpha: 0.85, strokeWidth: 1.5
+        });
+        engine.layers.l2.addChild(box);
         if (visible) {
-            addLabel(engine.layers.l2, '\u25B6 ' + g.class_name, 'group-label:' + gid);
+            addLabel(engine.layers.l2, '\u25B6 ' + g.class_name, 'group-label:' + gid,
+                ox + 10, oy + 15, TEXT_STYLE.groupHeader, { ax: 0, ay: 0.5 });
             if (hasTiming) {
-                addLabel(engine.layers.l2, 'Kernel ' + g.pct.toFixed(1) + '% \u00B7 ' + formatDurOf(g.dur_us), 'group-timing:' + gid);
+                addLabel(engine.layers.l2, 'Kernel ' + g.pct.toFixed(1) + '% \u00B7 ' + formatDurOf(g.dur_us),
+                    'group-timing:' + gid, ox + 10, oy + 32, TEXT_STYLE.groupTiming, { ax: 0, ay: 0.5 });
             }
             if (hasInfo) {
-                engine.layers.l2.addChild(makeGraphics('group-info-hit:' + gid));
-                addLabel(engine.layers.l2, 'i', 'group-info:' + gid);
+                const info = makeGraphics('group-info-hit:' + gid);
+                info.circle(ox + pos.w - 13, oy + 13, 8).fill({ color: 0x000000, alpha: 0.35 }).stroke({ color: 0xffffff, width: 1, alpha: 0.6 });
+                engine.layers.l2.addChild(info);
+                addLabel(engine.layers.l2, 'i', 'group-info:' + gid,
+                    ox + pos.w - 13, oy + 13, TEXT_STYLE.info, { ax: 0.5, ay: 0.5 });
             }
         } else if (hasInfo) {
-            engine.layers.l2.addChild(makeGraphics('group-info-hit:' + gid));
+            const info = makeGraphics('group-info-hit:' + gid);
+            info.circle(ox + pos.w - 13, oy + 13, 8).fill({ color: 0x000000, alpha: 0.35 });
+            engine.layers.l2.addChild(info);
         }
 
         engine.groups.push({
@@ -481,18 +627,33 @@
         const rect = { x: ox, y: oy, w: pos.w, h: pos.h };
         const visible = shouldCreateLabel(rect);
 
-        engine.layers.l2.addChild(makeGraphics('group-box:' + gid));
+        const groupColor = nodeColorOf(g);
+        const box = makeGraphics('group-box:' + gid);
+        fillStrokeBox(box, ox, oy, pos.w, pos.h, {
+            radius: 8, fill: groupColor, fillAlpha: 0.08,
+            stroke: groupColor, strokeAlpha: 0.7, strokeWidth: 1.5
+        });
+        // header bar so the expanded container title stays legible
+        box.roundRect(ox, oy, pos.w, 26, 8).fill({ color: groupColor, alpha: 0.35 });
+        engine.layers.l2.addChild(box);
         if (visible) {
-            addLabel(engine.layers.l2, '\u25BC ' + g.class_name, 'group-header:' + gid);
+            addLabel(engine.layers.l2, '\u25BC ' + g.class_name, 'group-header:' + gid,
+                ox + 10, oy + 13, TEXT_STYLE.groupHeader, { ax: 0, ay: 0.5 });
             if (hasInfo) {
-                engine.layers.l2.addChild(makeGraphics('group-info-hit:' + gid));
-                addLabel(engine.layers.l2, 'i', 'group-info:' + gid);
+                const info = makeGraphics('group-info-hit:' + gid);
+                info.circle(ox + pos.w - 13, oy + 13, 8).fill({ color: 0x000000, alpha: 0.35 }).stroke({ color: 0xffffff, width: 1, alpha: 0.6 });
+                engine.layers.l2.addChild(info);
+                addLabel(engine.layers.l2, 'i', 'group-info:' + gid,
+                    ox + pos.w - 13, oy + 13, TEXT_STYLE.info, { ax: 0.5, ay: 0.5 });
             }
             if (hasTiming) {
-                addLabel(engine.layers.l2, 'Kernel ' + g.pct.toFixed(1) + '% \u00B7 ' + formatDurOf(g.dur_us), 'group-timing:' + gid);
+                addLabel(engine.layers.l2, 'Kernel ' + g.pct.toFixed(1) + '% \u00B7 ' + formatDurOf(g.dur_us),
+                    'group-timing:' + gid, ox + pos.w - 26, oy + 13, TEXT_STYLE.groupTiming, { ax: 1, ay: 0.5 });
             }
         } else if (hasInfo) {
-            engine.layers.l2.addChild(makeGraphics('group-info-hit:' + gid));
+            const info = makeGraphics('group-info-hit:' + gid);
+            info.circle(ox + pos.w - 13, oy + 13, 8).fill({ color: 0x000000, alpha: 0.35 });
+            engine.layers.l2.addChild(info);
         }
 
         engine.groups.push({
@@ -669,14 +830,12 @@
     };
 
     function strokePolyline(g, points, style) {
-        if (typeof g.lineStyle !== 'function' || typeof g.moveTo !== 'function' || typeof g.lineTo !== 'function') {
-            return;
-        }
-        g.lineStyle(style.width, style.color, style.alpha);
+        if (!points || points.length < 2) { return; }
         g.moveTo(points[0].x, points[0].y);
         for (let i = 1; i < points.length; i++) {
             g.lineTo(points[i].x, points[i].y);
         }
+        g.stroke({ width: style.width, color: style.color, alpha: style.alpha });
     }
 
     function drawArrowHead(g, points, style) {
@@ -694,16 +853,12 @@
         const py = ux;
         const baseX = tip.x - ux * size;
         const baseY = tip.y - uy * size;
-        if (typeof g.beginFill !== 'function' || typeof g.drawPolygon !== 'function') {
-            return;
-        }
-        g.beginFill(style.color, style.arrowAlpha);
-        g.drawPolygon([
+        g.poly([
             tip.x, tip.y,
             baseX + px * half, baseY + py * half,
             baseX - px * half, baseY - py * half
         ]);
-        if (typeof g.endFill === 'function') { g.endFill(); }
+        g.fill({ color: style.color, alpha: style.arrowAlpha });
     }
 
     function drawGlobalEdges(data) {
@@ -745,10 +900,20 @@
         if (!spec || spec.id === undefined || spec.id === null) {
             throw new Error('render_canvas.js: IOLayer.drawPill got invalid spec');
         }
-        this.layer.addChild(makeGraphics('io-pill:' + spec.id));
-        addLabel(this.layer, spec.label, 'io-label:' + spec.id);
+        const pillX = spec.cx - spec.w / 2;
+        const pillY = spec.cy - spec.h / 2;
+        const pillFill = spec.fillColor || IO_GROUP_FILL[spec.subtype] || 'rgba(127,140,141,0.55)';
+        const pill = makeGraphics('io-pill:' + spec.id);
+        fillStrokeBox(pill, pillX, pillY, spec.w, spec.h, {
+            radius: Math.min(spec.h / 2, 12), fill: pillFill, fillAlpha: 1,
+            stroke: 0xffffff, strokeAlpha: 0.2, strokeWidth: 1
+        });
+        this.layer.addChild(pill);
+        addLabel(this.layer, spec.label, 'io-label:' + spec.id,
+            spec.cx, spec.sublabel ? spec.cy - 6 : spec.cy, TEXT_STYLE.ioTitle, { ax: 0.5, ay: 0.5 });
         if (spec.sublabel) {
-            addLabel(this.layer, spec.sublabel, 'io-sublabel:' + spec.id);
+            addLabel(this.layer, spec.sublabel, 'io-sublabel:' + spec.id,
+                spec.cx, spec.cy + 7, TEXT_STYLE.ioSub, { ax: 0.5, ay: 0.5 });
         }
         registerNodePorts(spec.id, spec.cx - spec.w / 2, spec.cy - spec.h / 2, spec.w, spec.h);
         engine.io_pills.push({
@@ -781,7 +946,12 @@
             const frameY = startY - 8;
             const frameW = availableW - 2 * (cfg.EXPAND_FRAME_PAD - 8);
             const frameH = expanded.height + 8;
-            this.layer.addChild(makeGraphics('io-group-frame:' + ioGroup.id));
+            const frame = makeGraphics('io-group-frame:' + ioGroup.id);
+            fillStrokeBox(frame, frameX, frameY, frameW, frameH, {
+                radius: 10, fill: fillColor, fillAlpha: 0.12,
+                stroke: fillColor, strokeAlpha: 0.7, strokeWidth: 1.2
+            });
+            this.layer.addChild(frame);
             engine.io_pills.push({
                 id: ioGroup.id,
                 subtype: ioGroup.io_subtype,
@@ -819,12 +989,27 @@
                     left += expanded.pillW + cfg.pillGap;
                 }
             }
-            this.layer.addChild(makeGraphics('io-group-collapse:' + ioGroup.id));
-            addLabel(this.layer, '▲ 收起', 'io-group-collapse-label:' + ioGroup.id);
+            const collapseCx = geom.cx;
+            const collapseCy = frameY + frameH - 4;
+            const collapseBtn = makeGraphics('io-group-collapse:' + ioGroup.id);
+            fillStrokeBox(collapseBtn, collapseCx - 34, collapseCy - 9, 68, 18, {
+                radius: 9, fill: 0x000000, fillAlpha: 0.35, stroke: 0xffffff, strokeAlpha: 0.4, strokeWidth: 1
+            });
+            this.layer.addChild(collapseBtn);
+            addLabel(this.layer, '\u25B2 \u6536\u8D77', 'io-group-collapse-label:' + ioGroup.id,
+                collapseCx, collapseCy, TEXT_STYLE.ioSub, { ax: 0.5, ay: 0.5 });
             return frameY + frameH;
         }
-        this.layer.addChild(makeGraphics('io-group-pill:' + ioGroup.id));
-        addLabel(this.layer, '▶ ' + ioGroup.label, 'io-group-label:' + ioGroup.id);
+        const groupPillX = geom.cx - geom.w / 2;
+        const groupPillY = geom.cy - geom.h / 2;
+        const groupPill = makeGraphics('io-group-pill:' + ioGroup.id);
+        fillStrokeBox(groupPill, groupPillX, groupPillY, geom.w, geom.h, {
+            radius: Math.min(geom.h / 2, 12), fill: fillColor, fillAlpha: 1,
+            stroke: 0xffffff, strokeAlpha: 0.2, strokeWidth: 1
+        });
+        this.layer.addChild(groupPill);
+        addLabel(this.layer, '\u25B6 ' + ioGroup.label, 'io-group-label:' + ioGroup.id,
+            geom.cx, geom.cy, TEXT_STYLE.ioTitle, { ax: 0.5, ay: 0.5 });
         registerNodePorts(ioGroup.id, geom.cx - geom.w / 2, geom.cy - geom.h / 2, geom.w, geom.h);
         engine.io_pills.push({
             id: ioGroup.id,
@@ -886,6 +1071,7 @@
         engine.edges = [];
         engine.io_pills = [];
         engine.labelsCreated = 0;
+        engine.labels = [];
         const map = lookupNodePortMap();
         if (map) {
             Object.keys(map).forEach(function (k) { delete map[k]; });
@@ -911,6 +1097,20 @@
             walkGroup(root.id, root.x, root.y);
         }
         drawIOTasks(layoutInfo.ioTasks || []);
+    }
+
+    // Stage 1.5: fit the freshly-laid-out world into the visible container.
+    // Required on the first render and after Expand/Collapse-All re-layouts.
+    function performAutoFit() {
+        if (!engine.worldBounds) {
+            throw new Error('render_canvas.js: auto-fit requires worldBounds');
+        }
+        const cw = getContainerWidth(engine.container);
+        const ch = getContainerHeight(engine.container);
+        if (cw === null || cw <= 0 || ch === null || ch <= 0) {
+            throw new Error('render_canvas.js: auto-fit requires positive container dimensions');
+        }
+        engine.viewportController.fitToView(engine.worldBounds, cw, ch);
     }
 
     function updateLegendAndSummary(data) {
@@ -964,8 +1164,9 @@
         };
     }
 
-    async function canvasRenderPhase1(data) {
+    async function canvasRenderPhase1(data, renderOpts) {
         ensureEngine();
+        await ensureStageMounted();
         const p = progressApi();
         const computeLayout = requireInline('computeFlowchartLayout', lookupComputeFlowchartLayout());
         const generation = bumpRenderGeneration();
@@ -1009,6 +1210,11 @@
                 allowedTypes: ['edge']
             });
             p.assertActiveRenderGeneration(generation, '收尾阶段');
+            const wantAutoFit = (!engine.hasRenderedOnce) || (renderOpts && renderOpts.autoFit === true);
+            if (wantAutoFit) {
+                performAutoFit();
+            }
+            engine.hasRenderedOnce = true;
             p.setRenderProgress(98, '正在更新图例和摘要…');
             await p.nextFrame();
             updateLegendAndSummary(data);
@@ -1088,6 +1294,7 @@
             },
             layers: layerChildCounts(),
             labelsCreated: engine.labelsCreated,
+            labels: (engine.labels || []).map(function (l) { return { name: l.name, x: l.x, y: l.y }; }),
             flags: {
                 noInteractionMode: global.__phase1NoInteractionMode === true,
                 cullingEnabled: engine.cullingEnabled === true
