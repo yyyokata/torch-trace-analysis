@@ -82,10 +82,6 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 .dag-svg .leaf-node:hover { stroke: #ffffff; stroke-width: 2.5; }
 .dag-svg .node-label { font-size: 11px; fill: #ffffff; font-weight: 500; pointer-events: none; text-anchor: middle; }
 .dag-svg .node-sublabel { font-size: 9px; fill: rgba(255,255,255,0.7); pointer-events: none; text-anchor: middle; }
-.dag-svg .edge-path { fill: none; stroke: rgba(255,255,255,0.2); stroke-width: 1.7; opacity: 0.82; transition: stroke 0.18s ease, stroke-width 0.18s ease, opacity 0.18s ease; }
-.dag-svg .edge-path.internal { stroke: rgba(100,181,246,0.46); stroke-width: 1.35; }
-.dag-svg .edge-path.dep { stroke: rgba(46,204,113,0.62); stroke-width: 1.9; }
-.dag-svg .edge-path.flow { stroke: rgba(255,255,255,0.28); stroke-width: 1.35; stroke-dasharray: 4,3; }
 .dag-svg .port { fill: rgba(255,255,255,0.15); stroke: rgba(255,255,255,0.3); stroke-width: 1; }
 .tooltip { position: fixed; background: #16213e; border: 1px solid rgba(100,181,246,0.3); border-radius: 8px; padding: 10px 14px; font-size: 11px; color: #e0e0e0; pointer-events: none; z-index: 1000; max-width: 300px; box-shadow: 0 4px 20px rgba(0,0,0,0.4); opacity: 0; transition: opacity 0.15s; }
 .tooltip.visible { opacity: 1; }
@@ -119,13 +115,6 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 .code-line .code-text mark.var-mark.producer-mark { background: rgba(46, 204, 113, 0.30); color: #d5f5e3; box-shadow: inset 0 0 0 1px rgba(46, 204, 113, 0.40); }
 .code-line .code-text mark.var-mark.consumer-mark { background: rgba(255, 209, 102, 0.25); color: #fff4c2; box-shadow: inset 0 0 0 1px rgba(255, 209, 102, 0.35); }
 .dag-svg .group-clickable { cursor: pointer; }
-.dag-svg .edge-path { pointer-events: stroke; cursor: pointer; }
-.dag-svg .edge-path:hover { stroke-width: 3.4; opacity: 1 !important; }
-.dag-container.hover-active .edge-path:not(.edge-active) { opacity: 0.14 !important; }
-.dag-container.hover-active .edge-path.edge-active { opacity: 1 !important; }
-.dag-container.hover-active .edge-path.dep.edge-active { stroke: #7CFFB2 !important; }
-.dag-container.hover-active .edge-path.flow.edge-active { stroke: #FFD166 !important; }
-.dag-container.hover-active .edge-path.internal.edge-active { stroke: #7FD1FF !important; }
 .dag-container.hover-active .leaf-node.node-dim,
 .dag-container.hover-active .group-box.node-dim,
 .dag-container.hover-active .io-node.node-dim,
@@ -1460,17 +1449,7 @@ async function render() {
         svg.onclick = () => clearEdgeFocus();
         svg.setAttribute('width', svgW);
         svg.setAttribute('height', svgH);
-        svg.innerHTML = `<defs>
-            <marker id="arrowhead" markerWidth="7" markerHeight="7" refX="7" refY="3.5" orient="auto">
-                <polygon points="0 0, 7 3.5, 0 7" fill="rgba(255,255,255,0.3)"/>
-            </marker>
-            <marker id="arrowhead-blue" markerWidth="7" markerHeight="7" refX="7" refY="3.5" orient="auto">
-                <polygon points="0 0, 7 3.5, 0 7" fill="rgba(100,181,246,0.5)"/>
-            </marker>
-            <marker id="arrowhead-dep" markerWidth="7" markerHeight="7" refX="7" refY="3.5" orient="auto">
-                <polygon points="0 0, 7 3.5, 0 7" fill="rgba(46,204,113,0.6)"/>
-            </marker>
-        </defs>
+        svg.innerHTML = `<defs></defs>
         <g id="edge-overlay-layer"></g>`;
         edgeOverlayLayer = document.getElementById('edge-overlay-layer');
         if (!edgeOverlayLayer || edgeOverlayLayer.tagName !== 'g') {
@@ -1561,143 +1540,6 @@ async function render() {
             nodePortMap[nid + '__out'] = { cx: nx + w/2, cy: ny + h };
         }
 
-        function configureLongEdgeDisplay(path) {
-            if (!path) return;
-            let total = NaN;
-            try {
-                total = path.getTotalLength();
-            } catch (err) {
-                total = NaN;
-            }
-            if (!Number.isFinite(total) || total < LONG_EDGE_MIN_SPAN) return;
-            const originalDasharray = path.getAttribute('stroke-dasharray') || '';
-            const originalDashoffset = path.getAttribute('stroke-dashoffset') || '';
-            const stubLen = Math.max(40, Math.min(72, total * 0.12));
-            const gapLen = Math.max(80, total - stubLen * 2);
-            path.dataset.longEdge = '1';
-            path.dataset.fullDasharray = originalDasharray;
-            path.dataset.fullDashoffset = originalDashoffset;
-            path.dataset.truncatedDasharray = `${stubLen} ${gapLen} ${stubLen}`;
-            if (originalDashoffset) {
-                path.dataset.truncatedDashoffset = originalDashoffset;
-            }
-            path.classList.add('long-edge');
-            path.setAttribute('stroke-dasharray', path.dataset.truncatedDasharray);
-        }
-
-        function buildDirectEdgePath(x1, y1, x2, y2, routeMeta) {
-            const dy = y2 - y1;
-            const dx = x2 - x1;
-            if (Math.abs(dy) < 3 && Math.abs(dx) < 3) return null;
-            const meta = routeMeta || {};
-            const offset = meta.bundleOffset || 0;
-            const sourceFanout = meta.sourceFanout || 1;
-            const targetFanin = meta.targetFanin || 1;
-            const sideBias = offset === 0 ? (dx >= 0 ? 1 : -1) : (offset > 0 ? 1 : -1);
-            let d;
-            if (dy > 8) {
-                const cp = Math.max(24, Math.min(Math.abs(dy) * 0.34 + Math.abs(offset) * 0.7, 96));
-                const c1x = x1 + offset;
-                const c2x = x2 + offset;
-                d = `M${x1},${y1} C${c1x},${y1+cp} ${c2x},${y2-cp} ${x2},${y2}`;
-            } else if (dy < -8) {
-                const horizontal = sideBias * Math.max(52, Math.abs(dx) * 0.42 + 34 + Math.abs(offset));
-                const rise = Math.max(18, Math.min(72, Math.abs(offset) + 24));
-                d = `M${x1},${y1} C${x1+horizontal},${y1-rise} ${x2+horizontal},${y2+rise} ${x2},${y2}`;
-            } else {
-                const midX = (x1 + x2) / 2 + offset;
-                const midY = (y1 + y2) / 2 + 14 + Math.abs(offset) * 0.28;
-                d = `M${x1},${y1} Q${midX},${midY} ${x2},${y2}`;
-            }
-            return { d };
-        }
-
-        function buildIntraGroupEdgePath(fr, to, routeCtx, edgeData) {
-            const { groupLeft, groupRight, childLeftEdge, childRightEdge, skipLaneCounter } = routeCtx;
-            const x1 = fr.x + fr.w / 2, y1 = fr.y + fr.h;
-            const x2 = to.x + to.w / 2, y2 = to.y;
-            const fromRank = fr.rank, toRank = to.rank;
-            const routeMeta = EDGE_BUNDLE_META.get(edgeKey(edgeData)) || null;
-            if (toRank < 0) {
-                return buildDirectEdgePath(x1, y1, x2, y2, routeMeta);
-            }
-            const span = Math.abs(toRank - fromRank);
-
-            if (span <= 1 && y2 > y1) {
-                return buildDirectEdgePath(x1, y1, x2, y2, routeMeta);
-            }
-            if (span === 0) {
-                return {
-                    d: `M${x1},${y1} C${x1},${y1+14} ${x2},${y2+14} ${x2},${y2}`,
-                };
-            }
-
-            const groupMidX = (childLeftEdge + childRightEdge) / 2;
-            const avgX = (x1 + x2) / 2;
-            const preferRight = avgX >= groupMidX;
-            let laneIndex;
-            if (preferRight) {
-                laneIndex = skipLaneCounter.right++;
-            } else {
-                laneIndex = skipLaneCounter.left++;
-            }
-            const laneStep = 9;
-            const laneX = preferRight
-                ? Math.min(groupRight - 4, childRightEdge + 14 + (laneIndex % 4) * laneStep)
-                : Math.max(groupLeft + 4, childLeftEdge - 14 - (laneIndex % 4) * laneStep);
-
-            const verticalApproach = 18;
-            const d = [
-                `M${x1},${y1}`,
-                `C${x1},${y1 + verticalApproach} ${laneX},${y1 + verticalApproach} ${laneX},${y1 + verticalApproach + 10}`,
-                `L${laneX},${y2 - verticalApproach - 10}`,
-                `C${laneX},${y2 - verticalApproach} ${x2},${y2 - verticalApproach} ${x2},${y2}`
-            ].join(' ');
-            return { d, opacity: '0.7' };
-        }
-
-        function createEdgePathElement(d) {
-            const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-            path.setAttribute('d', d);
-            return path;
-        }
-
-        function createEdgeHitboxElement(d, key) {
-            const hitbox = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-            hitbox.setAttribute('d', d);
-            hitbox.setAttribute('stroke', 'transparent');
-            hitbox.setAttribute('stroke-width', '20');
-            hitbox.setAttribute('fill', 'none');
-            hitbox.setAttribute('pointer-events', 'stroke');
-            hitbox.setAttribute('opacity', '0');
-            hitbox.setAttribute('data-edge-key', key);
-            return hitbox;
-        }
-
-        function finalizeEdgeRendering(path, hitbox) {
-            svg.appendChild(path);
-            if (hitbox) svg.appendChild(hitbox);
-            configureLongEdgeDisplay(path);
-        }
-
-        function renderEdge(edgeSpec) {
-            let pathSpec = null;
-            if (edgeSpec.routingMode === 'direct') {
-                pathSpec = buildDirectEdgePath(edgeSpec.x1, edgeSpec.y1, edgeSpec.x2, edgeSpec.y2, edgeSpec.routeMeta);
-            } else if (edgeSpec.routingMode === 'intra_group') {
-                pathSpec = buildIntraGroupEdgePath(edgeSpec.fr, edgeSpec.to, edgeSpec.routeCtx, edgeSpec.edgeData);
-            } else {
-                throw new Error(`Unknown edge routing mode: ${edgeSpec.routingMode}`);
-            }
-            if (!pathSpec) return;
-            const key = edgeKey(edgeSpec.edgeData);
-            const path = createEdgePathElement(pathSpec.d);
-            const hitbox = createEdgeHitboxElement(pathSpec.d, key);
-            applyEdgePresentation(path, edgeSpec.type, pathSpec.opacity ?? null);
-            bindEdgeInteractions(path, hitbox, edgeSpec.edgeData);
-            finalizeEdgeRendering(path, hitbox);
-        }
-
         function registerEdgeDom(path, edgeData) {
             if (!path || !edgeData) return;
             const item = { path, edge: edgeData, key: edgeKey(edgeData) };
@@ -1712,21 +1554,6 @@ async function render() {
                     if (!edgeByGroupId.has(gid)) edgeByGroupId.set(gid, []);
                     edgeByGroupId.get(gid).push(item);
                 }
-            }
-        }
-
-        function applyEdgePresentation(path, type, opacity=null) {
-            path.setAttribute('class', `edge-path ${type || ''}`);
-            path.setAttribute('style', 'pointer-events: none');
-            if (type === 'dep') {
-                path.setAttribute('marker-end', 'url(#arrowhead-dep)');
-            } else if (type === 'internal') {
-                path.setAttribute('marker-end', 'url(#arrowhead-blue)');
-            } else {
-                path.setAttribute('marker-end', 'url(#arrowhead)');
-            }
-            if (opacity !== null) {
-                path.setAttribute('opacity', opacity);
             }
         }
 
@@ -2181,42 +2008,6 @@ async function render() {
             allowedTypes: ['group', 'node', 'io'],
         });
 
-        const globalEdgeTasks = collectGlobalEdgeTasks();
-
-        await runChunked(globalEdgeTasks, async (task) => {
-            if (task.type !== 'edge') {
-                throw new Error(`edge renderer got unsupported task type: ${task.type}`);
-            }
-            if (task.taskKind === 'global_edge') {
-                const fromId = resolveCollapsedAncestor(task.edgeData.from);
-                const toId = resolveCollapsedAncestor(task.edgeData.to);
-                if (fromId === toId) {
-                    return;
-                }
-                const fromPos = nodePortMap[fromId + '__out'] || nodePortMap[fromId];
-                const toPos = nodePortMap[toId + '__in'] || nodePortMap[toId];
-                if (!fromPos || !toPos) {
-                    throw new Error(`global edge endpoint missing: ${task.edgeData.from} -> ${task.edgeData.to}`);
-                }
-                renderEdge({
-                    routingMode: 'direct',
-                    x1: fromPos.cx, y1: fromPos.cy,
-                    x2: toPos.cx, y2: toPos.cy,
-                    type: task.edgeData.type || 'dep',
-                    edgeData: task.edgeData,
-                    routeMeta: EDGE_BUNDLE_META.get(edgeKey(task.edgeData)) || null,
-                });
-                return;
-            }
-            throw new Error(`edge renderer got unknown taskKind: ${task.taskKind}`);
-        }, {
-            batchSize: 180,
-            phaseStart: 60,
-            phaseEnd: 90,
-            stageText: '正在渲染依赖边…',
-            generation,
-            allowedTypes: ['edge'],
-        });
         if (!edgeOverlayLayer) {
             throw new Error('edge overlay layer missing after edge render');
         }
