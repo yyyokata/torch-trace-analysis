@@ -476,7 +476,6 @@ function setGroupFocusStateById(gid, state) {
 
 function syncLongEdgeDisplay(path, isActive) {
     if (!path || path.dataset.longEdge !== '1') {
-        syncArrowPolygonStyle(path);
         return;
     }
     if (isActive) {
@@ -502,7 +501,6 @@ function syncLongEdgeDisplay(path, isActive) {
             path.removeAttribute('stroke-dashoffset');
         }
     }
-    syncArrowPolygonStyle(path);
 }
 
 function getAncestorGroups(nodeId) {
@@ -1437,7 +1435,18 @@ async function render() {
         svg.onclick = () => clearEdgeFocus();
         svg.setAttribute('width', svgW);
         svg.setAttribute('height', svgH);
-        svg.innerHTML = `<g id="edge-overlay-layer"></g>`;
+        svg.innerHTML = `<defs>
+            <marker id="arrowhead" markerWidth="7" markerHeight="7" refX="7" refY="3.5" orient="auto">
+                <polygon points="0 0, 7 3.5, 0 7" fill="rgba(255,255,255,0.3)"/>
+            </marker>
+            <marker id="arrowhead-blue" markerWidth="7" markerHeight="7" refX="7" refY="3.5" orient="auto">
+                <polygon points="0 0, 7 3.5, 0 7" fill="rgba(100,181,246,0.5)"/>
+            </marker>
+            <marker id="arrowhead-dep" markerWidth="7" markerHeight="7" refX="7" refY="3.5" orient="auto">
+                <polygon points="0 0, 7 3.5, 0 7" fill="rgba(46,204,113,0.6)"/>
+            </marker>
+        </defs>
+        <g id="edge-overlay-layer"></g>`;
         edgeOverlayLayer = document.getElementById('edge-overlay-layer');
         if (!edgeOverlayLayer || edgeOverlayLayer.tagName !== 'g') {
             edgeOverlayLayer = document.createElementNS('http://www.w3.org/2000/svg', 'g');
@@ -1628,47 +1637,6 @@ async function render() {
             return path;
         }
 
-        function getEdgeArrowColor(type) {
-            if (type === 'dep') return 'rgba(46,204,113,0.6)';
-            if (type === 'internal') return 'rgba(100,181,246,0.5)';
-            return 'rgba(255,255,255,0.3)';
-        }
-
-        function makeArrowhead(path, color) {
-            if (!path) throw new Error('makeArrowhead requires a path element');
-            const len = path.getTotalLength();
-            const p2 = path.getPointAtLength(len);
-            const p1 = path.getPointAtLength(Math.max(0, len - 8));
-            const dx = p2.x - p1.x;
-            const dy = p2.y - p1.y;
-            const angle = Math.atan2(dy, dx);
-            const L = 8;
-            const W = 3;
-            const cos = Math.cos(angle);
-            const sin = Math.sin(angle);
-            const pts = [
-                [p2.x, p2.y],
-                [p2.x - L * cos + W * sin, p2.y - L * sin - W * cos],
-                [p2.x - L * cos - W * sin, p2.y - L * sin + W * cos],
-            ].map(([x, y]) => `${x.toFixed(2)},${y.toFixed(2)}`).join(' ');
-            const poly = document.createElementNS('http://www.w3.org/2000/svg', 'polygon');
-            poly.setAttribute('points', pts);
-            poly.setAttribute('fill', color);
-            poly.setAttribute('pointer-events', 'none');
-            return poly;
-        }
-
-        function syncArrowPolygonStyle(path) {
-            if (!path || !path._arrowPoly) return;
-            const poly = path._arrowPoly;
-            const computed = window.getComputedStyle(path);
-            poly.setAttribute('fill', computed.stroke || path.dataset.arrowColor || 'rgba(255,255,255,0.3)');
-            poly.setAttribute('opacity', computed.opacity || path.getAttribute('opacity') || '1');
-            const display = computed.display === 'none' ? 'none' : '';
-            poly.style.display = display;
-            poly.style.visibility = computed.visibility === 'hidden' ? 'hidden' : 'visible';
-        }
-
         function createEdgeHitboxElement(d, key) {
             const hitbox = document.createElementNS('http://www.w3.org/2000/svg', 'path');
             hitbox.setAttribute('d', d);
@@ -1683,10 +1651,8 @@ async function render() {
 
         function finalizeEdgeRendering(path, hitbox) {
             svg.appendChild(path);
-            if (path._arrowPoly) svg.appendChild(path._arrowPoly);
             if (hitbox) svg.appendChild(hitbox);
             configureLongEdgeDisplay(path);
-            syncArrowPolygonStyle(path);
         }
 
         function renderEdge(edgeSpec) {
@@ -1713,18 +1679,30 @@ async function render() {
             edgeDomRegistry.push(item);
             edgeDomByKey.set(item.key, item);
             for (const nid of [edgeData.from, edgeData.to]) { if (nid == null) continue; if (!edgeByNodeId.has(nid)) edgeByNodeId.set(nid, []); edgeByNodeId.get(nid).push(item); }
-            for (const nid of [edgeData.from, edgeData.to]) { if (nid == null) continue; for (const gid of (nodeAncestorGroups.get(nid) ?? [])) { if (!edgeByGroupId.has(gid)) edgeByGroupId.set(gid, []); edgeByGroupId.get(gid).push(item); } }
+            for (const nid of [edgeData.from, edgeData.to]) {
+                if (nid == null) continue;
+                const relatedGroupIds = new Set(nodeAncestorGroups.get(nid) ?? []);
+                if (groupMap[nid]) relatedGroupIds.add(nid);
+                for (const gid of relatedGroupIds) {
+                    if (!edgeByGroupId.has(gid)) edgeByGroupId.set(gid, []);
+                    edgeByGroupId.get(gid).push(item);
+                }
+            }
         }
 
         function applyEdgePresentation(path, type, opacity=null) {
             path.setAttribute('class', `edge-path ${type || ''}`);
             path.setAttribute('style', 'pointer-events: none');
-            path.dataset.arrowColor = getEdgeArrowColor(type);
-            path._arrowPoly = makeArrowhead(path, path.dataset.arrowColor);
+            if (type === 'dep') {
+                path.setAttribute('marker-end', 'url(#arrowhead-dep)');
+            } else if (type === 'internal') {
+                path.setAttribute('marker-end', 'url(#arrowhead-blue)');
+            } else {
+                path.setAttribute('marker-end', 'url(#arrowhead)');
+            }
             if (opacity !== null) {
                 path.setAttribute('opacity', opacity);
             }
-            syncArrowPolygonStyle(path);
         }
 
         function showOverlapBadge(e, idx, total) {
