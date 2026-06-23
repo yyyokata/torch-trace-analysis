@@ -240,6 +240,13 @@
                 }
                 if (eng.app.canvas && typeof eng.container.appendChild === 'function') {
                     eng.container.appendChild(eng.app.canvas);
+                    // PixiJS autoDensity writes canvas.style.width = physicalPx + 'px' as inline
+                    // style, which overrides CSS class rules (e.g. max-width: 100%).  Force
+                    // width: 100% here so the canvas never inflates the container.
+                    if (eng.app.canvas) {
+                        eng.app.canvas.style.width = '100%';
+                        eng.app.canvas.style.height = '';
+                    }
                 }
                 // `init()` may (re)create app.stage; (re-)attach the world graph.
                 if (eng.app.stage && typeof eng.app.stage.addChild === 'function') {
@@ -1113,6 +1120,10 @@
         if (engine.app && engine.app.renderer && typeof engine.app.renderer.resize === 'function') {
             engine.app.renderer.resize(Math.ceil(containerSize.w), Math.ceil(containerSize.h));
         }
+        if (engine.app && engine.app.canvas) {
+            engine.app.canvas.style.width = '100%';
+            engine.app.canvas.style.height = '';
+        }
         applyViewport();
     }
 
@@ -1143,6 +1154,10 @@
         const canvasHeight = Math.max(Math.ceil(ch), contentHeight);
         if (engine.app && engine.app.renderer && typeof engine.app.renderer.resize === 'function') {
             engine.app.renderer.resize(Math.ceil(cw), canvasHeight);
+        }
+        if (engine.app && engine.app.canvas) {
+            engine.app.canvas.style.width = '100%';
+            engine.app.canvas.style.height = '';
         }
         return vp;
     }
