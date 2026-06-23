@@ -147,13 +147,10 @@ def _apply_function_grouping_a(
     bucket_order: list[str] = []
     for node_id in list(dag.direct_nodes):
         node = registry[node_id]
-        frames = node.call_loc.frames
-        if len(frames) <= len(scope_frames_prefix):
+        helper_frame = _find_a_group_helper_frame(node.call_loc.frames)
+        if helper_frame is None:
             continue
-        frame_names = tuple(frame.function_name for frame in frames[: len(scope_frames_prefix)])
-        if frame_names != scope_frames_prefix:
-            continue
-        helper_name = frames[len(scope_frames_prefix)].function_name
+        helper_name = helper_frame.function_name
         if helper_name == "__call__":
             continue  # 非 nn.Module 的第三方 class 调用边界，不是用户 helper
         if helper_name not in buckets:
@@ -182,11 +179,24 @@ def _apply_function_grouping_a(
             group_node_id=new_node.node_id,
         )
         registry[new_node.node_id] = new_node
-        _apply_function_grouping_a(
-            new_node.inner_dag,
-            registry,
-            scope_frames_prefix=scope_frames_prefix + (helper_name,),
-        )
+
+
+def _find_a_group_helper_frame(frames: tuple) -> object | None:
+    last_forward_idx = None
+    for idx in range(len(frames) - 1, -1, -1):
+        if frames[idx].function_name == "forward":
+            last_forward_idx = idx
+            break
+    if last_forward_idx is None:
+        return None
+    if last_forward_idx > 0 and frames[last_forward_idx - 1].function_name == "__call__":
+        return None
+    helper_idx = last_forward_idx + 1
+    while helper_idx < len(frames) and frames[helper_idx].function_name.startswith("forward"):
+        helper_idx += 1
+    if helper_idx >= len(frames):
+        return None
+    return frames[helper_idx]
 
 
 def _build_function_group_node(
@@ -201,18 +211,22 @@ def _build_function_group_node(
         raise RuntimeError(
             f"A-group {helper_name} representative node {representative_node.node_id} has empty call_loc.frames"
         )
-    leaf_frame = frames[-1]
-    if not leaf_frame.file:
+    helper_frame = _find_a_group_helper_frame(frames)
+    if helper_frame is None:
+        raise RuntimeError(
+            f"A-group {helper_name} representative node {representative_node.node_id} has no helper frame after last forward"
+        )
+    if not helper_frame.file:
         raise RuntimeError(
             f"A-group {helper_name} representative node {representative_node.node_id} has empty frame file"
         )
-    if leaf_frame.line <= 0:
+    if helper_frame.line <= 0:
         raise RuntimeError(
-            f"A-group {helper_name} representative node {representative_node.node_id} has invalid frame line {leaf_frame.line}"
+            f"A-group {helper_name} representative node {representative_node.node_id} has invalid frame line {helper_frame.line}"
         )
-    if leaf_frame.function_name != helper_name:
+    if helper_frame.function_name != helper_name:
         raise RuntimeError(
-            f"A-group {helper_name} representative node {representative_node.node_id} leaf function {leaf_frame.function_name} mismatches helper name"
+            f"A-group {helper_name} representative node {representative_node.node_id} helper function {helper_frame.function_name} mismatches helper name"
         )
     member_id_set = set(member_ids)
     return ModuleNode(
@@ -221,7 +235,7 @@ def _build_function_group_node(
         attr=ModuleAttr(
             attr_name=helper_name,
             class_name=helper_name,
-            def_loc=CallLoc(file=leaf_frame.file, line=leaf_frame.line, col=0),
+            def_loc=CallLoc(file=helper_frame.file, line=helper_frame.line, col=0),
         ),
         metadata={"is_synthetic": True, "synthetic_type": "function_group"},
         inner_dag=DAG(
