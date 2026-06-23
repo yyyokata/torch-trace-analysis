@@ -70,11 +70,11 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 .dag-svg .group-info-hit { fill: rgba(100,181,246,0.001); stroke: rgba(100,181,246,0.45); stroke-width: 1; pointer-events: auto; cursor: pointer; }
 .dag-svg .group-info-hit:hover { fill: rgba(100,181,246,0.12); stroke: rgba(100,181,246,0.9); }
 .dag-svg .group-info-text { fill: rgba(100,181,246,0.82); font-size: 10px; font-weight: 700; pointer-events: none; text-anchor: middle; dominant-baseline: middle; }
-.dag-svg .leaf-node { rx: 6; ry: 6; stroke-width: 1.5; cursor: default; transition: filter 0.2s; }
-.dag-svg .leaf-node:hover { filter: brightness(1.2); }
+.dag-svg .leaf-node { rx: 6; ry: 6; stroke-width: 1.5; cursor: default; transition: stroke 0.2s, stroke-width 0.2s; }
+.dag-svg .leaf-node:hover { stroke: #ffffff; stroke-width: 2.5; }
 .dag-svg .node-label { font-size: 11px; fill: #ffffff; font-weight: 500; pointer-events: none; text-anchor: middle; }
 .dag-svg .node-sublabel { font-size: 9px; fill: rgba(255,255,255,0.7); pointer-events: none; text-anchor: middle; }
-.dag-svg .edge-path { fill: none; stroke: rgba(255,255,255,0.2); stroke-width: 1.7; marker-end: url(#arrowhead); opacity: 0.82; transition: stroke 0.18s ease, stroke-width 0.18s ease, opacity 0.18s ease, filter 0.18s ease; }
+.dag-svg .edge-path { fill: none; stroke: rgba(255,255,255,0.2); stroke-width: 1.7; opacity: 0.82; transition: stroke 0.18s ease, stroke-width 0.18s ease, opacity 0.18s ease; }
 .dag-svg .edge-path.internal { stroke: rgba(100,181,246,0.46); stroke-width: 1.35; }
 .dag-svg .edge-path.dep { stroke: rgba(46,204,113,0.62); stroke-width: 1.9; }
 .dag-svg .edge-path.flow { stroke: rgba(255,255,255,0.28); stroke-width: 1.35; stroke-dasharray: 4,3; }
@@ -113,8 +113,8 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 .dag-svg .group-clickable { cursor: pointer; }
 .dag-svg .edge-path { pointer-events: stroke; cursor: pointer; }
 .dag-svg .edge-path:hover { stroke-width: 3.4; opacity: 1 !important; }
-.dag-container.hover-active .edge-path:not(.edge-active) { opacity: 0.14 !important; filter: saturate(0.7) !important; }
-.dag-container.hover-active .edge-path.edge-active { opacity: 1 !important; filter: none !important; }
+.dag-container.hover-active .edge-path:not(.edge-active) { opacity: 0.14 !important; }
+.dag-container.hover-active .edge-path.edge-active { opacity: 1 !important; }
 .dag-container.hover-active .edge-path.dep.edge-active { stroke: #7CFFB2 !important; }
 .dag-container.hover-active .edge-path.flow.edge-active { stroke: #FFD166 !important; }
 .dag-container.hover-active .edge-path.internal.edge-active { stroke: #7FD1FF !important; }
@@ -426,7 +426,7 @@ function syncActiveEdgeOverlay(item) {
     const sourcePath = item.path;
     const overlayPath = document.createElementNS('http://www.w3.org/2000/svg', 'path');
     overlayPath.setAttribute('d', sourcePath.getAttribute('d') || '');
-    for (const attrName of ['class', 'marker-end', 'opacity', 'stroke-dasharray', 'stroke-dashoffset']) {
+    for (const attrName of ['class', 'opacity', 'stroke-dasharray', 'stroke-dashoffset']) {
         const attrValue = sourcePath.getAttribute(attrName);
         if (attrValue !== null && attrValue !== undefined) {
             overlayPath.setAttribute(attrName, attrValue);
@@ -475,7 +475,10 @@ function setGroupFocusStateById(gid, state) {
 }
 
 function syncLongEdgeDisplay(path, isActive) {
-    if (!path || path.dataset.longEdge !== '1') return;
+    if (!path || path.dataset.longEdge !== '1') {
+        syncArrowPolygonStyle(path);
+        return;
+    }
     if (isActive) {
         path.classList.add('edge-full');
         if (path.dataset.fullDasharray) {
@@ -499,6 +502,7 @@ function syncLongEdgeDisplay(path, isActive) {
             path.removeAttribute('stroke-dashoffset');
         }
     }
+    syncArrowPolygonStyle(path);
 }
 
 function getAncestorGroups(nodeId) {
@@ -1433,18 +1437,7 @@ async function render() {
         svg.onclick = () => clearEdgeFocus();
         svg.setAttribute('width', svgW);
         svg.setAttribute('height', svgH);
-        svg.innerHTML = `<defs>
-            <marker id="arrowhead" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
-                <polygon points="0 0, 8 3, 0 6" fill="rgba(255,255,255,0.3)"/>
-            </marker>
-            <marker id="arrowhead-blue" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
-                <polygon points="0 0, 8 3, 0 6" fill="rgba(100,181,246,0.5)"/>
-            </marker>
-            <marker id="arrowhead-dep" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
-                <polygon points="0 0, 8 3, 0 6" fill="rgba(46,204,113,0.6)"/>
-            </marker>
-        </defs>
-        <g id="edge-overlay-layer"></g>`;
+        svg.innerHTML = `<g id="edge-overlay-layer"></g>`;
         edgeOverlayLayer = document.getElementById('edge-overlay-layer');
         if (!edgeOverlayLayer || edgeOverlayLayer.tagName !== 'g') {
             edgeOverlayLayer = document.createElementNS('http://www.w3.org/2000/svg', 'g');
@@ -1635,6 +1628,47 @@ async function render() {
             return path;
         }
 
+        function getEdgeArrowColor(type) {
+            if (type === 'dep') return 'rgba(46,204,113,0.6)';
+            if (type === 'internal') return 'rgba(100,181,246,0.5)';
+            return 'rgba(255,255,255,0.3)';
+        }
+
+        function makeArrowhead(path, color) {
+            if (!path) throw new Error('makeArrowhead requires a path element');
+            const len = path.getTotalLength();
+            const p2 = path.getPointAtLength(len);
+            const p1 = path.getPointAtLength(Math.max(0, len - 8));
+            const dx = p2.x - p1.x;
+            const dy = p2.y - p1.y;
+            const angle = Math.atan2(dy, dx);
+            const L = 8;
+            const W = 3;
+            const cos = Math.cos(angle);
+            const sin = Math.sin(angle);
+            const pts = [
+                [p2.x, p2.y],
+                [p2.x - L * cos + W * sin, p2.y - L * sin - W * cos],
+                [p2.x - L * cos - W * sin, p2.y - L * sin + W * cos],
+            ].map(([x, y]) => `${x.toFixed(2)},${y.toFixed(2)}`).join(' ');
+            const poly = document.createElementNS('http://www.w3.org/2000/svg', 'polygon');
+            poly.setAttribute('points', pts);
+            poly.setAttribute('fill', color);
+            poly.setAttribute('pointer-events', 'none');
+            return poly;
+        }
+
+        function syncArrowPolygonStyle(path) {
+            if (!path || !path._arrowPoly) return;
+            const poly = path._arrowPoly;
+            const computed = window.getComputedStyle(path);
+            poly.setAttribute('fill', computed.stroke || path.dataset.arrowColor || 'rgba(255,255,255,0.3)');
+            poly.setAttribute('opacity', computed.opacity || path.getAttribute('opacity') || '1');
+            const display = computed.display === 'none' ? 'none' : '';
+            poly.style.display = display;
+            poly.style.visibility = computed.visibility === 'hidden' ? 'hidden' : 'visible';
+        }
+
         function createEdgeHitboxElement(d, key) {
             const hitbox = document.createElementNS('http://www.w3.org/2000/svg', 'path');
             hitbox.setAttribute('d', d);
@@ -1649,8 +1683,10 @@ async function render() {
 
         function finalizeEdgeRendering(path, hitbox) {
             svg.appendChild(path);
+            if (path._arrowPoly) svg.appendChild(path._arrowPoly);
             if (hitbox) svg.appendChild(hitbox);
             configureLongEdgeDisplay(path);
+            syncArrowPolygonStyle(path);
         }
 
         function renderEdge(edgeSpec) {
@@ -1683,16 +1719,12 @@ async function render() {
         function applyEdgePresentation(path, type, opacity=null) {
             path.setAttribute('class', `edge-path ${type || ''}`);
             path.setAttribute('style', 'pointer-events: none');
-            if (type === 'dep') {
-                path.setAttribute('marker-end', 'url(#arrowhead-dep)');
-            } else if (type === 'internal') {
-                path.setAttribute('marker-end', 'url(#arrowhead-blue)');
-            } else {
-                path.setAttribute('marker-end', 'url(#arrowhead)');
-            }
+            path.dataset.arrowColor = getEdgeArrowColor(type);
+            path._arrowPoly = makeArrowhead(path, path.dataset.arrowColor);
             if (opacity !== null) {
                 path.setAttribute('opacity', opacity);
             }
+            syncArrowPolygonStyle(path);
         }
 
         function showOverlapBadge(e, idx, total) {
