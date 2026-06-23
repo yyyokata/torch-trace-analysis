@@ -382,7 +382,15 @@
     }
 
     function resolveContainerSize(context) {
-        let cw = getContainerWidth(engine.container);
+        // Prefer the parent element (#dag-container) for width measurement.
+        // engine.container (#dag-stage) has a canvas child whose PixiJS autoDensity
+        // writes canvas.style.width = physicalPx, which inflates #dag-stage.clientWidth
+        // before CSS reflow corrects it.  The parent is never affected by the canvas
+        // inline style and always returns the stable CSS layout width.
+        const widthSource = (engine.container && engine.container.parentElement)
+            ? engine.container.parentElement
+            : engine.container;
+        let cw = getContainerWidth(widthSource);
         let ch = getContainerHeight(engine.container);
         if (cw !== null && cw > 0 && ch !== null && ch > 0) {
             engine.lastKnownContainerW = cw;
