@@ -1,45 +1,41 @@
 /* render_canvas.js
- * Canvas Phase 1 -- Canvas (Pixi) render skeleton + static draw passes.
+ * Canvas Phase 1 -- Pixi/static render pipeline.
  *
- * Stage 1.1 scope: stand up PIXI.Application + world (viewport) + layers L0..L5,
- * expose window.__phase1NoInteractionMode and a read-only window.__renderSnapshot().
- *
- * Stage 1.2 scope (this revision): static Node / Group / Port drawing.
- *   - NodeView.draw():       leaf-node rect + label/sublabel (was renderNodeAt)
- *   - GroupView.drawCollapsed(): collapsed group box + label/timing/info
- *   - GroupView.drawExpanded():  expanded group shell + header/info/timing + children
- *   - PortRenderer.drawPorts():  populate the shared nodePortMap (was register*Ports)
- *   These consume the *existing* layout output (groupLayout / childPositions) produced
- *   by frontend_html.py's layoutGroup(); coordinates are never recomputed here.
+ * Phase 1 scope:
+ *   - L0..L5 scene graph + read-only snapshot
+ *   - Node / Group / Port drawing
+ *   - Global edges (EdgeRoute + EdgeBatch)
+ *   - IO layer (L5), viewport pan/zoom/fit, label culling, render progress wiring
  *
  * Hard rules honoured here:
- *   - no fallback / silent path: a missing #dag-stage container raises
- *   - no interaction wiring in this phase (no hover / click / toggle)
- *   - the snapshot is read-only and has the same shape in browser and headless paths
- *
- * Layer model (index === paint order):
- *   L0 background | L1 edges (Stage 1.3) | L2 groups | L3 nodes
- *   L4 interaction overlay (Phase 3, empty) | L5 io/overlay (Stage 1.4)
- *
- * The layout / colour / timing helpers below (layoutGroup, groupMap, nodeMap,
- * groupLayout, LAYOUT, getNodeColor, formatDur, nodePortMap) live as
- * classic-script globals defined by frontend_html.py's inline template.  They
- * are referenced by bare name and resolved lazily at call time (this script
- * loads *before* the inline template, but canvasRenderPhase1() only runs *after*
- * it).
+ *   - no fallback / silent path: missing runtime globals are hard errors
+ *   - Phase 1 remains no node/edge hover/click interaction
+ *   - snapshot shape is identical in browser and headless probe paths
  */
 /* global layoutGroup, groupMap, nodeMap, groupLayout, LAYOUT,
    getNodeColor, formatDur, nodePortMap,
-   isEdgeVisible, resolveCollapsedAncestor, edgeKey, EDGE_BUNDLE_META */
+   isEdgeVisible, resolveCollapsedAncestor, edgeKey, EDGE_BUNDLE_META,
+   computeFlowchartLayout, computeIOGroupExpandedLayout, getIOLayoutConfig,
+   showRenderProgress, hideRenderProgress, setRenderProgress, getRenderProgressElements,
+   runChunked, nextFrame, assertActiveRenderGeneration, renderGeneration */
 (function (global) {
     'use strict';
 
     const LAYER_KEYS = ['l0', 'l1', 'l2', 'l3', 'l4', 'l5'];
+    const IO_GROUP_FILL = {
+        input: 'rgba(46,204,113,0.55)',
+        param: 'rgba(155,89,182,0.55)',
+        const: 'rgba(241,196,15,0.55)',
+        output: 'rgba(231,76,60,0.55)'
+    };
+    const IO_GROUP_MEMBER_LABEL = {
+        input: 'Input',
+        param: 'Param',
+        const: 'Const',
+        output: 'Result'
+    };
 
     // ── engine factory ─────────────────────────────────────────────────────
-    // Prefer the injected engine bundle (global.PIXI); otherwise use an internal
-    // headless mock so unit tests run with no DOM canvas / WebGL context.  Both
-    // paths build the identical layer tree -- this is NOT a render fallback.
     function resolvePixi() {
         if (global.PIXI && typeof global.PIXI.Application === 'function' && typeof global.PIXI.Container === 'function') {
             return global.PIXI;
@@ -74,7 +70,10 @@
         }
         Graphics.prototype = Object.create(Container.prototype);
         Graphics.prototype.constructor = Graphics;
-        Graphics.prototype.clear = function () { return this; };
+        ['clear', 'lineStyle', 'moveTo', 'lineTo', 'beginFill', 'drawPolygon', 'endFill', 'drawRoundedRect', 'drawCircle', 'drawRect']
+            .forEach(function (name) {
+                Graphics.prototype[name] = function () { return this; };
+            });
         function Text(text) {
             Container.call(this);
             this.text = (text === undefined || text === null) ? '' : String(text);
@@ -87,7 +86,12 @@
             this.stage = new Container();
             this.screen = { x: 0, y: 0, width: opts.width || 0, height: opts.height || 0 };
             this.canvas = null;
-            this.renderer = { resize: function () {} };
+            this.renderer = {
+                resize: function (w, h) {
+                    this.width = w;
+                    this.height = h;
+                }
+            };
         }
         Application.prototype.destroy = function () { this.stage = new Container(); };
         return {
@@ -129,7 +133,7 @@
             layers[key] = layer;
         });
 
-        return {
+        const built = {
             pixi: PIXI,
             app: app,
             world: world,
@@ -139,14 +143,28 @@
             nodes: [],
             groups: [],
             edges: [],
-            viewport: { scale: 1, x: 0, y: 0, worldWidth: 0, worldHeight: 0 }
+            io_pills: [],
+            labelsCreated: 0,
+            cullingEnabled: true,
+            worldBounds: null,
+            viewport: {
+                scale: 1,
+                x: 0,
+                y: 0,
+                worldWidth: 0,
+                worldHeight: 0,
+                minScale: 0.25,
+                maxScale: 4
+            }
         };
+        built.viewportController = new ViewportController(built);
+        built.cullManager = new CullManager();
+        return built;
     }
 
     function initCanvasEngine(explicitContainer) {
         const container = resolveContainer(explicitContainer);
         if (!container) {
-            // No silent fallback: a missing render container is a hard error.
             throw new Error('render_canvas.js: #dag-stage container not found; cannot initialize Canvas renderer');
         }
         engine = buildEngine(container);
@@ -161,10 +179,6 @@
     }
 
     // ── lazy accessors for inline-template globals ─────────────────────────
-    // These globals are classic-script lexical bindings (not window properties),
-    // so they are read by bare name behind a typeof guard.  When this file runs
-    // standalone (Stage 1.1 headless snapshot probe) they are simply absent and
-    // the static draw pass never executes.
     function lookupGroupMap() { return (typeof groupMap !== 'undefined') ? groupMap : null; }
     function lookupNodeMap() { return (typeof nodeMap !== 'undefined') ? nodeMap : null; }
     function lookupGroupLayout() { return (typeof groupLayout !== 'undefined') ? groupLayout : null; }
@@ -172,18 +186,49 @@
     function lookupNodePortMap() { return (typeof nodePortMap !== 'undefined') ? nodePortMap : null; }
     function nodeColorOf(n) { return (typeof getNodeColor === 'function') ? getNodeColor(n) : '#4a6fa5'; }
     function formatDurOf(us) { return (typeof formatDur === 'function') ? formatDur(us) : String(us); }
-
-    // Edge-orchestration globals (also classic-script lexical bindings from the
-    // inline template): the visibility filter, collapse redirect, bundle-offset
-    // map and edge-key helper.  Read by bare name at draw time, exactly like the
-    // layout globals above.  drawGlobalEdges() only runs from the production
-    // canvasRenderPhase1() path (after the inline template has loaded), so these
-    // are always defined when it executes; a missing one is a hard error there,
-    // never a silent skip.
     function lookupIsEdgeVisible() { return (typeof isEdgeVisible === 'function') ? isEdgeVisible : null; }
     function lookupResolveCollapsedAncestor() { return (typeof resolveCollapsedAncestor === 'function') ? resolveCollapsedAncestor : null; }
     function lookupEdgeKey() { return (typeof edgeKey === 'function') ? edgeKey : null; }
     function lookupEdgeBundleMeta() { return (typeof EDGE_BUNDLE_META !== 'undefined') ? EDGE_BUNDLE_META : null; }
+    function lookupComputeFlowchartLayout() { return (typeof computeFlowchartLayout === 'function') ? computeFlowchartLayout : null; }
+    function lookupComputeIOGroupExpandedLayout() { return (typeof computeIOGroupExpandedLayout === 'function') ? computeIOGroupExpandedLayout : null; }
+    function lookupIOLayoutConfig() { return (typeof getIOLayoutConfig === 'function') ? getIOLayoutConfig() : null; }
+    function lookupShowRenderProgress() { return (typeof showRenderProgress === 'function') ? showRenderProgress : null; }
+    function lookupHideRenderProgress() { return (typeof hideRenderProgress === 'function') ? hideRenderProgress : null; }
+    function lookupSetRenderProgress() { return (typeof setRenderProgress === 'function') ? setRenderProgress : null; }
+    function lookupGetRenderProgressElements() { return (typeof getRenderProgressElements === 'function') ? getRenderProgressElements : null; }
+    function lookupRunChunked() { return (typeof runChunked === 'function') ? runChunked : null; }
+    function lookupNextFrame() { return (typeof nextFrame === 'function') ? nextFrame : null; }
+    function lookupAssertActiveRenderGeneration() { return (typeof assertActiveRenderGeneration === 'function') ? assertActiveRenderGeneration : null; }
+
+    function requireInline(name, value) {
+        if (!value) {
+            throw new Error('render_canvas.js: required inline runtime is missing: ' + name);
+        }
+        return value;
+    }
+
+    function currentRenderGeneration() {
+        if (typeof renderGeneration === 'undefined') {
+            throw new Error('render_canvas.js: renderGeneration is unavailable');
+        }
+        return renderGeneration;
+    }
+
+    function bumpRenderGeneration() {
+        if (typeof renderGeneration === 'undefined') {
+            throw new Error('render_canvas.js: renderGeneration is unavailable');
+        }
+        renderGeneration += 1;
+        return renderGeneration;
+    }
+
+    function resetInlineLayoutCache() {
+        if (typeof groupLayout === 'undefined') {
+            throw new Error('render_canvas.js: groupLayout is unavailable');
+        }
+        groupLayout = {};
+    }
 
     // ── pixi glyph factories ───────────────────────────────────────────────
     function makeGraphics(name) {
@@ -191,16 +236,159 @@
         if (name) { g.name = name; }
         return g;
     }
+
     function makeText(value, name) {
         const t = new engine.pixi.Text(value);
         if (name) { t.name = name; }
         return t;
     }
 
+    function addLabel(layer, value, name) {
+        engine.labelsCreated += 1;
+        layer.addChild(makeText(value, name));
+    }
+
+    // ── viewport / culling ─────────────────────────────────────────────────
+    function numericOrNull(value) {
+        const n = Number(value);
+        return Number.isFinite(n) ? n : null;
+    }
+
+    function getContainerWidth(container) {
+        if (!container) { return null; }
+        return numericOrNull(container.clientWidth || container.offsetWidth || container.width);
+    }
+
+    function getContainerHeight(container) {
+        if (!container) { return null; }
+        return numericOrNull(container.clientHeight || container.offsetHeight || container.height);
+    }
+
+    function applyViewport() {
+        engine.world.scale.x = engine.viewport.scale;
+        engine.world.scale.y = engine.viewport.scale;
+        engine.world.x = engine.viewport.x;
+        engine.world.y = engine.viewport.y;
+    }
+
+    function normalizeWorldBounds(worldBounds) {
+        if (!worldBounds || typeof worldBounds !== 'object') {
+            throw new Error('render_canvas.js: fitToView requires worldBounds');
+        }
+        const x = numericOrNull(worldBounds.x);
+        const y = numericOrNull(worldBounds.y);
+        const w = numericOrNull(worldBounds.w !== undefined ? worldBounds.w : worldBounds.width);
+        const h = numericOrNull(worldBounds.h !== undefined ? worldBounds.h : worldBounds.height);
+        if (x === null || y === null || w === null || h === null) {
+            throw new Error('render_canvas.js: fitToView got invalid worldBounds');
+        }
+        return { x: x, y: y, w: w, h: h };
+    }
+
+    function ViewportController(owner) {
+        this.owner = owner;
+    }
+    ViewportController.prototype.enablePan = function () {
+        return this;
+    };
+    ViewportController.prototype.enableZoom = function (limits) {
+        const opts = limits || {};
+        const min = numericOrNull(opts.min);
+        const max = numericOrNull(opts.max);
+        if (min === null || max === null || min <= 0 || max <= 0 || min > max) {
+            throw new Error('render_canvas.js: enableZoom got invalid limits');
+        }
+        this.owner.viewport.minScale = min;
+        this.owner.viewport.maxScale = max;
+        if (this.owner.viewport.scale < min) {
+            this.owner.viewport.scale = min;
+        }
+        if (this.owner.viewport.scale > max) {
+            this.owner.viewport.scale = max;
+        }
+        applyViewport();
+        return this;
+    };
+    ViewportController.prototype.panBy = function (dx, dy) {
+        const panX = numericOrNull(dx);
+        const panY = numericOrNull(dy);
+        if (panX === null || panY === null) {
+            throw new Error('render_canvas.js: panBy got invalid delta');
+        }
+        this.owner.viewport.x += panX;
+        this.owner.viewport.y += panY;
+        applyViewport();
+        return this.owner.viewport;
+    };
+    ViewportController.prototype.zoomTo = function (nextScale) {
+        const value = numericOrNull(nextScale);
+        if (value === null || value <= 0) {
+            throw new Error('render_canvas.js: zoomTo got invalid scale');
+        }
+        const vp = this.owner.viewport;
+        vp.scale = Math.max(vp.minScale, Math.min(vp.maxScale, value));
+        applyViewport();
+        return vp;
+    };
+    ViewportController.prototype.zoomBy = function (factor) {
+        const value = numericOrNull(factor);
+        if (value === null || value <= 0) {
+            throw new Error('render_canvas.js: zoomBy got invalid factor');
+        }
+        return this.zoomTo(this.owner.viewport.scale * value);
+    };
+    ViewportController.prototype.fitToView = function (worldBounds, containerWidth) {
+        const bounds = normalizeWorldBounds(worldBounds);
+        const cw = numericOrNull(containerWidth);
+        if (cw === null || cw <= 0) {
+            throw new Error('render_canvas.js: fitToView requires a positive containerWidth');
+        }
+        const scale = bounds.w > cw ? Number((cw / bounds.w).toFixed(3)) : 1;
+        this.owner.viewport.scale = scale;
+        this.owner.viewport.x = -bounds.x * scale;
+        this.owner.viewport.y = -bounds.y * scale;
+        applyViewport();
+        return this.owner.viewport;
+    };
+    ViewportController.prototype.currentBounds = function () {
+        const vp = this.owner.viewport;
+        const width = getContainerWidth(this.owner.container) || vp.worldWidth || 0;
+        const height = getContainerHeight(this.owner.container) || vp.worldHeight || 0;
+        const scale = vp.scale || 1;
+        return {
+            x: -vp.x / scale,
+            y: -vp.y / scale,
+            w: width / scale,
+            h: height / scale
+        };
+    };
+
+    function CullManager() {}
+    CullManager.prototype.isVisible = function (rect, viewportBounds) {
+        if (!rect || !viewportBounds) {
+            throw new Error('render_canvas.js: CullManager.isVisible requires rect and viewportBounds');
+        }
+        return !(
+            rect.x + rect.w < viewportBounds.x ||
+            rect.x > viewportBounds.x + viewportBounds.w ||
+            rect.y + rect.h < viewportBounds.y ||
+            rect.y > viewportBounds.y + viewportBounds.h
+        );
+    };
+
+    function shouldCreateLabel(rect) {
+        if (!engine.cullingEnabled) {
+            return true;
+        }
+        return engine.cullManager.isVisible(rect, engine.viewportController.currentBounds());
+    }
+
     // ── PortRenderer ───────────────────────────────────────────────────────
     function registerNodePorts(nid, x, y, w, h) {
         const map = lookupNodePortMap();
-        if (!map) { return; }
+        if (!map) {
+            throw new Error('render_canvas.js: nodePortMap is unavailable while registering node ports');
+        }
         map[nid] = { cx: x + w / 2, cy: y + h / 2 };
         map[nid + '__in'] = { cx: x + w / 2, cy: y };
         map[nid + '__out'] = { cx: x + w / 2, cy: y + h };
@@ -208,7 +396,9 @@
 
     function registerCollapsedGroupPorts(g, gid, ox, oy, pos) {
         const map = lookupNodePortMap();
-        if (!map) { return; }
+        if (!map) {
+            throw new Error('render_canvas.js: nodePortMap is unavailable while registering collapsed group ports');
+        }
         const inPoint = { cx: ox + pos.w / 2, cy: oy };
         const outPoint = { cx: ox + pos.w / 2, cy: oy + pos.h };
         map[gid + '__in'] = inPoint;
@@ -220,7 +410,9 @@
 
     function registerExpandedGroupPorts(g, gid, ox, oy, pos) {
         const map = lookupNodePortMap();
-        if (!map) { return; }
+        if (!map) {
+            throw new Error('render_canvas.js: nodePortMap is unavailable while registering expanded group ports');
+        }
         const inPoint = { cx: ox + pos.w / 2, cy: oy };
         const outPoint = { cx: ox + pos.w / 2, cy: oy + pos.h };
         map[gid + '__in'] = inPoint;
@@ -236,13 +428,16 @@
         if (!n) { return; }
         const color = nodeColorOf(n);
         const label = n.class_name;
-        let sublabel = '';
-        if (n.has_timing) { sublabel = n.pct.toFixed(1) + '%'; }
+        const sublabel = n.has_timing ? (n.pct.toFixed(1) + '%') : '';
+        const rect = { x: x, y: y, w: w, h: h };
+        const visible = shouldCreateLabel(rect);
 
         engine.layers.l3.addChild(makeGraphics('node-box:' + nid));
-        engine.layers.l3.addChild(makeText(label, 'node-label:' + nid));
-        if (sublabel) {
-            engine.layers.l3.addChild(makeText(sublabel, 'node-sublabel:' + nid));
+        if (visible) {
+            addLabel(engine.layers.l3, label, 'node-label:' + nid);
+            if (sublabel) {
+                addLabel(engine.layers.l3, sublabel, 'node-sublabel:' + nid);
+            }
         }
 
         engine.nodes.push({
@@ -256,15 +451,21 @@
     function drawCollapsedGroup(g, gid, ox, oy, pos) {
         const hasTiming = !!g.has_timing;
         const hasInfo = !!g.src_file;
+        const rect = { x: ox, y: oy, w: pos.w, h: pos.h };
+        const visible = shouldCreateLabel(rect);
 
         engine.layers.l2.addChild(makeGraphics('group-box:' + gid));
-        engine.layers.l2.addChild(makeText('\u25B6 ' + g.class_name, 'group-label:' + gid));
-        if (hasTiming) {
-            engine.layers.l2.addChild(makeText('Kernel ' + g.pct.toFixed(1) + '% \u00B7 ' + formatDurOf(g.dur_us), 'group-timing:' + gid));
-        }
-        if (hasInfo) {
+        if (visible) {
+            addLabel(engine.layers.l2, '\u25B6 ' + g.class_name, 'group-label:' + gid);
+            if (hasTiming) {
+                addLabel(engine.layers.l2, 'Kernel ' + g.pct.toFixed(1) + '% \u00B7 ' + formatDurOf(g.dur_us), 'group-timing:' + gid);
+            }
+            if (hasInfo) {
+                engine.layers.l2.addChild(makeGraphics('group-info-hit:' + gid));
+                addLabel(engine.layers.l2, 'i', 'group-info:' + gid);
+            }
+        } else if (hasInfo) {
             engine.layers.l2.addChild(makeGraphics('group-info-hit:' + gid));
-            engine.layers.l2.addChild(makeText('i', 'group-info:' + gid));
         }
 
         engine.groups.push({
@@ -277,15 +478,21 @@
     function drawExpandedGroupShell(g, gid, ox, oy, pos) {
         const hasTiming = !!g.has_timing;
         const hasInfo = !!g.src_file;
+        const rect = { x: ox, y: oy, w: pos.w, h: pos.h };
+        const visible = shouldCreateLabel(rect);
 
         engine.layers.l2.addChild(makeGraphics('group-box:' + gid));
-        engine.layers.l2.addChild(makeText('\u25BC ' + g.class_name, 'group-header:' + gid));
-        if (hasInfo) {
+        if (visible) {
+            addLabel(engine.layers.l2, '\u25BC ' + g.class_name, 'group-header:' + gid);
+            if (hasInfo) {
+                engine.layers.l2.addChild(makeGraphics('group-info-hit:' + gid));
+                addLabel(engine.layers.l2, 'i', 'group-info:' + gid);
+            }
+            if (hasTiming) {
+                addLabel(engine.layers.l2, 'Kernel ' + g.pct.toFixed(1) + '% \u00B7 ' + formatDurOf(g.dur_us), 'group-timing:' + gid);
+            }
+        } else if (hasInfo) {
             engine.layers.l2.addChild(makeGraphics('group-info-hit:' + gid));
-            engine.layers.l2.addChild(makeText('i', 'group-info:' + gid));
-        }
-        if (hasTiming) {
-            engine.layers.l2.addChild(makeText('Kernel ' + g.pct.toFixed(1) + '% \u00B7 ' + formatDurOf(g.dur_us), 'group-timing:' + gid));
         }
 
         engine.groups.push({
@@ -294,7 +501,6 @@
         });
     }
 
-    // Recursively render a group at (ox, oy) using the precomputed layout.
     function walkGroup(gid, ox, oy) {
         const groups = lookupGroupMap();
         const layout = lookupGroupLayout();
@@ -326,24 +532,8 @@
     }
 
     // ── EdgeRoute (pure geometry) ──────────────────────────────────────────
-    // Faithful Canvas port of frontend_html.py's SVG `buildDirectEdgePath`
-    // (the only routing the production pipeline ever used).  The control-point
-    // formulas are copied verbatim; the Bezier is then sampled at a fixed step
-    // count so the result is a polyline `[{x,y}...]` whose endpoints are exactly
-    // (x1,y1)/(x2,y2).  Sampling the *same* curve means each sample equals the
-    // legacy Bezier at the same parameter t (point distance 0 -> well under the
-    // 0.5px equivalence bound), see UT P1-11.
     const EDGE_SAMPLE_STEPS = 24;
-
-    // Long-edge dash threshold.  Same source constant as the legacy
-    // `LONG_EDGE_MIN_SPAN` in frontend_html.py (260): the SVG path used
-    // getTotalLength() >= 260; the Canvas route uses the sampled polyline length,
-    // which is numerically equivalent for these short, smooth curves.
     const LONG_EDGE_MIN_SPAN = 260;
-
-    // Stroke styles ported 1:1 from the deleted `.edge-path*` CSS rules
-    // (frontend_html.py): rgba colour -> 0xRRGGBB + alpha, plus the matching
-    // SVG <marker> fill alpha for the arrow head.
     const EDGE_STYLE = {
         dep:      { color: 0x2ecc71, width: 1.9,  alpha: 0.62, arrowAlpha: 0.6 },
         internal: { color: 0x64b5f6, width: 1.35, alpha: 0.46, arrowAlpha: 0.5 },
@@ -398,10 +588,6 @@
     }
 
     const EdgeRoute = {
-        // Direct route: returns {points,branch,dashed} or null (degenerate).
-        // branch ∈ {'down','back','quad'} mirrors the legacy dy>8 / dy<-8 / else
-        // selection.  Returns null for the degenerate |dy|<3 && |dx|<3 case so no
-        // edge is produced (identical to legacy returning a null path string).
         direct: function (x1, y1, x2, y2, routeMeta) {
             const dy = y2 - y1;
             const dx = x2 - x1;
@@ -439,9 +625,6 @@
             const dashed = polylineLength(points) >= LONG_EDGE_MIN_SPAN;
             return { points: points, branch: branch, dashed: dashed };
         },
-        // Routing-mode dispatcher.  Unknown modes are a hard error (no silent
-        // return), matching the legacy renderEdge() `throw new Error('Unknown
-        // edge routing mode')`.
         compute: function (routingMode, x1, y1, x2, y2, routeMeta) {
             if (routingMode === 'direct') {
                 return EdgeRoute.direct(x1, y1, x2, y2, routeMeta);
@@ -450,20 +633,14 @@
         }
     };
 
-    // ── EdgeBatch (type-bucketed batched stroke + arrow head) ───────────────
-    // Painting primitives (lineStyle/moveTo/lineTo/drawPolygon) are invoked only
-    // when the resolved Graphics implementation provides them.  The Stage 1.1
-    // minimal bundle (and the headless mock) build the object graph but draw
-    // nothing -- the geometry contract lives in engine.edges / the snapshot, and
-    // the real WebGL Pixi bundle paints it.  This is the same dual-backend shape
-    // used by resolvePixi() and is NOT an error fallback.
+    // ── EdgeBatch ──────────────────────────────────────────────────────────
     function EdgeBatch() {
         this.buckets = { dep: [], internal: [], default: [] };
     }
     EdgeBatch.prototype.collect = function (edge, start, end, routeMeta, routingMode) {
         const mode = routingMode || 'direct';
         const route = EdgeRoute.compute(mode, start.cx, start.cy, end.cx, end.cy, routeMeta);
-        if (!route) { return; }  // degenerate route: produce no edge (legacy parity)
+        if (!route) { return; }
         const type = edge.type || 'dep';
         const colorKey = colorKeyForType(type);
         this.buckets[colorKey].push({ points: route.points, dashed: route.dashed });
@@ -493,7 +670,7 @@
 
     function strokePolyline(g, points, style) {
         if (typeof g.lineStyle !== 'function' || typeof g.moveTo !== 'function' || typeof g.lineTo !== 'function') {
-            return;  // object-graph-only backend; painting deferred to real Pixi
+            return;
         }
         g.lineStyle(style.width, style.color, style.alpha);
         g.moveTo(points[0].x, points[0].y);
@@ -502,9 +679,6 @@
         }
     }
 
-    // Triangular arrow head at the route end, oriented along the terminal
-    // tangent (the marker-end equivalent).  Size 7 matches the legacy
-    // <marker markerWidth="7" markerHeight="7">.
     function drawArrowHead(g, points, style) {
         const n = points.length;
         const tip = points[n - 1];
@@ -521,7 +695,7 @@
         const baseX = tip.x - ux * size;
         const baseY = tip.y - uy * size;
         if (typeof g.beginFill !== 'function' || typeof g.drawPolygon !== 'function') {
-            return;  // object-graph-only backend; painting deferred to real Pixi
+            return;
         }
         g.beginFill(style.color, style.arrowAlpha);
         g.drawPolygon([
@@ -532,10 +706,6 @@
         if (typeof g.endFill === 'function') { g.endFill(); }
     }
 
-    // Global edge orchestration.  Reuses the inline-template edge model 1:1:
-    // visibility filter -> collapse redirect -> self-skip -> port resolution
-    // (out/in slot with center fallback) -> missing-endpoint hard error -> bundle
-    // offset lookup -> EdgeBatch.collect, then a single flush per type bucket.
     function drawGlobalEdges(data) {
         const edges = (data && Array.isArray(data.edges)) ? data.edges : [];
         if (edges.length === 0) { return; }
@@ -545,7 +715,6 @@
         const keyOf = lookupEdgeKey();
         const bundleMeta = lookupEdgeBundleMeta();
         if (!portMap || !isVisible || !resolveAncestor || !keyOf || !bundleMeta) {
-            // Hard error: the production path must have these inline globals.
             throw new Error('render_canvas.js: inline edge globals unavailable while drawing edges');
         }
         const batch = new EdgeBatch();
@@ -553,7 +722,7 @@
             if (!isVisible(edge)) { continue; }
             const fromId = resolveAncestor(edge.from);
             const toId = resolveAncestor(edge.to);
-            if (fromId === toId) { continue; }  // self after redirect: skip
+            if (fromId === toId) { continue; }
             const fromPos = portMap[fromId + '__out'] || portMap[fromId];
             const toPos = portMap[toId + '__in'] || portMap[toId];
             if (!fromPos || !toPos) {
@@ -565,7 +734,146 @@
         batch.flush();
     }
 
-    // ── scene reset + draw orchestration ───────────────────────────────────
+    // ── IO layer (L5) ──────────────────────────────────────────────────────
+    function IOLayer() {
+        this.layer = engine.layers.l5;
+        this.config = requireInline('getIOLayoutConfig', lookupIOLayoutConfig());
+        this.computeExpandedLayout = requireInline('computeIOGroupExpandedLayout', lookupComputeIOGroupExpandedLayout());
+    }
+
+    IOLayer.prototype.drawPill = function (spec) {
+        if (!spec || spec.id === undefined || spec.id === null) {
+            throw new Error('render_canvas.js: IOLayer.drawPill got invalid spec');
+        }
+        this.layer.addChild(makeGraphics('io-pill:' + spec.id));
+        addLabel(this.layer, spec.label, 'io-label:' + spec.id);
+        if (spec.sublabel) {
+            addLabel(this.layer, spec.sublabel, 'io-sublabel:' + spec.id);
+        }
+        registerNodePorts(spec.id, spec.cx - spec.w / 2, spec.cy - spec.h / 2, spec.w, spec.h);
+        engine.io_pills.push({
+            id: spec.id,
+            subtype: spec.subtype,
+            cx: spec.cx,
+            cy: spec.cy,
+            w: spec.w,
+            h: spec.h,
+            expanded: spec.expanded === true
+        });
+    };
+
+    IOLayer.prototype.drawGroupPill = function (ioGroup, geom, availableW) {
+        if (!ioGroup || !geom) {
+            throw new Error('render_canvas.js: IOLayer.drawGroupPill got invalid arguments');
+        }
+        const fillColor = IO_GROUP_FILL[ioGroup.io_subtype] || 'rgba(127,140,141,0.55)';
+        const memberLabel = IO_GROUP_MEMBER_LABEL[ioGroup.io_subtype] || ioGroup.io_subtype;
+        const isCollapsed = !!ioGroup._collapsed;
+        const cfg = this.config;
+        if (!isCollapsed) {
+            const members = ioGroup.member_ids || [];
+            if (members.length === 0) {
+                return 0;
+            }
+            const expanded = this.computeExpandedLayout(members.length, availableW);
+            const startY = geom.cy - cfg.EXPANDED_IO_H / 2;
+            const frameX = geom.cx - availableW / 2 + cfg.EXPAND_FRAME_PAD - 8;
+            const frameY = startY - 8;
+            const frameW = availableW - 2 * (cfg.EXPAND_FRAME_PAD - 8);
+            const frameH = expanded.height + 8;
+            this.layer.addChild(makeGraphics('io-group-frame:' + ioGroup.id));
+            engine.io_pills.push({
+                id: ioGroup.id,
+                subtype: ioGroup.io_subtype,
+                cx: geom.cx,
+                cy: geom.cy,
+                w: availableW,
+                h: expanded.height,
+                expanded: true
+            });
+            for (let rowIdx = 0; rowIdx < expanded.memberRows; rowIdx++) {
+                const first = rowIdx * expanded.cols;
+                const rowMemberCount = Math.max(0, Math.min(expanded.cols, members.length - first));
+                const rowWidth = rowMemberCount * expanded.pillW + (rowMemberCount - 1) * cfg.pillGap;
+                let left = geom.cx - rowWidth / 2;
+                const rowCy = startY + rowIdx * (cfg.EXPANDED_IO_H + cfg.EXPANDED_IO_GAP) + cfg.EXPANDED_IO_H / 2;
+                for (let idx = 0; idx < rowMemberCount; idx++) {
+                    const memberId = members[first + idx];
+                    const node = lookupNodeMap() ? lookupNodeMap()[memberId] : null;
+                    const baseText = node ? node.class_name : memberLabel;
+                    const sublabel = (node && node.has_timing)
+                        ? (baseText + ' · ' + node.pct.toFixed(1) + '%')
+                        : baseText;
+                    this.drawPill({
+                        id: memberId,
+                        subtype: ioGroup.io_subtype,
+                        cx: left + expanded.pillW / 2,
+                        cy: rowCy,
+                        w: expanded.pillW,
+                        h: cfg.EXPANDED_IO_H,
+                        label: memberLabel,
+                        sublabel: truncateExpandedIOSublabel(sublabel, expanded.pillW),
+                        fillColor: fillColor,
+                        expanded: false
+                    });
+                    left += expanded.pillW + cfg.pillGap;
+                }
+            }
+            this.layer.addChild(makeGraphics('io-group-collapse:' + ioGroup.id));
+            addLabel(this.layer, '▲ 收起', 'io-group-collapse-label:' + ioGroup.id);
+            return frameY + frameH;
+        }
+        this.layer.addChild(makeGraphics('io-group-pill:' + ioGroup.id));
+        addLabel(this.layer, '▶ ' + ioGroup.label, 'io-group-label:' + ioGroup.id);
+        registerNodePorts(ioGroup.id, geom.cx - geom.w / 2, geom.cy - geom.h / 2, geom.w, geom.h);
+        engine.io_pills.push({
+            id: ioGroup.id,
+            subtype: ioGroup.io_subtype,
+            cx: geom.cx,
+            cy: geom.cy,
+            w: geom.w,
+            h: geom.h,
+            expanded: false
+        });
+        return geom.h;
+    };
+
+    function truncateExpandedIOSublabel(text, pillW) {
+        const limit = Math.max(1, Math.floor(pillW / 6.5));
+        const value = String(text || '');
+        return value.length > limit ? (value.slice(0, Math.max(0, limit - 1)) + '…') : value;
+    }
+
+    function drawIOTasks(tasks) {
+        const ioLayer = new IOLayer();
+        for (const task of (tasks || [])) {
+            if (task.type !== 'io') {
+                throw new Error('render_canvas.js: drawIOTasks got unsupported task type: ' + task.type);
+            }
+            if (task.taskKind === 'io_group') {
+                ioLayer.drawGroupPill(task.ioGroup, task, task.availableW);
+                continue;
+            }
+            if (task.taskKind === 'io_pill') {
+                ioLayer.drawPill({
+                    id: task.nid,
+                    subtype: task.subtype,
+                    cx: task.cx,
+                    cy: task.cy,
+                    w: task.w,
+                    h: task.h,
+                    label: task.label,
+                    sublabel: task.sublabel,
+                    fillColor: task.fillColor,
+                    expanded: false
+                });
+                continue;
+            }
+            throw new Error('render_canvas.js: drawIOTasks got unknown taskKind: ' + task.taskKind);
+        }
+    }
+
+    // ── scene reset + layout orchestration ─────────────────────────────────
     function resetScene() {
         LAYER_KEYS.forEach(function (key) {
             const layer = engine.layers[key];
@@ -576,44 +884,148 @@
         engine.nodes = [];
         engine.groups = [];
         engine.edges = [];
+        engine.io_pills = [];
+        engine.labelsCreated = 0;
         const map = lookupNodePortMap();
         if (map) {
             Object.keys(map).forEach(function (k) { delete map[k]; });
         }
     }
 
-    // Run the (unchanged) inline layout, then draw the single root group at its
-    // centred origin -- mirroring frontend_html.py's render() geometry for the
-    // no-IO case.  IO pills + culling + fit arrive in Stage 1.4.
-    function layoutAndDrawRoots(data) {
-        const layoutDefaults = lookupLayout();
-        const nodeW = layoutDefaults ? layoutDefaults.nodeW : 150;
-        const rootSizes = data.root_groups.map(function (rid) {
-            const sz = layoutGroup(rid);
-            return { id: rid, w: sz.w, h: sz.h };
-        });
-        const maxRootW = rootSizes.length
-            ? Math.max.apply(null, rootSizes.map(function (r) { return r.w; }))
-            : nodeW;
-        const svgW = Math.max(maxRootW + 80, 480);
-        const rootStartY = 30;
-        if (rootSizes.length > 0) {
-            const rs = rootSizes[0];
-            walkGroup(rs.id, (svgW - rs.w) / 2, rootStartY);
+    function applyWorldLayout(layoutInfo) {
+        if (!layoutInfo || !Number.isFinite(layoutInfo.svgW) || !Number.isFinite(layoutInfo.svgH)) {
+            throw new Error('render_canvas.js: computeFlowchartLayout returned invalid world bounds');
         }
-        engine.viewport.worldWidth = svgW;
+        engine.viewport.worldWidth = layoutInfo.svgW;
+        engine.viewport.worldHeight = layoutInfo.svgH;
+        engine.worldBounds = { x: 0, y: 0, w: layoutInfo.svgW, h: layoutInfo.svgH };
+        if (engine.app && engine.app.renderer && typeof engine.app.renderer.resize === 'function') {
+            engine.app.renderer.resize(Math.ceil(layoutInfo.svgW), Math.ceil(layoutInfo.svgH));
+        }
+        applyViewport();
     }
 
-    // Production render entry.  The in-template render() delegates here whenever
-    // window.__phase1NoInteractionMode === true.
-    function canvasRenderPhase1(data) {
-        ensureEngine();
-        resetScene();
-        if (data && Array.isArray(data.root_groups) && data.root_groups.length > 0) {
-            layoutAndDrawRoots(data);
-            drawGlobalEdges(data);
+    function layoutAndDrawRoots(layoutInfo) {
+        applyWorldLayout(layoutInfo);
+        for (const root of (layoutInfo.rootPositions || [])) {
+            walkGroup(root.id, root.x, root.y);
         }
-        return Promise.resolve(buildSnapshot());
+        drawIOTasks(layoutInfo.ioTasks || []);
+    }
+
+    function updateLegendAndSummary(data) {
+        if (!global.document || typeof global.document.getElementById !== 'function') {
+            throw new Error('render_canvas.js: document.getElementById is unavailable while updating DOM panels');
+        }
+        const meta = data.meta || {};
+        const modeBadge = global.document.getElementById('mode-badge');
+        const metaInfo = global.document.getElementById('meta-info');
+        const legendDiv = global.document.getElementById('legend');
+        const summaryDiv = global.document.getElementById('summary');
+        if (!modeBadge || !metaInfo || !legendDiv || !summaryDiv) {
+            throw new Error('render_canvas.js: legend/summary DOM is incomplete');
+        }
+
+        if (data.has_timing) {
+            modeBadge.innerHTML = '<span class="mode-badge mode-timing">📊 Structure + Timing</span>';
+            metaInfo.textContent = 'Device: ' + meta.device + ' | Step: ' + meta.step_dur_str + ' | Modules: ' + meta.num_modules;
+        } else {
+            modeBadge.innerHTML = '<span class="mode-badge mode-structure">🏗️ Static Structure (source code)</span>';
+            metaInfo.textContent = 'Modules: ' + meta.num_modules + ' | Root: ' + (meta.roots ? meta.roots.join(', ') : 'N/A');
+        }
+
+        if (data.has_timing) {
+            legendDiv.innerHTML = '\n                <div class="legend-item"><div class="legend-dot" style="background:#2980b9"></div>&gt;20%</div>\n                <div class="legend-item"><div class="legend-dot" style="background:#27ae60"></div>10-20%</div>\n                <div class="legend-item"><div class="legend-dot" style="background:#8e44ad"></div>5-10%</div>\n                <div class="legend-item"><div class="legend-dot" style="background:#5a6c7d"></div>&lt;5%</div>\n                <div class="legend-item"><div class="legend-dot" style="background:#e74c3c"></div>Worker &gt;20%</div>\n                <div class="legend-item"><div class="legend-dot" style="background:#e67e22"></div>Worker 10-20%</div>';
+        } else {
+            legendDiv.innerHTML = '\n                <div class="legend-item"><div class="legend-dot" style="background:#4a6fa5"></div>Depth 0</div>\n                <div class="legend-item"><div class="legend-dot" style="background:#5b8c5a"></div>Depth 1</div>\n                <div class="legend-item"><div class="legend-dot" style="background:#8e6fad"></div>Depth 2</div>\n                <div class="legend-item"><div class="legend-dot" style="background:#c77a3c"></div>Depth 3+</div>\n                <div class="legend-item" style="margin-left: 12px;"><span style="color:#64b5f6">▶</span> Click to expand</div>\n                <div class="legend-item" style="margin-left: 12px;"><span style="color:rgba(46,204,113,0.8)">━━▶</span> Data dependency</div>\n                <div class="legend-item"><span style="color:rgba(255,255,255,0.3)">╌╌▶</span> Sequential (fallback)</div>';
+        }
+
+        const allNodes = data.nodes || [];
+        const allGroups = data.groups || [];
+        if (data.has_timing) {
+            const topN = allNodes.concat(allGroups).filter(function (x) { return x.has_timing; }).sort(function (a, b) { return b.pct - a.pct; }).slice(0, 5);
+            summaryDiv.innerHTML = '<h3>📊 Top Modules by Time</h3><p>' + topN.map(function (x) {
+                return '<b>' + (x.label || x.class_name) + '</b> ' + x.pct.toFixed(1) + '%';
+            }).join(' → ') + '</p>';
+        } else {
+            summaryDiv.innerHTML = '<h3>🏗️ Architecture Summary</h3><p>Module count: ' + (allNodes.length + allGroups.length) + ' | Expandable containers: ' + allGroups.length + ' | Leaf nodes: ' + allNodes.length + '<br><i>Click ▶ collapsed containers to expand. Provide --trace-file for timing overlay.</i></p>';
+        }
+    }
+
+    function progressApi() {
+        return {
+            showRenderProgress: requireInline('showRenderProgress', lookupShowRenderProgress()),
+            hideRenderProgress: requireInline('hideRenderProgress', lookupHideRenderProgress()),
+            setRenderProgress: requireInline('setRenderProgress', lookupSetRenderProgress()),
+            getRenderProgressElements: requireInline('getRenderProgressElements', lookupGetRenderProgressElements()),
+            runChunked: requireInline('runChunked', lookupRunChunked()),
+            nextFrame: requireInline('nextFrame', lookupNextFrame()),
+            assertActiveRenderGeneration: requireInline('assertActiveRenderGeneration', lookupAssertActiveRenderGeneration())
+        };
+    }
+
+    async function canvasRenderPhase1(data) {
+        ensureEngine();
+        const p = progressApi();
+        const computeLayout = requireInline('computeFlowchartLayout', lookupComputeFlowchartLayout());
+        const generation = bumpRenderGeneration();
+        p.showRenderProgress('正在计算 DAG 布局…');
+        const progressEls = p.getRenderProgressElements();
+        progressEls.overlay.dataset.renderGeneration = String(generation);
+        await p.nextFrame();
+        try {
+            resetInlineLayoutCache();
+            resetScene();
+            let layoutInfo = null;
+            await p.runChunked([{ type: 'group', taskKind: 'layout' }], async function () {
+                resetInlineLayoutCache();
+                layoutInfo = computeLayout(data);
+            }, {
+                batchSize: 1,
+                phaseStart: 0,
+                phaseEnd: 30,
+                stageText: '正在计算 DAG 布局…',
+                generation: generation,
+                allowedTypes: ['group']
+            });
+            await p.runChunked([{ type: 'group', taskKind: 'draw-scene' }], async function () {
+                layoutAndDrawRoots(layoutInfo);
+            }, {
+                batchSize: 1,
+                phaseStart: 30,
+                phaseEnd: 60,
+                stageText: '正在渲染模块节点…',
+                generation: generation,
+                allowedTypes: ['group']
+            });
+            await p.runChunked([{ type: 'edge', taskKind: 'draw-edges' }], async function () {
+                drawGlobalEdges(data);
+            }, {
+                batchSize: 1,
+                phaseStart: 60,
+                phaseEnd: 90,
+                stageText: '正在渲染依赖边…',
+                generation: generation,
+                allowedTypes: ['edge']
+            });
+            p.assertActiveRenderGeneration(generation, '收尾阶段');
+            p.setRenderProgress(98, '正在更新图例和摘要…');
+            await p.nextFrame();
+            updateLegendAndSummary(data);
+            p.assertActiveRenderGeneration(generation, '完成阶段');
+            await p.hideRenderProgress();
+            return buildSnapshot();
+        } catch (err) {
+            if (currentRenderGeneration() === generation) {
+                const els = p.getRenderProgressElements();
+                els.overlay.classList.remove('closing');
+                els.overlay.classList.add('visible', 'failed');
+                els.overlay.setAttribute('aria-hidden', 'false');
+                const lastProgress = Number(els.overlay.dataset.progress || 0);
+                p.setRenderProgress(Number.isFinite(lastProgress) ? Math.min(99, lastProgress) : 0, '渲染失败，请查看 Console 错误');
+            }
+            throw err;
+        }
     }
 
     function layerChildCounts() {
@@ -635,8 +1047,6 @@
         return out;
     }
 
-    // Read-only snapshot.  MUST NOT mutate runtime state.  Same shape in browser
-    // and headless paths; any missing field is a bug, never an optional.
     function buildSnapshot() {
         if (!engine) {
             throw new Error('render_canvas.js: __renderSnapshot called before the Canvas engine was initialized');
@@ -658,7 +1068,17 @@
                 };
             }),
             ports: clonePorts(lookupNodePortMap()),
-            io_pills: [],
+            io_pills: (engine.io_pills || []).map(function (p) {
+                return {
+                    id: p.id,
+                    subtype: p.subtype,
+                    cx: p.cx,
+                    cy: p.cy,
+                    w: p.w,
+                    h: p.h,
+                    expanded: p.expanded === true
+                };
+            }),
             viewport: {
                 scale: vp.scale,
                 x: vp.x,
@@ -667,23 +1087,19 @@
                 worldHeight: vp.worldHeight
             },
             layers: layerChildCounts(),
+            labelsCreated: engine.labelsCreated,
             flags: {
                 noInteractionMode: global.__phase1NoInteractionMode === true,
-                cullingEnabled: false
+                cullingEnabled: engine.cullingEnabled === true
             }
         };
     }
 
-    // Phase 1 runs with interaction disabled.
     global.__phase1NoInteractionMode = true;
     global.__canvasRenderPhase1 = canvasRenderPhase1;
     global.__initCanvasEngine = initCanvasEngine;
     global.__canvasEnginePhase1 = function () { return engine; };
-    // Pure geometry, exposed for UT (P1-11 / P1-11b / P1-E3): EdgeRoute.direct
-    // returns the sampled polyline and EdgeRoute.compute validates routing mode.
     global.__EdgeRoute = EdgeRoute;
-    // Edge stroke/arrow style table, exposed for UT (P1-13): asserts the colour
-    // constants equal the (deleted) CSS `.edge-path*` values.
     global.__EDGE_STYLE = EDGE_STYLE;
     global.__renderSnapshot = function () {
         ensureEngine();
