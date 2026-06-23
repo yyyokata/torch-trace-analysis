@@ -36,6 +36,12 @@ from pathlib import Path
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _RENDER_GROUP_JS_PATH = Path(_SCRIPT_DIR) / "render_group.js"
 _RENDER_GROUP_JS_PLACEHOLDER = "__RENDER_GROUP_JS_PLACEHOLDER__"
+# Canvas Phase 1 / Stage 1.1: the runtime render path switches from the legacy
+# SVG `render_group.js` injection to a Pixi engine bundle + `render_canvas.js`.
+_ENGINE_BUNDLE_PATH = Path(_SCRIPT_DIR) / "pixi_engine_bundle.js"
+_ENGINE_BUNDLE_PLACEHOLDER = "__ENGINE_BUNDLE_PLACEHOLDER__"
+_RENDER_CANVAS_JS_PATH = Path(_SCRIPT_DIR) / "render_canvas.js"
+_RENDER_CANVAS_JS_PLACEHOLDER = "__RENDER_CANVAS_JS_PLACEHOLDER__"
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
@@ -60,6 +66,8 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 .controls button:hover { background: rgba(255,255,255,0.15); color: #fff; }
 .controls button.active { background: rgba(100,181,246,0.2); border-color: #64b5f6; color: #64b5f6; }
 .dag-container { width: 100%; overflow: auto; position: relative; contain: layout style; }
+.dag-stage { display: block; margin: 0 auto; width: 100%; min-height: 200px; }
+.dag-stage canvas { display: block; margin: 0 auto; }
 .dag-svg { display: block; margin: 0 auto; will-change: transform; }
 .dag-svg .group-box { fill: rgba(255,255,255,0.03); stroke: rgba(255,255,255,0.12); stroke-width: 1.5; rx: 10; cursor: pointer; transition: fill 0.2s; }
 .dag-svg .group-box:hover { fill: rgba(255,255,255,0.06); stroke: rgba(100,181,246,0.4); }
@@ -232,7 +240,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 </div>
 <div class="legend" id="legend"></div>
 <div class="dag-container" id="dag-container">
-    <svg class="dag-svg" id="dag-svg"></svg>
+    <div id="dag-stage" class="dag-stage"></div>
 </div>
 <div class="tooltip" id="tooltip"></div>
 <div class="side-panel" id="side-panel">
@@ -256,6 +264,13 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
         <div class="iter14-render-progress-percent" id="render-progress-percent">0%</div>
     </div>
 </div>
+
+<script id="engine-bundle">
+__ENGINE_BUNDLE_PLACEHOLDER__
+</script>
+<script id="render-canvas-js">
+__RENDER_CANVAS_JS_PLACEHOLDER__
+</script>
 
 <script>
 const DATA = __FLOWCHART_DATA_PLACEHOLDER__;
@@ -1271,6 +1286,16 @@ function invokeRender() {
 }
 
 async function render() {
+    // Canvas Phase 1 / Stage 1.1: the production runtime renders through the
+    // Canvas (Pixi) skeleton, never the legacy SVG path below.  render_canvas.js
+    // sets window.__phase1NoInteractionMode and provides the canvas entry; if the
+    // flag is on but the entry is missing that is a hard error (no fallback).
+    if (typeof window !== 'undefined' && window.__phase1NoInteractionMode === true) {
+        if (typeof window.__canvasRenderPhase1 !== 'function') {
+            throw new Error('Canvas render entry __canvasRenderPhase1 is missing while phase1 no-interaction mode is enabled');
+        }
+        return window.__canvasRenderPhase1(DATA);
+    }
     const generation = ++renderGeneration;
     showRenderProgress('正在准备渲染状态…');
     const { overlay } = getRenderProgressElements();
@@ -3065,16 +3090,25 @@ def _generate_flowchart_html(data):
     # ensure_ascii=True is safer for character handling
     data_json = _json.dumps(data, ensure_ascii=True)
     html_template = FLOWCHART_HTML_TEMPLATE
-    render_group_js = _RENDER_GROUP_JS_PATH.read_text(encoding="utf-8")
-    if _RENDER_GROUP_JS_PLACEHOLDER not in html_template:
-        raise RuntimeError("render_group.js placeholder is missing from FLOWCHART_HTML_TEMPLATE")
-    html_template = html_template.replace(_RENDER_GROUP_JS_PLACEHOLDER, render_group_js, 1)
-    # NOTE: The legacy "Total X% · Y" → totalUs reflow patch that previously
-    # lived here is gone.  After the kernel-field migration the in-template
-    # SVG label already reads `Kernel ${g.pct.toFixed(1)}% · ${formatDur(g.dur_us)}`
-    # directly (g.dur_us mirrors kernel_us), so no post-hoc replace is
-    # needed.
 
+    # Canvas Phase 1 / Stage 1.1: inject the Pixi engine bundle and
+    # render_canvas.js.  These two placeholders are the only runtime render
+    # injection path now; a missing placeholder is a hard error (no fallback).
+    engine_bundle_js = _ENGINE_BUNDLE_PATH.read_text(encoding="utf-8")
+    if _ENGINE_BUNDLE_PLACEHOLDER not in html_template:
+        raise RuntimeError("engine bundle placeholder is missing from FLOWCHART_HTML_TEMPLATE")
+    html_template = html_template.replace(_ENGINE_BUNDLE_PLACEHOLDER, engine_bundle_js, 1)
+
+    render_canvas_js = _RENDER_CANVAS_JS_PATH.read_text(encoding="utf-8")
+    if _RENDER_CANVAS_JS_PLACEHOLDER not in html_template:
+        raise RuntimeError("render_canvas.js placeholder is missing from FLOWCHART_HTML_TEMPLATE")
+    html_template = html_template.replace(_RENDER_CANVAS_JS_PLACEHOLDER, render_canvas_js, 1)
+
+    # The legacy render_group.js slot is intentionally NOT fed any runtime code.
+    # Stage 1.1 stops injecting the SVG group renderer entirely; if the template
+    # still carries the placeholder it can only collapse to an empty string.
+    if _RENDER_GROUP_JS_PLACEHOLDER in html_template:
+        html_template = html_template.replace(_RENDER_GROUP_JS_PLACEHOLDER, "", 1)
 
     # Replace the embedded DATA payload using the stable script markers rather
     # than a naive non-greedy `{...};` regex: the serialized JSON contains many
@@ -3085,7 +3119,7 @@ def _generate_flowchart_html(data):
         'const DATA = ' + data_json + ';',
         1
     )
-    
+
     return html_template
 
 
