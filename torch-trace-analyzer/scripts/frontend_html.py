@@ -275,6 +275,8 @@ let hoveredNodeId = null;
 let nodeDomRegistry = new Map();
 const groupDomRegistry = new Map();
 let renderGeneration = 0;
+let edgeOverlayLayer = null;
+let activeEdgeOverlayPath = null;
 const nodeAncestorGroups = new Map();
 const LONG_EDGE_MIN_SPAN = 260;
 
@@ -394,6 +396,48 @@ function setEdgeItemFocusState(item, state) {
     p.style.removeProperty('filter');
     p.style.removeProperty('stroke');
     syncLongEdgeDisplay(p, false);
+}
+
+function clearActiveEdgeOverlay() {
+    if (activeEdgeOverlayPath && activeEdgeOverlayPath.parentNode) {
+        const parent = activeEdgeOverlayPath.parentNode;
+        if (typeof parent.removeChild === 'function') {
+            parent.removeChild(activeEdgeOverlayPath);
+        } else if (Array.isArray(parent.children)) {
+            parent.children = parent.children.filter(child => child !== activeEdgeOverlayPath);
+        }
+        activeEdgeOverlayPath.parentNode = null;
+    }
+    activeEdgeOverlayPath = null;
+}
+
+function syncActiveEdgeOverlay(item) {
+    if (!item || !item.path) {
+        clearActiveEdgeOverlay();
+        return;
+    }
+    if (!edgeOverlayLayer) {
+        throw new Error('edge overlay layer is not initialized');
+    }
+    const sourcePath = item.path;
+    const overlayPath = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    overlayPath.setAttribute('d', sourcePath.getAttribute('d') || '');
+    for (const attrName of ['class', 'marker-end', 'opacity', 'stroke-dasharray', 'stroke-dashoffset']) {
+        const attrValue = sourcePath.getAttribute(attrName);
+        if (attrValue !== null && attrValue !== undefined) {
+            overlayPath.setAttribute(attrName, attrValue);
+        }
+    }
+    for (const dataName of ['longEdge', 'fullDasharray', 'fullDashoffset', 'truncatedDasharray', 'truncatedDashoffset']) {
+        if (sourcePath.dataset && sourcePath.dataset[dataName] !== undefined) {
+            overlayPath.dataset[dataName] = sourcePath.dataset[dataName];
+        }
+    }
+    overlayPath.style.pointerEvents = 'none';
+    setEdgeItemFocusState({ path: overlayPath }, 'active');
+    clearActiveEdgeOverlay();
+    edgeOverlayLayer.appendChild(overlayPath);
+    activeEdgeOverlayPath = overlayPath;
 }
 
 function _applyNodeFocusStyle(el, state) {
@@ -546,6 +590,7 @@ function clearEdgeHoverFocusState() {
     }
     prevActiveItems = [];
     prevActiveNodeIds = new Set();
+    clearActiveEdgeOverlay();
 }
 
 function applyGroupFocusState(hoveredGid) {
@@ -658,6 +703,7 @@ function applyGroupFocusState(hoveredGid) {
 function applyEdgeFocusState() {
     if (hoveredGroupId != null) {
         applyGroupFocusState(hoveredGroupId);
+        clearActiveEdgeOverlay();
         return;
     }
     if (lastHoveredGid != null) {
@@ -701,6 +747,7 @@ function applyEdgeFocusState() {
 
     prevActiveItems = newItems;
     prevActiveNodeIds = newNodeIds;
+    syncActiveEdgeOverlay(newItems[0] || null);
 }
 
 function clearEdgeFocus() {
@@ -1251,6 +1298,8 @@ async function render() {
         hoveredEdgeIdx = 0;
         hoveredGroupId = null;
         hoveredNodeId = null;
+        edgeOverlayLayer = null;
+        clearActiveEdgeOverlay();
         hideOverlapBadge();
         assertActiveRenderGeneration(generation, '准备阶段');
         setRenderProgress(5, '正在准备渲染状态…');
@@ -1394,7 +1443,15 @@ async function render() {
             <marker id="arrowhead-dep" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
                 <polygon points="0 0, 8 3, 0 6" fill="rgba(46,204,113,0.6)"/>
             </marker>
-        </defs>`;
+        </defs>
+        <g id="edge-overlay-layer"></g>`;
+        edgeOverlayLayer = document.getElementById('edge-overlay-layer');
+        if (!edgeOverlayLayer || edgeOverlayLayer.tagName !== 'g') {
+            edgeOverlayLayer = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+            edgeOverlayLayer.setAttribute('id', 'edge-overlay-layer');
+            svg.appendChild(edgeOverlayLayer);
+        }
+        clearActiveEdgeOverlay();
         assertActiveRenderGeneration(generation, 'SVG 初始化阶段');
         setRenderProgress(30, '正在初始化画布…');
         await nextFrame();
@@ -1689,23 +1746,9 @@ async function render() {
                 hoveredEdgeIdx = hoveredEdges.findIndex(item => item.key === key);
                 if (hoveredEdgeIdx < 0) hoveredEdgeIdx = 0;
                 hoveredEdgeKey = hoveredEdges.length > 0 ? hoveredEdges[hoveredEdgeIdx].key : key;
-                if (hoveredEdges.length > 0) {
-                    const firstPath = hoveredEdges[hoveredEdgeIdx].path;
-                    firstPath.parentNode && firstPath.parentNode.appendChild(firstPath);
-                }
                 applyEdgeFocusState();
                 if (hoveredEdges.length > 1) showOverlapBadge(e, hoveredEdgeIdx, hoveredEdges.length);
                 const handleMouseMove = (ev) => {
-                    const nextHoveredEdges = getHoveredEdgesFromEvent(ev);
-                    if (nextHoveredEdges.length > 0) {
-                        hoveredEdges = nextHoveredEdges;
-                        const matchedIdx = hoveredEdges.findIndex(item => item.key === hoveredEdgeKey);
-                        if (matchedIdx >= 0) {
-                            hoveredEdgeIdx = matchedIdx;
-                        } else if (hoveredEdgeIdx >= hoveredEdges.length) {
-                            hoveredEdgeIdx = hoveredEdges.length - 1;
-                        }
-                    }
                     const badge = document.getElementById('overlap-badge');
                     if (badge && badge.style.display !== 'none') {
                         badge.style.left = (ev.clientX + 14) + 'px';
@@ -1737,8 +1780,6 @@ async function render() {
                 e.preventDefault();
                 hoveredEdgeIdx = (hoveredEdgeIdx + (e.deltaY > 0 ? 1 : -1) + hoveredEdges.length) % hoveredEdges.length;
                 hoveredEdgeKey = hoveredEdges[hoveredEdgeIdx].key;
-                const activePath = hoveredEdges[hoveredEdgeIdx].path;
-                activePath.parentNode && activePath.parentNode.appendChild(activePath);
                 applyEdgeFocusState();
                 updateOverlapBadge();
                 showEdgePanel(hoveredEdges[hoveredEdgeIdx].edge);
@@ -2141,6 +2182,10 @@ async function render() {
             generation,
             allowedTypes: ['edge'],
         });
+        if (!edgeOverlayLayer) {
+            throw new Error('edge overlay layer missing after edge render');
+        }
+        svg.appendChild(edgeOverlayLayer);
 
         setRenderProgress(90, '正在更新图例和摘要…');
         await nextFrame();
