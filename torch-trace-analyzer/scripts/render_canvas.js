@@ -1246,7 +1246,7 @@
             let layoutInfo = null;
             await p.runChunked([{ type: 'group', taskKind: 'layout' }], async function () {
                 resetInlineLayoutCache();
-                layoutInfo = computeLayout(data);
+                layoutInfo = computeLayout(data, resolveContainerSize('layout').w);
             }, {
                 batchSize: 1,
                 phaseStart: 0,
