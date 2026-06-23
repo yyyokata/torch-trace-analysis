@@ -585,7 +585,9 @@
         const n = nodes ? nodes[nid] : null;
         if (!n) { return; }
         const color = nodeColorOf(n);
-        const label = n.class_name;
+        // Truncate the title to the node box width (12px monospace ≈ 7.2px/char,
+        // 8px total side padding) so long class names no longer overflow the box.
+        const label = truncateLabel(n.class_name, maxCharsForWidth(w, 7.2, 8));
         const sublabel = n.has_timing ? (n.pct.toFixed(1) + '%') : '';
         const rect = { x: x, y: y, w: w, h: h };
         const visible = shouldCreateLabel(rect);
@@ -629,7 +631,11 @@
         });
         engine.layers.l2.addChild(box);
         if (visible) {
-            addLabel(engine.layers.l2, '\u25B6 ' + g.class_name, 'group-label:' + gid,
+            // Header text grows rightward from ox+10; reserve room on the right
+            // for the info badge.  13px monospace ≈ 7.8px/char; the leading
+            // arrow glyph + space cost 2 chars and must not be truncated.
+            const headerChars = maxCharsForWidth(pos.w - 10 - (hasInfo ? 26 : 10), 7.8, 0) - 2;
+            addLabel(engine.layers.l2, '\u25B6 ' + truncateLabel(g.class_name, headerChars), 'group-label:' + gid,
                 ox + 10, oy + 15, TEXT_STYLE.groupHeader, { ax: 0, ay: 0.5 });
             if (hasTiming) {
                 addLabel(engine.layers.l2, 'Kernel ' + g.pct.toFixed(1) + '% \u00B7 ' + formatDurOf(g.dur_us),
@@ -671,7 +677,12 @@
         box.roundRect(ox, oy, pos.w, 26, 8).fill({ color: groupColor, alpha: 0.35 });
         engine.layers.l2.addChild(box);
         if (visible) {
-            addLabel(engine.layers.l2, '\u25BC ' + g.class_name, 'group-header:' + gid,
+            // Expanded header shares the bar with the right-aligned info badge
+            // and timing text; reserve room for whichever are present so the
+            // truncated title never collides with them.
+            const rightReserve = (hasInfo ? 26 : 10) + (hasTiming ? 130 : 0);
+            const headerChars = maxCharsForWidth(pos.w - 10 - rightReserve, 7.8, 0) - 2;
+            addLabel(engine.layers.l2, '\u25BC ' + truncateLabel(g.class_name, headerChars), 'group-header:' + gid,
                 ox + 10, oy + 13, TEXT_STYLE.groupHeader, { ax: 0, ay: 0.5 });
             if (hasInfo) {
                 const info = makeGraphics('group-info-hit:' + gid);
@@ -1061,6 +1072,23 @@
         const limit = Math.max(1, Math.floor(pillW / 6.5));
         const value = String(text || '');
         return value.length > limit ? (value.slice(0, Math.max(0, limit - 1)) + '…') : value;
+    }
+
+    // Estimate how many monospace glyphs fit in `boxW` px after subtracting
+    // `padding`.  charW is the per-glyph advance in px for the relevant font
+    // size (~7.2px for the 12px node title, ~7.8px for the 13px group header).
+    function maxCharsForWidth(boxW, charW, padding) {
+        const usable = boxW - (padding || 0);
+        return Math.max(1, Math.floor(usable / (charW || 7.2)));
+    }
+
+    // Hard-truncate `text` to `maxChars` glyphs, appending an ellipsis when it
+    // overflows.  Box width / layout are unaffected — only the rendered string
+    // is shortened so long labels no longer spill past their node/group box.
+    function truncateLabel(text, maxChars) {
+        const value = String(text || '');
+        if (!(maxChars >= 1)) { return ''; }
+        return value.length > maxChars ? (value.slice(0, Math.max(0, maxChars - 1)) + '…') : value;
     }
 
     function drawIOTasks(tasks) {
