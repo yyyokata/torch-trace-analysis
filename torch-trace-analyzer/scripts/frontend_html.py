@@ -1000,7 +1000,11 @@ function orderRanks(rankInfo, childSizes) {
     return layers;
 }
 
-function layoutGroup(gid) {
+function layoutGroup(gid, containerWidth) {
+    if (!containerWidth || containerWidth <= 0) {
+        throw new Error('layoutGroup: containerWidth must be a positive number');
+    }
+    const effectiveMaxRowWidth = Math.max(containerWidth - 100, 400);
     const g = groupMap[gid];
     if (!g) return { w: LAYOUT.nodeW, h: LAYOUT.nodeH };
 
@@ -1029,7 +1033,7 @@ function layoutGroup(gid) {
             const h = node && node.has_timing ? 36 : 28;
             childSizes.push({ id: item.id, type: 'node', w: LAYOUT.nodeW, h });
         } else {
-            const sz = layoutGroup(item.id);
+            const sz = layoutGroup(item.id, containerWidth);
             childSizes.push({ id: item.id, type: 'group', w: sz.w, h: sz.h });
         }
     }
@@ -1048,7 +1052,7 @@ function layoutGroup(gid) {
     const rowLayouts = []; // each: y, h, rows (each row: items, totalW)
     let cy = LAYOUT.groupPadTop;
     let maxRowW = 0;
-    const maxW = LAYOUT.maxRowWidth;
+    const maxW = effectiveMaxRowWidth;
     for (let r = 0; r <= maxRank; r++) {
         const layerIds = layers[r] || [];
         if (layerIds.length === 0) continue;
@@ -1319,10 +1323,13 @@ function collectIORenderTasks(row, startY) {
     return { tasks, height: y - startY };
 }
 
-function computeFlowchartLayout(data) {
+function computeFlowchartLayout(data, containerWidth) {
+    if (!containerWidth || containerWidth <= 0) {
+        throw new Error('computeFlowchartLayout: containerWidth must be a positive number');
+    }
     const rootIds = Array.isArray(data.root_groups) ? data.root_groups : [];
     const rootSizes = rootIds.map(rid => {
-        const sz = layoutGroup(rid);
+        const sz = layoutGroup(rid, containerWidth);
         return { id: rid, ...sz };
     });
     const topIOItems = (data.io_groups && data.io_groups.length > 0)
