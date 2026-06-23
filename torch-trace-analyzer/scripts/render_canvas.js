@@ -1110,14 +1110,8 @@
         // renderer to svgW x svgH blows the canvas up to the entire graph and pushes
         // everything off-screen, which defeats the first-screen auto-fit.
         const containerSize = resolveContainerSize('applyWorldLayout');
-        // Prefer app.screen (PixiJS CSS-px viewport) over clientWidth which can be
-        // inflated by the canvas element itself before CSS width constraints take effect.
-        const screenW = (engine.app && engine.app.screen && engine.app.screen.width > 0)
-            ? engine.app.screen.width : containerSize.w;
-        const screenH = (engine.app && engine.app.screen && engine.app.screen.height > 0)
-            ? engine.app.screen.height : containerSize.h;
         if (engine.app && engine.app.renderer && typeof engine.app.renderer.resize === 'function') {
-            engine.app.renderer.resize(Math.ceil(screenW), Math.ceil(screenH));
+            engine.app.renderer.resize(Math.ceil(containerSize.w), Math.ceil(containerSize.h));
         }
         applyViewport();
     }
@@ -1137,12 +1131,8 @@
             throw new Error('render_canvas.js: auto-fit requires worldBounds');
         }
         const containerSize = resolveContainerSize('auto-fit');
-        // Prefer app.screen (PixiJS CSS-px viewport) over clientWidth which can be
-        // inflated by the canvas element before CSS constraints take effect.
-        const cw = (engine.app && engine.app.screen && engine.app.screen.width > 0)
-            ? engine.app.screen.width : containerSize.w;
-        const ch = (engine.app && engine.app.screen && engine.app.screen.height > 0)
-            ? engine.app.screen.height : containerSize.h;
+        const cw = containerSize.w;
+        const ch = containerSize.h;
         const FIT_PADDING = 40;
         const vp = engine.viewportController.fitToView(engine.worldBounds, cw, ch, { padding: FIT_PADDING, maxScale: 1.0 });
         // Width-only fit: the canvas width fills the container so there is no
