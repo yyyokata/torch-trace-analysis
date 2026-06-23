@@ -1278,6 +1278,10 @@
             p.assertActiveRenderGeneration(generation, '收尾阶段');
             const wantAutoFit = (!engine.hasRenderedOnce) || (renderOpts && renderOpts.autoFit === true);
             if (wantAutoFit) {
+                if (engine.app && engine.app.canvas) {
+                    engine.app.canvas.style.width = '100%';
+                    engine.app.canvas.style.height = '';
+                }
                 await requestAnimationFramePromise(function () {
                     return performAutoFit();
                 });
