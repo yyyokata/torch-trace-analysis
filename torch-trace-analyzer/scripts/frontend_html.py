@@ -59,7 +59,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 .controls button { background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.15); color: #ccc; padding: 6px 14px; border-radius: 6px; font-size: 12px; cursor: pointer; transition: all 0.2s; }
 .controls button:hover { background: rgba(255,255,255,0.15); color: #fff; }
 .controls button.active { background: rgba(100,181,246,0.2); border-color: #64b5f6; color: #64b5f6; }
-.dag-container { width: 100%; overflow: auto; position: relative; }
+.dag-container { width: 100%; overflow: auto; position: relative; contain: layout style paint; }
 .dag-svg { display: block; margin: 0 auto; }
 .dag-svg .group-box { fill: rgba(255,255,255,0.03); stroke: rgba(255,255,255,0.12); stroke-width: 1.5; rx: 10; cursor: pointer; transition: fill 0.2s; }
 .dag-svg .group-box:hover { fill: rgba(255,255,255,0.06); stroke: rgba(100,181,246,0.4); }
@@ -113,6 +113,19 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 .dag-svg .group-clickable { cursor: pointer; }
 .dag-svg .edge-path { pointer-events: stroke; cursor: pointer; }
 .dag-svg .edge-path:hover { stroke-width: 3.4; opacity: 1 !important; }
+.dag-container.hover-active .edge-path:not(.edge-active) { opacity: 0.14 !important; filter: saturate(0.7) !important; }
+.dag-container.hover-active .edge-path.edge-active { opacity: 1 !important; filter: none !important; }
+.dag-container.hover-active .edge-path.dep.edge-active { stroke: #7CFFB2 !important; }
+.dag-container.hover-active .edge-path.flow.edge-active { stroke: #FFD166 !important; }
+.dag-container.hover-active .edge-path.internal.edge-active { stroke: #7FD1FF !important; }
+.dag-container.hover-active .leaf-node.node-dim,
+.dag-container.hover-active .group-box.node-dim,
+.dag-container.hover-active .io-node.node-dim,
+.dag-container.hover-active .group-label.node-dim,
+.dag-container.hover-active .group-timing.node-dim { opacity: 0.25 !important; }
+.dag-container.hover-active .leaf-node.node-active,
+.dag-container.hover-active .group-box.node-active,
+.dag-container.hover-active .io-node.node-active { opacity: 1 !important; stroke: #FFD166 !important; stroke-width: 3 !important; }
 .evidence-meta { padding: 6px 18px 10px; font-size: 11px; color: #aab4cf; }
 .evidence-meta b { color: #64b5f6; }
 .evidence-meta code { background: rgba(100,181,246,0.12); padding: 1px 5px; border-radius: 3px; font-family: monospace; color: #ffffff; }
@@ -374,27 +387,18 @@ function setEdgeItemFocusState(item, state) {
     if (!item || !item.path) return;
     const p = item.path;
     if (state === 'active') {
-        p.style.setProperty('opacity', '1', 'important');
-        p.style.removeProperty('filter');
-        let activeStroke = null;
-        if (p.classList.contains('dep')) activeStroke = '#7CFFB2';
-        else if (p.classList.contains('flow')) activeStroke = '#FFD166';
-        else if (p.classList.contains('internal')) activeStroke = '#7FD1FF';
-        if (activeStroke) p.style.setProperty('stroke', activeStroke, 'important');
-        else p.style.removeProperty('stroke');
+        p.classList.add('edge-active');
+        p.classList.remove('edge-dim');
         syncLongEdgeDisplay(p, true);
         return;
     }
     if (state === 'dim') {
-        p.style.setProperty('opacity', '0.14', 'important');
-        p.style.setProperty('filter', 'saturate(0.7)', 'important');
-        p.style.removeProperty('stroke');
+        p.classList.add('edge-dim');
+        p.classList.remove('edge-active');
         syncLongEdgeDisplay(p, false);
         return;
     }
-    p.style.removeProperty('opacity');
-    p.style.removeProperty('filter');
-    p.style.removeProperty('stroke');
+    p.classList.remove('edge-active', 'edge-dim');
     syncLongEdgeDisplay(p, false);
 }
 
@@ -441,32 +445,17 @@ function syncActiveEdgeOverlay(item) {
 }
 
 function _applyNodeFocusStyle(el, state) {
-    const isRect = el.classList.contains('leaf-node') ||
-                   el.classList.contains('group-box') ||
-                   el.classList.contains('io-node');
-    const isText = el.classList.contains('group-label') ||
-                   el.classList.contains('group-timing');
     if (state === 'active') {
-        el.style.setProperty('opacity', '1', 'important');
-        if (isRect) {
-            el.style.setProperty('stroke', '#FFD166', 'important');
-            el.style.setProperty('stroke-width', '3', 'important');
-        }
+        el.classList.add('node-active');
+        el.classList.remove('node-dim');
         return;
     }
     if (state === 'dim') {
-        el.style.setProperty('opacity', '0.25', 'important');
-        if (isRect) {
-            el.style.removeProperty('stroke');
-            el.style.removeProperty('stroke-width');
-        }
+        el.classList.add('node-dim');
+        el.classList.remove('node-active');
         return;
     }
-    el.style.removeProperty('opacity');
-    if (isRect) {
-        el.style.removeProperty('stroke');
-        el.style.removeProperty('stroke-width');
-    }
+    el.classList.remove('node-active', 'node-dim');
 }
 
 function setNodeFocusStateById(nodeId, state) {
@@ -591,6 +580,8 @@ function clearEdgeHoverFocusState() {
     prevActiveItems = [];
     prevActiveNodeIds = new Set();
     clearActiveEdgeOverlay();
+    const dagContainer = document.getElementById('dag-container');
+    if (dagContainer) dagContainer.classList.remove('hover-active');
 }
 
 function applyGroupFocusState(hoveredGid) {
@@ -621,6 +612,8 @@ function applyGroupFocusState(hoveredGid) {
         prevDimGroupNodeIds = new Set();
         prevDimGroupIds = new Set();
         lastHoveredGid = null;
+        const dagContainer = document.getElementById('dag-container');
+        if (dagContainer) dagContainer.classList.remove('hover-active');
         return;
     }
 
@@ -698,6 +691,8 @@ function applyGroupFocusState(hoveredGid) {
     prevDimGroupNodeIds = nextDimGroupNodeIds;
     prevDimGroupIds = nextDimGroupIds;
     lastHoveredGid = hoveredGid;
+    const dagContainer = document.getElementById('dag-container');
+    if (dagContainer) dagContainer.classList.add('hover-active');
 }
 
 function applyEdgeFocusState() {
@@ -745,6 +740,11 @@ function applyEdgeFocusState() {
         }
     }
 
+    const dagContainer = document.getElementById('dag-container');
+    if (dagContainer) {
+        if (hasActive) dagContainer.classList.add('hover-active');
+        else dagContainer.classList.remove('hover-active');
+    }
     prevActiveItems = newItems;
     prevActiveNodeIds = newNodeIds;
     syncActiveEdgeOverlay(newItems[0] || null);
