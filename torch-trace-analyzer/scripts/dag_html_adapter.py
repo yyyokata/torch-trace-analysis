@@ -116,22 +116,8 @@ def _walk_serialized_level(
 
     node_entries = serialized["nodes"]
     node_entry_by_id = _collect_node_entry_index(serialized)
-    container_child_ids: set[int] = set()
-    for entry in node_entries:
-        node_id = _require_field(entry, "node_id")
-        if entry.get("children_nodes") is not None:
-            children = entry["children_nodes"]
-            if not isinstance(children, list):
-                raise RuntimeError(f"container node {node_id} children_nodes must be list")
-            for child_id in children:
-                if child_id in container_child_ids:
-                    raise RuntimeError(f"duplicate container child id: {child_id}")
-                container_child_ids.add(child_id)
-
     for entry in node_entries:
         node_id = entry["node_id"]
-        if node_id in container_child_ids:
-            continue
         if node_id in state.group_by_id or node_id in state.leaf_nodes_by_id:
             continue
         built = _build_structured_node(

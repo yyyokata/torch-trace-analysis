@@ -120,11 +120,17 @@ def _normalize_single_dag(
                 edge for edge in dag.edges if edge.src_id in member_id_set and edge.dst_id in member_id_set
             ]
             _rebuild_adjacency(inner_dag)
+            if owner_node_id != container_node_id:
+                for member_id in member_ids:
+                    if member_id in dag.direct_nodes:
+                        dag.direct_nodes.remove(member_id)
             continue
 
         for member_id in sorted(member_ids):
             if member_id not in inner_dag.direct_nodes:
                 inner_dag.direct_nodes.append(member_id)
+            if owner_node_id != container_node_id and member_id in dag.direct_nodes:
+                dag.direct_nodes.remove(member_id)
 
     if allow_function_grouping:
         _apply_function_grouping_a(dag, registry, scope_frames_prefix=scope_frames_prefix)
@@ -309,7 +315,10 @@ def _apply_function_grouping_b(
     if len(current_seg) >= 2:
         segments.append(current_seg)
 
+    original_direct_node_count = len(dag.direct_nodes)
     for member_ids in segments:
+        if len(member_ids) == original_direct_node_count:
+            continue
         representative_node = registry[member_ids[0]]
         member_id_set = set(member_ids)
         function_name = representative_node.call_loc.frames[-1].function_name
