@@ -1221,6 +1221,15 @@
         };
     }
 
+    function requestAnimationFramePromise(fn) {
+        return new Promise(function (resolve) {
+            const raf = (global.requestAnimationFrame || function (cb) { return setTimeout(cb, 0); });
+            raf(function () {
+                resolve(fn());
+            });
+        });
+    }
+
     async function canvasRenderPhase1(data, renderOpts) {
         ensureEngine();
         await ensureStageMounted();
@@ -1269,7 +1278,9 @@
             p.assertActiveRenderGeneration(generation, '收尾阶段');
             const wantAutoFit = (!engine.hasRenderedOnce) || (renderOpts && renderOpts.autoFit === true);
             if (wantAutoFit) {
-                performAutoFit();
+                await requestAnimationFramePromise(function () {
+                    return performAutoFit();
+                });
             }
             engine.hasRenderedOnce = true;
             p.setRenderProgress(98, '正在更新图例和摘要…');
