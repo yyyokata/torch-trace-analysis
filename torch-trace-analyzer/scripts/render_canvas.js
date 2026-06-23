@@ -464,7 +464,9 @@
         // zoom range.  Height is NOT constrained — when the scaled graph is taller
         // than the viewport the overflow is reached by vertical scrolling / panning.
         let scale = availW / bounds.w;
-        scale = Math.max(vp.minScale, Math.min(vp.maxScale, scale));
+        // opts.maxScale may override vp.maxScale for auto-fit paths that must not upscale content.
+        const effectiveMax = (options && options.maxScale !== undefined) ? options.maxScale : vp.maxScale;
+        scale = Math.max(vp.minScale, Math.min(effectiveMax, scale));
         scale = Number(scale.toFixed(3));
         vp.scale = scale;
         // Center horizontally; top-align vertically so the graph starts at the top
@@ -1121,7 +1123,7 @@
             throw new Error('render_canvas.js: auto-fit requires positive container dimensions');
         }
         const FIT_PADDING = 40;
-        const vp = engine.viewportController.fitToView(engine.worldBounds, cw, ch, { padding: FIT_PADDING });
+        const vp = engine.viewportController.fitToView(engine.worldBounds, cw, ch, { padding: FIT_PADDING, maxScale: 1.0 });
         // Width-only fit: the canvas width fills the container so there is no
         // horizontal scroll.  The height is grown to the full scaled content so a
         // graph taller than the viewport overflows into the .dag-stage's vertical
