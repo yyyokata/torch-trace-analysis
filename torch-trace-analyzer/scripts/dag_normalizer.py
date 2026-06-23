@@ -192,8 +192,6 @@ def _find_a_group_helper_frame(frames: tuple) -> object | None:
     if last_forward_idx > 0 and frames[last_forward_idx - 1].function_name == "__call__":
         return None
     helper_idx = last_forward_idx + 1
-    while helper_idx < len(frames) and frames[helper_idx].function_name.startswith("forward"):
-        helper_idx += 1
     if helper_idx >= len(frames):
         return None
     return frames[helper_idx]
