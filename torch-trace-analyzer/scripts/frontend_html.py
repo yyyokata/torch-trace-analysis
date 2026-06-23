@@ -68,21 +68,6 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 .dag-container { width: 100%; overflow: auto; position: relative; contain: layout style; }
 .dag-stage { display: block; margin: 0 auto; width: 100%; min-height: 200px; }
 .dag-stage canvas { display: block; margin: 0 auto; }
-.dag-svg { display: block; margin: 0 auto; will-change: transform; }
-.dag-svg .group-box { fill: rgba(255,255,255,0.03); stroke: rgba(255,255,255,0.12); stroke-width: 1.5; rx: 10; cursor: pointer; transition: fill 0.2s; }
-.dag-svg .group-box:hover { fill: rgba(255,255,255,0.06); stroke: rgba(100,181,246,0.4); }
-.dag-svg .group-box.collapsed { fill: rgba(100,181,246,0.08); stroke: rgba(100,181,246,0.3); stroke-dasharray: 5,3; }
-.dag-svg .group-label { font-size: 11px; fill: #8892b0; font-weight: 600; pointer-events: none; }
-.dag-svg .group-timing { font-size: 10px; fill: #64b5f6; pointer-events: none; }
-.dag-svg .group-toggle { font-size: 10px; fill: #555; pointer-events: auto; cursor: pointer; }
-.dag-svg .group-info-hit { fill: rgba(100,181,246,0.001); stroke: rgba(100,181,246,0.45); stroke-width: 1; pointer-events: auto; cursor: pointer; }
-.dag-svg .group-info-hit:hover { fill: rgba(100,181,246,0.12); stroke: rgba(100,181,246,0.9); }
-.dag-svg .group-info-text { fill: rgba(100,181,246,0.82); font-size: 10px; font-weight: 700; pointer-events: none; text-anchor: middle; dominant-baseline: middle; }
-.dag-svg .leaf-node { rx: 6; ry: 6; stroke-width: 1.5; cursor: default; transition: stroke 0.2s, stroke-width 0.2s; }
-.dag-svg .leaf-node:hover { stroke: #ffffff; stroke-width: 2.5; }
-.dag-svg .node-label { font-size: 11px; fill: #ffffff; font-weight: 500; pointer-events: none; text-anchor: middle; }
-.dag-svg .node-sublabel { font-size: 9px; fill: rgba(255,255,255,0.7); pointer-events: none; text-anchor: middle; }
-.dag-svg .port { fill: rgba(255,255,255,0.15); stroke: rgba(255,255,255,0.3); stroke-width: 1; }
 .tooltip { position: fixed; background: #16213e; border: 1px solid rgba(100,181,246,0.3); border-radius: 8px; padding: 10px 14px; font-size: 11px; color: #e0e0e0; pointer-events: none; z-index: 1000; max-width: 300px; box-shadow: 0 4px 20px rgba(0,0,0,0.4); opacity: 0; transition: opacity 0.15s; }
 .tooltip.visible { opacity: 1; }
 .tooltip .tt-title { font-weight: 600; color: #64b5f6; margin-bottom: 4px; }
@@ -114,7 +99,6 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 .code-line .code-text mark.var-mark { background: rgba(255, 209, 102, 0.25); color: #fff4c2; border-radius: 3px; padding: 0 2px; box-shadow: inset 0 0 0 1px rgba(255, 209, 102, 0.35); font-weight: 600; }
 .code-line .code-text mark.var-mark.producer-mark { background: rgba(46, 204, 113, 0.30); color: #d5f5e3; box-shadow: inset 0 0 0 1px rgba(46, 204, 113, 0.40); }
 .code-line .code-text mark.var-mark.consumer-mark { background: rgba(255, 209, 102, 0.25); color: #fff4c2; box-shadow: inset 0 0 0 1px rgba(255, 209, 102, 0.35); }
-.dag-svg .group-clickable { cursor: pointer; }
 .dag-container.hover-active .leaf-node.node-dim,
 .dag-container.hover-active .group-box.node-dim,
 .dag-container.hover-active .io-node.node-dim,
@@ -292,8 +276,6 @@ let hoveredNodeId = null;
 let nodeDomRegistry = new Map();
 const groupDomRegistry = new Map();
 let renderGeneration = 0;
-let edgeOverlayLayer = null;
-let activeEdgeOverlayPath = null;
 const nodeAncestorGroups = new Map();
 const LONG_EDGE_MIN_SPAN = 260;
 
@@ -407,45 +389,11 @@ function setEdgeItemFocusState(item, state) {
 }
 
 function clearActiveEdgeOverlay() {
-    if (activeEdgeOverlayPath && activeEdgeOverlayPath.parentNode) {
-        const parent = activeEdgeOverlayPath.parentNode;
-        if (typeof parent.removeChild === 'function') {
-            parent.removeChild(activeEdgeOverlayPath);
-        } else if (Array.isArray(parent.children)) {
-            parent.children = parent.children.filter(child => child !== activeEdgeOverlayPath);
-        }
-        activeEdgeOverlayPath.parentNode = null;
-    }
-    activeEdgeOverlayPath = null;
+    return;
 }
 
 function syncActiveEdgeOverlay(item) {
-    if (!item || !item.path) {
-        clearActiveEdgeOverlay();
-        return;
-    }
-    if (!edgeOverlayLayer) {
-        throw new Error('edge overlay layer is not initialized');
-    }
-    const sourcePath = item.path;
-    const overlayPath = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-    overlayPath.setAttribute('d', sourcePath.getAttribute('d') || '');
-    for (const attrName of ['class', 'opacity', 'stroke-dasharray', 'stroke-dashoffset']) {
-        const attrValue = sourcePath.getAttribute(attrName);
-        if (attrValue !== null && attrValue !== undefined) {
-            overlayPath.setAttribute(attrName, attrValue);
-        }
-    }
-    for (const dataName of ['longEdge', 'fullDasharray', 'fullDashoffset', 'truncatedDasharray', 'truncatedDashoffset']) {
-        if (sourcePath.dataset && sourcePath.dataset[dataName] !== undefined) {
-            overlayPath.dataset[dataName] = sourcePath.dataset[dataName];
-        }
-    }
-    overlayPath.style.pointerEvents = 'none';
-    setEdgeItemFocusState({ path: overlayPath }, 'active');
-    clearActiveEdgeOverlay();
-    edgeOverlayLayer.appendChild(overlayPath);
-    activeEdgeOverlayPath = overlayPath;
+    return;
 }
 
 function _applyNodeFocusStyle(el, state) {
@@ -1168,6 +1116,295 @@ function layoutGroup(gid) {
     return { w: groupW, h: groupH };
 }
 
+const IO_W = 140;
+const IO_H = 40;
+const IO_GAP = 36;
+const IO_PILL_GAP = 18;
+const EXPAND_PADDING = 24;
+const EXPAND_PILL_W = 100;
+const EXPAND_COLS = 3;
+const EXPAND_FRAME_PAD = 16;
+const EXPAND_COL_GAP = 20;
+const EXPAND_OUTER_PAD = 24;
+const EXPANDED_IO_H = 28;
+const EXPANDED_IO_GAP = 16;
+const COLLAPSE_BUTTON_W = 70;
+const COLLAPSE_BUTTON_H = 22;
+const COLLAPSE_BOTTOM_PADDING = 10;
+let ACTIVE_FLOWCHART_LAYOUT_CONTEXT = null;
+
+function getIOLayoutConfig() {
+    return {
+        ioW: IO_W,
+        ioH: IO_H,
+        ioGap: IO_GAP,
+        pillGap: IO_PILL_GAP,
+        EXPAND_PADDING,
+        EXPAND_PILL_W,
+        EXPAND_COLS,
+        EXPAND_FRAME_PAD,
+        EXPAND_COL_GAP,
+        EXPAND_OUTER_PAD,
+        EXPANDED_IO_H,
+        EXPANDED_IO_GAP,
+        COLLAPSE_BUTTON_W,
+        COLLAPSE_BUTTON_H,
+        COLLAPSE_BOTTOM_PADDING,
+    };
+}
+
+function computeIOGroupExpandedLayout(memberCount, availableSvgW) {
+    const availableWInput = Number(availableSvgW);
+    if (!Number.isFinite(availableWInput)) {
+        throw new Error(`computeIOGroupExpandedLayout got invalid availableSvgW: ${availableSvgW}`);
+    }
+    if (memberCount === 0) return { cols: EXPAND_COLS, pillW: EXPAND_PILL_W, memberRows: 0, height: 0 };
+    const availableW = availableWInput - 2 * EXPAND_FRAME_PAD;
+    const cols = Math.max(EXPAND_COLS, Math.floor(availableW / (EXPAND_PILL_W + IO_PILL_GAP)));
+    const pillW = Math.floor((availableW - (cols - 1) * IO_PILL_GAP) / cols);
+    const memberRows = Math.ceil(memberCount / cols);
+    const memberAreaH = memberRows * EXPANDED_IO_H + (memberRows - 1) * EXPANDED_IO_GAP;
+    const height = memberAreaH + EXPANDED_IO_GAP + COLLAPSE_BUTTON_H + COLLAPSE_BOTTOM_PADDING;
+    return { cols, pillW, memberRows, height };
+}
+
+function calcIOGroupExpandedHeight(ioGroup, availableW) {
+    const width = Number(availableW);
+    if (!Number.isFinite(width)) {
+        throw new Error(`calcIOGroupExpandedHeight got invalid availableW: ${availableW}`);
+    }
+    const memberCount = (ioGroup.member_ids || []).length;
+    return computeIOGroupExpandedLayout(memberCount, width).height;
+}
+
+function getIOGroupCollapsedState(ioGroup) {
+    return (ioGroup.id in collapsedState) ? collapsedState[ioGroup.id] : ioGroup.collapsed;
+}
+
+function calcIORowWidth(row, availableW) {
+    const width = Number(availableW);
+    if (!Number.isFinite(width)) {
+        throw new Error(`calcIORowWidth got invalid availableW: ${availableW}`);
+    }
+    if (!row.items || row.items.length === 0) return 0;
+    let result = 0;
+    let pendingInline = 0;
+    const flushInline = () => {
+        if (pendingInline > 0) {
+            result = Math.max(result, pendingInline * IO_W + (pendingInline - 1) * IO_PILL_GAP);
+            pendingInline = 0;
+        }
+    };
+    for (const item of row.items) {
+        if (item.isIOGroup === true) {
+            const ioGroup = item.ioGroup;
+            if (!getIOGroupCollapsedState(ioGroup)) {
+                flushInline();
+                const memberCount = (ioGroup.member_ids || []).length;
+                const expandedW = memberCount > 0
+                    ? Math.min(width * 0.85, memberCount * (IO_W + IO_PILL_GAP) - IO_PILL_GAP)
+                    : 0;
+                result = Math.max(result, expandedW);
+                continue;
+            }
+        }
+        pendingInline += 1;
+    }
+    flushInline();
+    return result;
+}
+
+function calcIORowHeight(row, svgW) {
+    const width = Number(svgW);
+    if (!Number.isFinite(width)) {
+        throw new Error(`calcIORowHeight got invalid svgW: ${svgW}`);
+    }
+    if (!row.items || row.items.length === 0) return 0;
+    const expandedGroups = row.items.filter(item => item.isIOGroup === true && !getIOGroupCollapsedState(item.ioGroup));
+    const hasInlineRow = row.items.some(item => item.isIOGroup !== true || getIOGroupCollapsedState(item.ioGroup));
+    let height = hasInlineRow ? IO_H : 0;
+    if (expandedGroups.length > 0) {
+        const groupCount = expandedGroups.length;
+        const colW = (width - (groupCount - 1) * EXPAND_COL_GAP) / groupCount;
+        const expandedH = Math.max(...expandedGroups.map(item => calcIOGroupExpandedHeight(item.ioGroup, colW)));
+        height += (height > 0 ? IO_GAP : 0) + expandedH;
+    }
+    return height;
+}
+
+function collectIORenderTasks(row, startY) {
+    if (!ACTIVE_FLOWCHART_LAYOUT_CONTEXT) {
+        throw new Error('collectIORenderTasks called before computeFlowchartLayout initialized layout context');
+    }
+    const { svgW } = ACTIVE_FLOWCHART_LAYOUT_CONTEXT;
+    if (!row || !row.items || row.items.length === 0) return { tasks: [], height: 0 };
+    let y = startY;
+    const tasks = [];
+    const inlineItems = [];
+    const expandedItems = [];
+    for (const item of row.items) {
+        if (item.isIOGroup === true) {
+            const ioGroup = item.ioGroup;
+            if (!getIOGroupCollapsedState(ioGroup)) {
+                expandedItems.push(item);
+                continue;
+            }
+        }
+        inlineItems.push(item);
+    }
+
+    if (inlineItems.length > 0) {
+        const rowWidth = inlineItems.length * IO_W + (inlineItems.length - 1) * IO_PILL_GAP;
+        let left = (svgW - rowWidth) / 2;
+        const cy = y + IO_H / 2;
+        for (const item of inlineItems) {
+            if (item.isIOGroup === true) {
+                tasks.push({
+                    type: 'io',
+                    taskKind: 'io_group',
+                    ioGroup: { ...item.ioGroup, _collapsed: true },
+                    cx: left + IO_W / 2,
+                    cy,
+                    w: IO_W,
+                    h: IO_H,
+                    availableW: svgW,
+                });
+            } else {
+                const nid = item.id;
+                const node = nodeMap[nid];
+                const baseText = node ? node.class_name : item.defaultSublabel;
+                const sublabel = (node && node.has_timing)
+                    ? `${baseText} · ${node.pct.toFixed(1)}%`
+                    : baseText;
+                tasks.push({
+                    type: 'io',
+                    taskKind: 'io_pill',
+                    nid,
+                    subtype: item.subtype,
+                    cx: left + IO_W / 2,
+                    cy,
+                    w: IO_W,
+                    h: IO_H,
+                    label: item.label,
+                    sublabel,
+                    fillColor: item.fillColor,
+                });
+            }
+            left += IO_W + IO_PILL_GAP;
+        }
+        y += IO_H;
+    }
+
+    if (expandedItems.length > 0) {
+        if (y > startY) y += IO_GAP;
+        const groupCount = expandedItems.length;
+        const colW = (svgW - (groupCount - 1) * EXPAND_COL_GAP) / groupCount;
+        const expandedHeight = Math.max(...expandedItems.map(item => calcIOGroupExpandedHeight(item.ioGroup, colW)));
+        let left = 0;
+        for (const item of expandedItems) {
+            tasks.push({
+                type: 'io',
+                taskKind: 'io_group',
+                ioGroup: { ...item.ioGroup, _collapsed: false },
+                cx: left + colW / 2,
+                cy: y + EXPANDED_IO_H / 2,
+                w: IO_W,
+                h: IO_H,
+                availableW: colW,
+            });
+            left += colW + EXPAND_COL_GAP;
+        }
+        y += expandedHeight;
+    }
+    return { tasks, height: y - startY };
+}
+
+function computeFlowchartLayout(data) {
+    const rootIds = Array.isArray(data.root_groups) ? data.root_groups : [];
+    const rootSizes = rootIds.map(rid => {
+        const sz = layoutGroup(rid);
+        return { id: rid, ...sz };
+    });
+    const topIOItems = (data.io_groups && data.io_groups.length > 0)
+        ? data.io_groups
+            .filter(g => g.io_subtype !== 'output')
+            .map(g => ({ isIOGroup: true, ioGroup: g }))
+        : [
+            ...(data.input_node_ids || []).map(id => ({ id, subtype: 'input', label: 'Input', defaultSublabel: 'network input', fillColor: 'rgba(46,204,113,0.55)' })),
+            ...(data.param_node_ids || []).map(id => ({ id, subtype: 'param', label: 'Param', defaultSublabel: 'model param', fillColor: 'rgba(155,89,182,0.55)' })),
+            ...(data.const_node_ids || []).map(id => ({ id, subtype: 'const', label: 'Const', defaultSublabel: 'const value', fillColor: 'rgba(241,196,15,0.55)' })),
+        ];
+    const outputIOGroup = (data.io_groups || []).find(g => g.io_subtype === 'output');
+    const bottomIOItems = outputIOGroup
+        ? [{ isIOGroup: true, ioGroup: outputIOGroup }]
+        : (data.output_node_ids || []).map(id => ({
+              id,
+              subtype: 'output',
+              label: 'Result',
+              defaultSublabel: 'result output',
+              fillColor: 'rgba(231,76,60,0.55)'
+          }));
+    const topIORows = topIOItems.length > 0 ? [{ items: topIOItems }] : [];
+    const bottomIORows = bottomIOItems.length > 0 ? [{ items: bottomIOItems }] : [];
+    const allIORows = topIORows.concat(bottomIORows);
+    const maxRootW = rootSizes.length ? Math.max(...rootSizes.map(r => r.w)) : LAYOUT.nodeW;
+    const maxRootH = rootSizes.length ? Math.max(...rootSizes.map(r => r.h)) : LAYOUT.nodeH;
+    const provisionalSvgW = Math.max(maxRootW + 80, 480);
+    const expandedGroupCount = (data.io_groups || []).filter(g => !getIOGroupCollapsedState(g)).length;
+    const minIOColW = EXPAND_COLS * EXPAND_PILL_W + (EXPAND_COLS - 1) * IO_PILL_GAP + 2 * EXPAND_FRAME_PAD;
+    const minIOTotalW = expandedGroupCount > 0
+        ? expandedGroupCount * minIOColW + (expandedGroupCount - 1) * EXPAND_COL_GAP + 2 * EXPAND_OUTER_PAD
+        : 0;
+    const maxIORowW = allIORows.length > 0 ? Math.max(...allIORows.map(row => calcIORowWidth(row, provisionalSvgW))) : 0;
+    const svgW = Math.max(provisionalSvgW, maxIORowW + 80, minIOTotalW);
+    const topIOHeight = topIORows.length > 0 ? topIORows.reduce((acc, row, idx) => acc + calcIORowHeight(row, svgW) + (idx > 0 ? IO_GAP : 0), 0) : 0;
+    const bottomIOHeight = bottomIORows.length > 0 ? bottomIORows.reduce((acc, row, idx) => acc + calcIORowHeight(row, svgW) + (idx > 0 ? IO_GAP : 0), 0) : 0;
+    const rootStartY = 30 + (topIOHeight > 0 ? topIOHeight + IO_GAP : 0);
+    const svgH = 30 + topIOHeight + (topIOHeight > 0 ? IO_GAP : 0) + maxRootH + (bottomIOHeight > 0 ? IO_GAP + bottomIOHeight : 0) + 40;
+    const rootPositions = [];
+    if (rootSizes.length > 0) {
+        const rs = rootSizes[0];
+        rootPositions.push({ id: rs.id, x: (svgW - rs.w) / 2, y: rootStartY, w: rs.w, h: rs.h });
+    }
+    ACTIVE_FLOWCHART_LAYOUT_CONTEXT = {
+        data,
+        svgW,
+        svgH,
+        provisionalSvgW,
+        rootStartY,
+        topIORows,
+        bottomIORows,
+    };
+    const ioTasks = [];
+    let topIOY = 30;
+    for (const row of topIORows) {
+        const plan = collectIORenderTasks(row, topIOY);
+        ioTasks.push(...plan.tasks);
+        topIOY += plan.height + IO_GAP;
+    }
+    const rootEntry = rootPositions[0];
+    let bottomIOY = rootEntry ? (rootEntry.y + rootEntry.h + IO_GAP) : (rootStartY + maxRootH + IO_GAP);
+    for (const row of bottomIORows) {
+        const plan = collectIORenderTasks(row, bottomIOY);
+        ioTasks.push(...plan.tasks);
+        bottomIOY += plan.height + IO_GAP;
+    }
+    return {
+        svgW,
+        svgH,
+        provisionalSvgW,
+        rootStartY,
+        rootSizes,
+        rootPositions,
+        rootEntry,
+        ioTasks,
+        topIORows,
+        bottomIORows,
+        topIOHeight,
+        bottomIOHeight,
+    };
+}
+
 function nextFrame() {
     return new Promise((resolve) => requestAnimationFrame(() => resolve()));
 }
@@ -1275,802 +1512,13 @@ function invokeRender() {
 }
 
 async function render() {
-    // Canvas Phase 1 / Stage 1.1: the production runtime renders through the
-    // Canvas (Pixi) skeleton, never the legacy SVG path below.  render_canvas.js
-    // sets window.__phase1NoInteractionMode and provides the canvas entry; if the
-    // flag is on but the entry is missing that is a hard error (no fallback).
     if (typeof window !== 'undefined' && window.__phase1NoInteractionMode === true) {
         if (typeof window.__canvasRenderPhase1 !== 'function') {
             throw new Error('Canvas render entry __canvasRenderPhase1 is missing while phase1 no-interaction mode is enabled');
         }
         return window.__canvasRenderPhase1(DATA);
     }
-    const generation = ++renderGeneration;
-    showRenderProgress('正在准备渲染状态…');
-    const { overlay } = getRenderProgressElements();
-    overlay.dataset.renderGeneration = String(generation);
-    await nextFrame();
-    try {
-        groupLayout = {};
-        nodePortMap = {};
-        edgeDomRegistry = [];
-        edgeByNodeId.clear();
-        edgeByGroupId.clear();
-        edgeDomByKey.clear();
-        prevActiveItems = [];
-        prevActiveNodeIds = new Set();
-        prevActiveEdgeKeys = new Set();
-        prevActiveGroupNodeIds = new Set();
-        prevActiveGroupIds = new Set();
-        prevDimEdgeKeys = new Set();
-        prevDimGroupNodeIds = new Set();
-        prevDimGroupIds = new Set();
-        lastHoveredGid = null;
-        nodeDomRegistry = new Map();
-        groupDomRegistry.clear();
-        focusedEdgePath = null;
-        hoveredEdgeKey = null;
-        hoveredEdges = [];
-        hoveredEdgeIdx = 0;
-        hoveredGroupId = null;
-        hoveredNodeId = null;
-        edgeOverlayLayer = null;
-        clearActiveEdgeOverlay();
-        hideOverlapBadge();
-        assertActiveRenderGeneration(generation, '准备阶段');
-        setRenderProgress(5, '正在准备渲染状态…');
-        await nextFrame();
-
-        const rootSizes = DATA.root_groups.map(rid => {
-            const sz = layoutGroup(rid);
-            return { id: rid, ...sz };
-        });
-
-        const ioW = 140, ioH = 40;
-        const ioGap = 36;
-        const pillGap = 18;
-        const topIOItems = (DATA.io_groups && DATA.io_groups.length > 0)
-            ? DATA.io_groups
-                .filter(g => g.io_subtype !== 'output')
-                .map(g => ({ isIOGroup: true, ioGroup: g }))
-            : [
-                ...(DATA.input_node_ids || []).map(id => ({ id, label: 'Input', defaultSublabel: 'network input', fillColor: 'rgba(46,204,113,0.55)' })),
-                ...(DATA.param_node_ids || []).map(id => ({ id, label: 'Param', defaultSublabel: 'model param', fillColor: 'rgba(155,89,182,0.55)' })),
-                ...(DATA.const_node_ids || []).map(id => ({ id, label: 'Const', defaultSublabel: 'const value', fillColor: 'rgba(241,196,15,0.55)' })),
-            ];
-        const outputIOGroup = (DATA.io_groups || []).find(g => g.io_subtype === 'output');
-        const bottomIOItems = outputIOGroup
-            ? [{ isIOGroup: true, ioGroup: outputIOGroup }]
-            : (DATA.output_node_ids || []).map(id => ({
-                  id, label: 'Result', defaultSublabel: 'result output',
-                  fillColor: 'rgba(231,76,60,0.55)'
-              }));
-        const topIORows = topIOItems.length > 0 ? [{ items: topIOItems }] : [];
-        const bottomIORows = bottomIOItems.length > 0 ? [{ items: bottomIOItems }] : [];
-        const allIORows = topIORows.concat(bottomIORows);
-        const maxRootW = rootSizes.length ? Math.max(...rootSizes.map(r => r.w)) : LAYOUT.nodeW;
-        const maxRootH = rootSizes.length ? Math.max(...rootSizes.map(r => r.h)) : LAYOUT.nodeH;
-        const provisionalSvgW = Math.max(maxRootW + 80, 480);
-        const EXPAND_PADDING = 24;
-        const EXPAND_PILL_W = 100;
-        const EXPAND_COLS = 3;
-        const EXPAND_FRAME_PAD = 16;
-        const EXPAND_COL_GAP = 20;
-        const EXPAND_OUTER_PAD = 24;
-        const EXPANDED_IO_H = 28;
-        const EXPANDED_IO_GAP = 16;
-        const COLLAPSE_BUTTON_W = 70;
-        const COLLAPSE_BUTTON_H = 22;
-        const COLLAPSE_BOTTOM_PADDING = 10;
-        const expandedGroupCount = (DATA.io_groups || []).filter(g =>
-            !((g.id in collapsedState) ? collapsedState[g.id] : g.collapsed)
-        ).length;
-        const minIOColW = EXPAND_COLS * EXPAND_PILL_W + (EXPAND_COLS - 1) * pillGap + 2 * EXPAND_FRAME_PAD;
-        const minIOTotalW = expandedGroupCount > 0
-            ? expandedGroupCount * minIOColW + (expandedGroupCount - 1) * EXPAND_COL_GAP + 2 * EXPAND_OUTER_PAD
-            : 0;
-        const computeIOGroupExpandedLayout = (memberCount, availableSvgW = provisionalSvgW) => {
-            if (memberCount === 0) return { cols: EXPAND_COLS, pillW: EXPAND_PILL_W, memberRows: 0, height: 0 };
-            const availableW = availableSvgW - 2 * EXPAND_FRAME_PAD;
-            const cols = Math.max(EXPAND_COLS, Math.floor(availableW / (EXPAND_PILL_W + pillGap)));
-            const pillW = Math.floor((availableW - (cols - 1) * pillGap) / cols);
-            const memberRows = Math.ceil(memberCount / cols);
-            const memberAreaH = memberRows * EXPANDED_IO_H + (memberRows - 1) * EXPANDED_IO_GAP;
-            const height = memberAreaH + EXPANDED_IO_GAP + COLLAPSE_BUTTON_H + COLLAPSE_BOTTOM_PADDING;
-            return { cols, pillW, memberRows, height };
-        };
-        const calcIOGroupExpandedHeight = (ioGroup, availableW = provisionalSvgW) => {
-            const memberCount = (ioGroup.member_ids || []).length;
-            return computeIOGroupExpandedLayout(memberCount, availableW).height;
-        };
-        const calcIORowWidth = (row, availableW = provisionalSvgW) => {
-            if (!row.items || row.items.length === 0) return 0;
-            let width = 0;
-            let pendingInline = 0;
-            const flushInline = () => {
-                if (pendingInline > 0) {
-                    width = Math.max(width, pendingInline * ioW + (pendingInline - 1) * pillGap);
-                    pendingInline = 0;
-                }
-            };
-            for (const item of row.items) {
-                if (item.isIOGroup === true) {
-                    const ioGroup = item.ioGroup;
-                    const isCollapsed = (ioGroup.id in collapsedState) ? collapsedState[ioGroup.id] : ioGroup.collapsed;
-                    if (!isCollapsed) {
-                        flushInline();
-                        const memberCount = (ioGroup.member_ids || []).length;
-                        const expandedW = memberCount > 0
-                            ? Math.min(availableW * 0.85, memberCount * (ioW + pillGap) - pillGap)
-                            : 0;
-                        width = Math.max(width, expandedW);
-                        continue;
-                    }
-                }
-                pendingInline += 1;
-            }
-            flushInline();
-            return width;
-        };
-        const maxIORowW = allIORows.length > 0 ? Math.max(...allIORows.map(row => calcIORowWidth(row))) : 0;
-        const svgW = Math.max(provisionalSvgW, maxIORowW + 80, minIOTotalW);
-        const calcIORowHeight = (row) => {
-            if (!row.items || row.items.length === 0) return 0;
-            const expandedGroups = row.items.filter(item => {
-                if (item.isIOGroup !== true) return false;
-                const ioGroup = item.ioGroup;
-                const isCollapsed = (ioGroup.id in collapsedState) ? collapsedState[ioGroup.id] : ioGroup.collapsed;
-                return !isCollapsed;
-            });
-            const hasInlineRow = row.items.some(item => {
-                if (item.isIOGroup !== true) return true;
-                const ioGroup = item.ioGroup;
-                const isCollapsed = (ioGroup.id in collapsedState) ? collapsedState[ioGroup.id] : ioGroup.collapsed;
-                return isCollapsed;
-            });
-            let height = hasInlineRow ? ioH : 0;
-            if (expandedGroups.length > 0) {
-                const groupCount = expandedGroups.length;
-                const colW = (svgW - (groupCount - 1) * EXPAND_COL_GAP) / groupCount;
-                const expandedH = Math.max(...expandedGroups.map(item => calcIOGroupExpandedHeight(item.ioGroup, colW)));
-                height += (height > 0 ? ioGap : 0) + expandedH;
-            }
-            return height;
-        };
-        const topIOHeight = topIORows.length > 0 ? topIORows.reduce((acc, row, idx) => acc + calcIORowHeight(row) + (idx > 0 ? ioGap : 0), 0) : 0;
-        const bottomIOHeight = bottomIORows.length > 0 ? bottomIORows.reduce((acc, row, idx) => acc + calcIORowHeight(row) + (idx > 0 ? ioGap : 0), 0) : 0;
-        const rootStartY = 30 + (topIOHeight > 0 ? topIOHeight + ioGap : 0);
-        const svgH = 30 + topIOHeight + (topIOHeight > 0 ? ioGap : 0) + maxRootH + (bottomIOHeight > 0 ? ioGap + bottomIOHeight : 0) + 40;
-        assertActiveRenderGeneration(generation, '布局阶段');
-        setRenderProgress(25, '正在计算 DAG 布局…');
-        await nextFrame();
-
-        const svg = document.getElementById('dag-svg');
-        svg.onclick = () => clearEdgeFocus();
-        svg.setAttribute('width', svgW);
-        svg.setAttribute('height', svgH);
-        svg.innerHTML = `<defs></defs>
-        <g id="edge-overlay-layer"></g>`;
-        edgeOverlayLayer = document.getElementById('edge-overlay-layer');
-        if (!edgeOverlayLayer || edgeOverlayLayer.tagName !== 'g') {
-            edgeOverlayLayer = document.createElementNS('http://www.w3.org/2000/svg', 'g');
-            edgeOverlayLayer.setAttribute('id', 'edge-overlay-layer');
-            svg.appendChild(edgeOverlayLayer);
-        }
-        clearActiveEdgeOverlay();
-        assertActiveRenderGeneration(generation, 'SVG 初始化阶段');
-        setRenderProgress(30, '正在初始化画布…');
-        await nextFrame();
-
-        const rootPositions = [];
-        if (rootSizes.length > 0) {
-            const rs = rootSizes[0];
-            const rx = (svgW - rs.w) / 2;
-            const ry = rootStartY;
-            rootPositions.push({ id: rs.id, x: rx, y: ry, w: rs.w, h: rs.h });
-        }
-
-        function appendGroupInfoButton(g, cx, cy, titleText = '') {
-            if (!g || !g.src_file) return;
-            const hit = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
-            hit.setAttribute('cx', cx);
-            hit.setAttribute('cy', cy - 1);
-            hit.setAttribute('r', 9);
-            hit.setAttribute('class', 'group-info-hit');
-            hit.addEventListener('click', (e) => {
-                e.stopPropagation();
-                showSourcePanel(g);
-            });
-            svg.appendChild(hit);
-
-            const info = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-            info.setAttribute('x', cx);
-            info.setAttribute('y', cy - 1);
-            info.setAttribute('class', 'group-toggle group-info-text');
-            info.textContent = 'i';
-            if (titleText) {
-                const titleEl = document.createElementNS('http://www.w3.org/2000/svg', 'title');
-                titleEl.textContent = titleText;
-                info.appendChild(titleEl);
-            }
-            svg.appendChild(info);
-        }
-
-        __RENDER_GROUP_JS_PLACEHOLDER__
-
-        function renderNodeAt(nid, nx, ny, w, h) {
-            const n = nodeMap[nid];
-            if (!n) return;
-            const color = getNodeColor(n);
-
-            const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-            rect.setAttribute('x', nx); rect.setAttribute('y', ny);
-            rect.setAttribute('width', w); rect.setAttribute('height', h);
-            rect.setAttribute('class', 'leaf-node');
-            rect.setAttribute('fill', color);
-            rect.setAttribute('stroke', 'rgba(255,255,255,0.15)');
-            rect.style.cursor = 'pointer';
-            rect.dataset.nid = nid;
-            rect.addEventListener('mouseenter', (e) => showTooltip(e, n));
-            rect.addEventListener('mouseleave', hideTooltip);
-            rect.addEventListener('click', (e) => { e.stopPropagation(); showSourcePanel(n); });
-            svg.appendChild(rect);
-            registerNodeDom(nid, rect);
-
-            const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-            label.setAttribute('x', nx + w/2); label.setAttribute('y', ny + h/2);
-            label.setAttribute('class', 'node-label');
-            label.style.pointerEvents = 'none';
-            label.textContent = n.class_name;
-            svg.appendChild(label);
-
-            let subText = '';
-            if (n.has_timing) subText = `${n.pct.toFixed(1)}%`;
-            if (subText) {
-                const sub = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-                sub.setAttribute('x', nx + w/2); sub.setAttribute('y', ny + h/2 + 11);
-                sub.setAttribute('class', 'node-sublabel');
-                sub.style.pointerEvents = 'none';
-                sub.textContent = subText;
-                svg.appendChild(sub);
-            }
-
-            nodePortMap[nid] = { cx: nx + w/2, cy: ny + h/2 };
-            nodePortMap[nid + '__in'] = { cx: nx + w/2, cy: ny };
-            nodePortMap[nid + '__out'] = { cx: nx + w/2, cy: ny + h };
-        }
-
-        function registerEdgeDom(path, edgeData) {
-            if (!path || !edgeData) return;
-            const item = { path, edge: edgeData, key: edgeKey(edgeData) };
-            edgeDomRegistry.push(item);
-            edgeDomByKey.set(item.key, item);
-            for (const nid of [edgeData.from, edgeData.to]) { if (nid == null) continue; if (!edgeByNodeId.has(nid)) edgeByNodeId.set(nid, []); edgeByNodeId.get(nid).push(item); }
-            for (const nid of [edgeData.from, edgeData.to]) {
-                if (nid == null) continue;
-                const relatedGroupIds = new Set(nodeAncestorGroups.get(nid) ?? []);
-                if (groupMap[nid]) relatedGroupIds.add(nid);
-                for (const gid of relatedGroupIds) {
-                    if (!edgeByGroupId.has(gid)) edgeByGroupId.set(gid, []);
-                    edgeByGroupId.get(gid).push(item);
-                }
-            }
-        }
-
-        function showOverlapBadge(e, idx, total) {
-            let badge = document.getElementById('overlap-badge');
-            if (!badge) {
-                badge = document.createElement('div');
-                badge.id = 'overlap-badge';
-                badge.style.cssText = 'position:fixed;background:rgba(30,30,40,0.92);color:#e0e0e0;'
-                    + 'font-size:12px;padding:3px 8px;border-radius:4px;pointer-events:none;'
-                    + 'z-index:9999;white-space:nowrap;border:1px solid rgba(255,255,255,0.15);';
-                document.body.appendChild(badge);
-            }
-            badge.textContent = `${idx + 1}/${total}  ·  scroll to switch`;
-            badge.style.left = (e.clientX + 14) + 'px';
-            badge.style.top  = (e.clientY - 10) + 'px';
-            badge.style.display = 'block';
-        }
-        function hideOverlapBadge() {
-            const badge = document.getElementById('overlap-badge');
-            if (badge) badge.style.display = 'none';
-        }
-        function updateOverlapBadge() {
-            const badge = document.getElementById('overlap-badge');
-            if (!badge || hoveredEdges.length <= 1) return;
-            badge.textContent = `${hoveredEdgeIdx + 1}/${hoveredEdges.length}  ·  scroll to switch`;
-        }
-
-        function getHoveredEdgesFromEvent(e) {
-            const hitEls = document.elementsFromPoint(e.clientX, e.clientY);
-            const seen = new Set();
-            return hitEls
-                .filter(el => el && typeof el.hasAttribute === 'function' && el.hasAttribute('data-edge-key'))
-                .map(el => el.getAttribute('data-edge-key'))
-                .filter(key => {
-                    if (!key || seen.has(key)) return false;
-                    seen.add(key);
-                    return true;
-                })
-                .map(key => edgeDomByKey.get(key))
-                .filter(Boolean);
-        }
-
-        function bindEdgeInteractions(path, hitbox, edgeData) {
-            if (!path || !edgeData || !hitbox) return;
-            const key = edgeKey(edgeData);
-            const hoverTargets = [path, hitbox];
-            path._hitbox = hitbox;
-
-            const handleMouseEnter = (e) => {
-                hoveredEdges = getHoveredEdgesFromEvent(e);
-                hoveredEdgeIdx = hoveredEdges.findIndex(item => item.key === key);
-                if (hoveredEdgeIdx < 0) hoveredEdgeIdx = 0;
-                hoveredEdgeKey = hoveredEdges.length > 0 ? hoveredEdges[hoveredEdgeIdx].key : key;
-                applyEdgeFocusState();
-                if (hoveredEdges.length > 1) showOverlapBadge(e, hoveredEdgeIdx, hoveredEdges.length);
-                const handleMouseMove = (ev) => {
-                    const badge = document.getElementById('overlap-badge');
-                    if (badge && badge.style.display !== 'none') {
-                        badge.style.left = (ev.clientX + 14) + 'px';
-                        badge.style.top  = (ev.clientY - 10) + 'px';
-                    }
-                };
-                for (const target of hoverTargets) {
-                    target._overlapMoveHandler = handleMouseMove;
-                    target.addEventListener('mousemove', handleMouseMove);
-                }
-            };
-
-            const handleMouseLeave = () => {
-                for (const target of hoverTargets) {
-                    if (target._overlapMoveHandler) {
-                        target.removeEventListener('mousemove', target._overlapMoveHandler);
-                        target._overlapMoveHandler = null;
-                    }
-                }
-                hoveredEdges = [];
-                hoveredEdgeIdx = 0;
-                hoveredEdgeKey = null;
-                hideOverlapBadge();
-                applyEdgeFocusState();
-            };
-
-            const handleWheel = (e) => {
-                if (hoveredEdges.length <= 1) return;
-                e.preventDefault();
-                hoveredEdgeIdx = (hoveredEdgeIdx + (e.deltaY > 0 ? 1 : -1) + hoveredEdges.length) % hoveredEdges.length;
-                hoveredEdgeKey = hoveredEdges[hoveredEdgeIdx].key;
-                applyEdgeFocusState();
-                updateOverlapBadge();
-                showEdgePanel(hoveredEdges[hoveredEdgeIdx].edge);
-            };
-
-            const handleClick = (e) => {
-                e.stopPropagation();
-                const alreadyActive = focusedEdgePath === key;
-                if (alreadyActive) {
-                    focusedEdgePath = null;
-                    applyEdgeFocusState();
-                } else {
-                    setEdgeFocus(key);
-                }
-                showEdgePanel(edgeData);
-            };
-
-            for (const target of hoverTargets) {
-                target.addEventListener('mouseenter', handleMouseEnter);
-                target.addEventListener('mouseleave', handleMouseLeave);
-                target.addEventListener('wheel', handleWheel, { passive: false });
-                target.addEventListener('click', handleClick);
-            }
-            registerEdgeDom(path, edgeData);
-        }
-
-        function renderGroupTask(task) {
-            if (task.type === 'node') {
-                renderNodeAt(task.nid, task.x, task.y, task.w, task.h);
-                return;
-            }
-            if (task.type !== 'group') {
-                throw new Error(`renderGroupTask got unsupported task type: ${task.type}`);
-            }
-            const ctx = task.ctx;
-            if (!ctx || !ctx.g || !ctx.pos) {
-                throw new Error(`renderGroupTask got invalid context for task: ${task.taskKind || '<missing>'}`);
-            }
-            if (task.taskKind === 'collapsed_group') {
-                RENDER_GROUP_EXPORTS.renderCollapsedGroupBox(ctx);
-                RENDER_GROUP_EXPORTS.renderCollapsedGroupLabel(ctx);
-                RENDER_GROUP_EXPORTS.renderCollapsedGroupTiming(ctx);
-                RENDER_GROUP_EXPORTS.renderCollapsedGroupInfoButton(ctx);
-                RENDER_GROUP_EXPORTS.registerCollapsedGroupPorts(ctx);
-                return;
-            }
-            if (task.taskKind === 'expanded_group_shell') {
-                RENDER_GROUP_EXPORTS.renderExpandedGroupBox(ctx);
-                const { headerText } = RENDER_GROUP_EXPORTS.renderExpandedGroupHeaderLabel(ctx);
-                RENDER_GROUP_EXPORTS.renderExpandedGroupInfoButton(ctx, headerText);
-                RENDER_GROUP_EXPORTS.renderExpandedGroupTiming(ctx);
-                return;
-            }
-            if (task.taskKind === 'expanded_group_ports') {
-                RENDER_GROUP_EXPORTS.registerExpandedGroupPorts(ctx);
-                return;
-            }
-            throw new Error(`renderGroupTask got unknown taskKind: ${task.taskKind}`);
-        }
-
-        function collectGroupRenderTasks(items) {
-            const tasks = [];
-            function visitGroup(gid, ox, oy) {
-                const ctx = RENDER_GROUP_EXPORTS.getGroupRenderContext(gid, ox, oy);
-                if (!ctx || !ctx.pos) {
-                    throw new Error(`collectGroupRenderTasks missing layout for group: ${gid}`);
-                }
-                if (ctx.pos.collapsed) {
-                    tasks.push({ type: 'group', taskKind: 'collapsed_group', ctx });
-                    return;
-                }
-                tasks.push({ type: 'group', taskKind: 'expanded_group_shell', ctx });
-                for (const child of (ctx.pos.childPositions || [])) {
-                    if (child.type === 'node') {
-                        tasks.push({
-                            type: 'node',
-                            taskKind: 'node',
-                            nid: child.id,
-                            x: ctx.ox + child.x,
-                            y: ctx.oy + child.y,
-                            w: child.w,
-                            h: child.h,
-                        });
-                    } else if (child.type === 'group') {
-                        visitGroup(child.id, ctx.ox + child.x, ctx.oy + child.y);
-                    } else {
-                        throw new Error(`collectGroupRenderTasks got unknown child type: ${child.type}`);
-                    }
-                }
-                tasks.push({ type: 'group', taskKind: 'expanded_group_ports', ctx });
-            }
-            for (const item of items) {
-                visitGroup(item.id, item.x, item.y);
-            }
-            return tasks;
-        }
-
-        function collectGlobalEdgeTasks() {
-            const tasks = [];
-            for (const edge of (DATA.edges || [])) {
-                if (!isEdgeVisible(edge)) {
-                    continue;
-                }
-                tasks.push({ type: 'edge', taskKind: 'global_edge', edgeData: edge });
-            }
-            return tasks;
-        }
-
-        function renderIOPill(nid, cx, cy, w, h, label, sublabel, fillColor) {
-            const n = nodeMap[nid];
-            const x = cx - w/2;
-            const y = cy - h/2;
-            const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-            rect.setAttribute('x', x); rect.setAttribute('y', y);
-            rect.setAttribute('width', w); rect.setAttribute('height', h);
-            rect.setAttribute('rx', h / 2); rect.setAttribute('ry', h / 2);
-            rect.setAttribute('class', 'io-node');
-            rect.setAttribute('fill', fillColor);
-            rect.setAttribute('stroke', 'rgba(255,255,255,0.35)');
-            rect.setAttribute('stroke-width', '1.5');
-            if (n) {
-                rect.dataset.nid = nid;
-                rect.addEventListener('mouseenter', (e) => showTooltip(e, n));
-                rect.addEventListener('mouseleave', hideTooltip);
-                bindIONodeHover(rect, nid);
-            }
-            svg.appendChild(rect);
-            registerNodeDom(nid, rect);
-
-            const lab = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-            lab.setAttribute('x', cx); lab.setAttribute('y', sublabel ? cy - 2 : cy + 4);
-            lab.setAttribute('class', 'node-label');
-            lab.setAttribute('font-weight', '700');
-            lab.textContent = label;
-            svg.appendChild(lab);
-
-            if (sublabel) {
-                const sub = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-                sub.setAttribute('x', cx); sub.setAttribute('y', cy + 11);
-                sub.setAttribute('class', 'node-sublabel');
-                sub.textContent = sublabel;
-                svg.appendChild(sub);
-            }
-
-            nodePortMap[nid] = { cx, cy };
-            nodePortMap[nid + '__in'] = { cx, cy: y };
-            nodePortMap[nid + '__out'] = { cx, cy: y + h };
-        }
-
-        const IO_GROUP_FILL = {
-            input: 'rgba(46,204,113,0.55)',
-            param: 'rgba(155,89,182,0.55)',
-            const: 'rgba(241,196,15,0.55)',
-            output: 'rgba(231,76,60,0.55)',
-        };
-        const IO_GROUP_MEMBER_LABEL = { input: 'Input', param: 'Param', const: 'Const', output: 'Result' };
-
-        function renderIOGroupPill(ioGroup, cx, cy, w, h, availableW = svgW) {
-            const fillColor = IO_GROUP_FILL[ioGroup.io_subtype] || 'rgba(127,140,141,0.55)';
-            const memberLabel = IO_GROUP_MEMBER_LABEL[ioGroup.io_subtype] || ioGroup.io_subtype;
-            const isCollapsed = (ioGroup.id in collapsedState) ? collapsedState[ioGroup.id] : ioGroup.collapsed;
-            const renderCollapseButton = (bcx, bcy) => {
-                const bx = bcx - COLLAPSE_BUTTON_W / 2;
-                const by = bcy - COLLAPSE_BUTTON_H / 2;
-                const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-                rect.setAttribute('x', bx); rect.setAttribute('y', by);
-                rect.setAttribute('width', COLLAPSE_BUTTON_W); rect.setAttribute('height', COLLAPSE_BUTTON_H);
-                rect.setAttribute('rx', COLLAPSE_BUTTON_H / 2); rect.setAttribute('ry', COLLAPSE_BUTTON_H / 2);
-                rect.setAttribute('class', 'io-node io-group');
-                rect.setAttribute('fill', 'transparent');
-                rect.setAttribute('stroke', 'rgba(255,255,255,0.45)');
-                rect.setAttribute('stroke-width', '1.5');
-                rect.style.cursor = 'pointer';
-                rect.dataset.ioGroupId = ioGroup.id;
-                rect.addEventListener('dblclick', (e) => {
-                    e.stopPropagation();
-                    collapsedState[ioGroup.id] = true;
-                    invokeRender();
-                });
-                svg.appendChild(rect);
-
-                const lab = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-                lab.setAttribute('x', bcx); lab.setAttribute('y', bcy + 4);
-                lab.setAttribute('class', 'node-label');
-                lab.setAttribute('font-weight', '700');
-                lab.textContent = '▲ 收起';
-                lab.style.pointerEvents = 'none';
-                svg.appendChild(lab);
-            };
-            if (!isCollapsed) {
-                const members = ioGroup.member_ids || [];
-                if (members.length === 0) return 0;
-                const { cols, pillW, memberRows, height: expandedHeight } = computeIOGroupExpandedLayout(members.length, availableW);
-                const startY = cy - EXPANDED_IO_H / 2;
-                const frameX = cx - availableW / 2 + EXPAND_FRAME_PAD - 8;
-                const frameY = startY - 8;
-                const frameW = availableW - 2 * (EXPAND_FRAME_PAD - 8);
-                const frameH = expandedHeight + 8;
-                const frame = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-                frame.setAttribute('x', frameX); frame.setAttribute('y', frameY);
-                frame.setAttribute('width', frameW); frame.setAttribute('height', frameH);
-                frame.setAttribute('rx', 10); frame.setAttribute('ry', 10);
-                frame.setAttribute('fill', 'rgba(255,255,255,0.03)');
-                frame.setAttribute('stroke', fillColor);
-                frame.setAttribute('stroke-width', '1.5');
-                frame.setAttribute('stroke-dasharray', '5,4');
-                svg.appendChild(frame);
-
-                const truncateSublabel = (text) => {
-                    const limit = Math.max(1, Math.floor(pillW / 6.5));
-                    return text.length > limit ? `${text.slice(0, Math.max(0, limit - 1))}…` : text;
-                };
-                for (let rowIdx = 0; rowIdx < memberRows; rowIdx++) {
-                    const first = rowIdx * cols;
-                    const rowMemberCount = Math.max(0, Math.min(cols, members.length - first));
-                    const rowWidth = rowMemberCount * pillW + (rowMemberCount - 1) * pillGap;
-                    let left = cx - rowWidth / 2;
-                    const rowCy = startY + rowIdx * (EXPANDED_IO_H + EXPANDED_IO_GAP) + EXPANDED_IO_H / 2;
-                    for (let idx = 0; idx < rowMemberCount; idx++) {
-                        const memberId = members[first + idx];
-                        const node = nodeMap[memberId];
-                        const baseText = node ? node.class_name : memberLabel;
-                        const sublabel = (node && node.has_timing)
-                            ? `${baseText} · ${node.pct.toFixed(1)}%`
-                            : baseText;
-                        renderIOPill(memberId, left + pillW / 2, rowCy, pillW, EXPANDED_IO_H, memberLabel, truncateSublabel(sublabel), fillColor);
-                        left += pillW + pillGap;
-                    }
-                }
-                const collapseRowCy = frameY + frameH - COLLAPSE_BOTTOM_PADDING - COLLAPSE_BUTTON_H / 2;
-                renderCollapseButton(cx, collapseRowCy);
-                return expandedHeight;
-            }
-            const x = cx - w / 2;
-            const y = cy - h / 2;
-            const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-            rect.setAttribute('x', x); rect.setAttribute('y', y);
-            rect.setAttribute('width', w); rect.setAttribute('height', h);
-            rect.setAttribute('rx', h / 2); rect.setAttribute('ry', h / 2);
-            rect.setAttribute('class', 'io-node io-group');
-            rect.setAttribute('fill', fillColor);
-            rect.setAttribute('stroke', 'rgba(255,255,255,0.35)');
-            rect.setAttribute('stroke-width', '1.5');
-            rect.style.cursor = 'pointer';
-            rect.dataset.ioGroupId = ioGroup.id;
-            rect.addEventListener('dblclick', (e) => {
-                e.stopPropagation();
-                collapsedState[ioGroup.id] = false;
-                invokeRender();
-            });
-            svg.appendChild(rect);
-
-            const lab = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-            lab.setAttribute('x', cx); lab.setAttribute('y', cy + 4);
-            lab.setAttribute('class', 'node-label');
-            lab.setAttribute('font-weight', '700');
-            lab.textContent = `▶ ${ioGroup.label}`;
-            lab.style.pointerEvents = 'none';
-            svg.appendChild(lab);
-
-            nodePortMap[ioGroup.id] = { cx, cy };
-            nodePortMap[ioGroup.id + '__in'] = { cx, cy: y };
-            nodePortMap[ioGroup.id + '__out'] = { cx, cy: y + h };
-            return h;
-        }
-
-        function collectIORenderTasks(row, startY) {
-            if (!row || !row.items || row.items.length === 0) return { tasks: [], height: 0 };
-            let y = startY;
-            const tasks = [];
-            const inlineItems = [];
-            const expandedItems = [];
-            for (const item of row.items) {
-                if (item.isIOGroup === true) {
-                    const ioGroup = item.ioGroup;
-                    const isCollapsed = (ioGroup.id in collapsedState) ? collapsedState[ioGroup.id] : ioGroup.collapsed;
-                    if (!isCollapsed) {
-                        expandedItems.push(item);
-                        continue;
-                    }
-                }
-                inlineItems.push(item);
-            }
-
-            if (inlineItems.length > 0) {
-                const rowWidth = inlineItems.length * ioW + (inlineItems.length - 1) * pillGap;
-                let left = (svgW - rowWidth) / 2;
-                const cy = y + ioH / 2;
-                for (const item of inlineItems) {
-                    if (item.isIOGroup === true) {
-                        tasks.push({ type: 'io', taskKind: 'io_group', ioGroup: item.ioGroup, cx: left + ioW / 2, cy, w: ioW, h: ioH, availableW: svgW });
-                    } else {
-                        const nid = item.id;
-                        const node = nodeMap[nid];
-                        const baseText = node ? node.class_name : item.defaultSublabel;
-                        const sublabel = (node && node.has_timing)
-                            ? `${baseText} · ${node.pct.toFixed(1)}%`
-                            : baseText;
-                        tasks.push({ type: 'io', taskKind: 'io_pill', nid, cx: left + ioW / 2, cy, w: ioW, h: ioH, label: item.label, sublabel, fillColor: item.fillColor });
-                    }
-                    left += ioW + pillGap;
-                }
-                y += ioH;
-            }
-
-            if (expandedItems.length > 0) {
-                if (y > startY) y += ioGap;
-                const groupCount = expandedItems.length;
-                const colW = (svgW - (groupCount - 1) * EXPAND_COL_GAP) / groupCount;
-                const expandedHeight = Math.max(...expandedItems.map(item => calcIOGroupExpandedHeight(item.ioGroup, colW)));
-                let left = 0;
-                for (const item of expandedItems) {
-                    tasks.push({ type: 'io', taskKind: 'io_group', ioGroup: item.ioGroup, cx: left + colW / 2, cy: y + EXPANDED_IO_H / 2, w: ioW, h: ioH, availableW: colW });
-                    left += colW + EXPAND_COL_GAP;
-                }
-                y += expandedHeight;
-            }
-            return { tasks, height: y - startY };
-        }
-
-        function renderIOTask(task) {
-            if (task.type !== 'io') {
-                throw new Error(`renderIOTask got unsupported task type: ${task.type}`);
-            }
-            if (task.taskKind === 'io_group') {
-                renderIOGroupPill(task.ioGroup, task.cx, task.cy, task.w, task.h, task.availableW);
-                return;
-            }
-            if (task.taskKind === 'io_pill') {
-                renderIOPill(task.nid, task.cx, task.cy, task.w, task.h, task.label, task.sublabel, task.fillColor);
-                return;
-            }
-            throw new Error(`renderIOTask got unknown taskKind: ${task.taskKind}`);
-        }
-
-        const groupTasks = collectGroupRenderTasks(rootPositions);
-        const ioTasks = [];
-        let topIOY = 30;
-        for (const row of topIORows) {
-            const plan = collectIORenderTasks(row, topIOY);
-            ioTasks.push(...plan.tasks);
-            topIOY += plan.height + ioGap;
-        }
-        const rootEntry = rootPositions[0];
-        let bottomIOY = rootEntry ? (rootEntry.y + rootEntry.h + ioGap) : (rootStartY + maxRootH + ioGap);
-        for (const row of bottomIORows) {
-            const plan = collectIORenderTasks(row, bottomIOY);
-            ioTasks.push(...plan.tasks);
-            bottomIOY += plan.height + ioGap;
-        }
-
-        await runChunked(groupTasks.concat(ioTasks), async (task) => {
-            if (task.type === 'io') {
-                renderIOTask(task);
-                return;
-            }
-            renderGroupTask(task);
-        }, {
-            batchSize: 80,
-            phaseStart: 30,
-            phaseEnd: 60,
-            stageText: '正在渲染模块节点…',
-            generation,
-            allowedTypes: ['group', 'node', 'io'],
-        });
-
-        if (!edgeOverlayLayer) {
-            throw new Error('edge overlay layer missing after edge render');
-        }
-        svg.appendChild(edgeOverlayLayer);
-
-        setRenderProgress(90, '正在更新图例和摘要…');
-        await nextFrame();
-        const meta = DATA.meta;
-        if (DATA.has_timing) {
-            document.getElementById('mode-badge').innerHTML = '<span class="mode-badge mode-timing">📊 Structure + Timing</span>';
-            document.getElementById('meta-info').textContent = `Device: ${meta.device} | Step: ${meta.step_dur_str} | Modules: ${meta.num_modules}`;
-        } else {
-            document.getElementById('mode-badge').innerHTML = '<span class="mode-badge mode-structure">🏗️ Static Structure (source code)</span>';
-            document.getElementById('meta-info').textContent = `Modules: ${meta.num_modules} | Root: ${meta.roots ? meta.roots.join(", ") : "N/A"}`;
-        }
-
-        const legendDiv = document.getElementById('legend');
-        if (DATA.has_timing) {
-            legendDiv.innerHTML = `
-                <div class="legend-item"><div class="legend-dot" style="background:#2980b9"></div>&gt;20%</div>
-                <div class="legend-item"><div class="legend-dot" style="background:#27ae60"></div>10-20%</div>
-                <div class="legend-item"><div class="legend-dot" style="background:#8e44ad"></div>5-10%</div>
-                <div class="legend-item"><div class="legend-dot" style="background:#5a6c7d"></div>&lt;5%</div>
-                <div class="legend-item"><div class="legend-dot" style="background:#e74c3c"></div>Worker &gt;20%</div>
-                <div class="legend-item"><div class="legend-dot" style="background:#e67e22"></div>Worker 10-20%</div>`;
-        } else {
-            legendDiv.innerHTML = `
-                <div class="legend-item"><div class="legend-dot" style="background:#4a6fa5"></div>Depth 0</div>
-                <div class="legend-item"><div class="legend-dot" style="background:#5b8c5a"></div>Depth 1</div>
-                <div class="legend-item"><div class="legend-dot" style="background:#8e6fad"></div>Depth 2</div>
-                <div class="legend-item"><div class="legend-dot" style="background:#c77a3c"></div>Depth 3+</div>
-                <div class="legend-item" style="margin-left: 12px;"><span style="color:#64b5f6">▶</span> Click to expand</div>
-                <div class="legend-item" style="margin-left: 12px;"><span style="color:rgba(46,204,113,0.8)">━━▶</span> Data dependency</div>
-                <div class="legend-item"><span style="color:rgba(255,255,255,0.3)">╌╌▶</span> Sequential (fallback)</div>`;
-        }
-
-        const summaryDiv = document.getElementById('summary');
-        const allNodes = DATA.nodes;
-        const allGroups = DATA.groups;
-        if (DATA.has_timing) {
-            const topN = [...allNodes, ...allGroups].filter(x => x.has_timing).sort((a,b) => b.pct - a.pct).slice(0,5);
-            summaryDiv.innerHTML = `<h3>📊 Top Modules by Time</h3><p>${
-                topN.map(x => `<b>${x.label || x.class_name}</b> ${x.pct.toFixed(1)}%`).join(' → ')
-            }</p>`;
-        } else {
-            summaryDiv.innerHTML = `<h3>🏗️ Architecture Summary</h3><p>Module count: ${allNodes.length + allGroups.length} | Expandable containers: ${allGroups.length} | Leaf nodes: ${allNodes.length}<br><i>Click ▶ collapsed containers to expand. Provide --trace-file for timing overlay.</i></p>`;
-        }
-        assertActiveRenderGeneration(generation, '收尾阶段');
-        setRenderProgress(98, '正在更新图例和摘要…');
-        await nextFrame();
-        assertActiveRenderGeneration(generation, '完成阶段');
-        await hideRenderProgress();
-    } catch (err) {
-        if (renderGeneration === generation) {
-            const progressEls = getRenderProgressElements();
-            progressEls.overlay.classList.remove('closing');
-            progressEls.overlay.classList.add('visible', 'failed');
-            progressEls.overlay.setAttribute('aria-hidden', 'false');
-            const lastProgress = Number(progressEls.overlay.dataset.progress || 0);
-            setRenderProgress(Number.isFinite(lastProgress) ? Math.min(99, lastProgress) : 0, '渲染失败，请查看 Console 错误');
-        }
-        throw err;
-    }
+    throw new Error('Legacy SVG render path has been removed; Canvas Phase 1 requires render_canvas.js');
 }
 
 function toggleGroup(gid) {
@@ -2350,16 +1798,16 @@ document.getElementById('btn-collapse-all').addEventListener('click', () => {
     invokeRender();
 });
 document.getElementById('btn-fit').addEventListener('click', () => {
-    const container = document.getElementById('dag-container');
-    const svgEl = document.getElementById('dag-svg');
-    const sw = parseInt(svgEl.getAttribute('width'));
-    const cw = container.clientWidth;
-    if (sw > cw) {
-        svgEl.style.transform = `scale(${(cw / sw).toFixed(3)})`;
-        svgEl.style.transformOrigin = 'top left';
-    } else {
-        svgEl.style.transform = '';
+    if (typeof window.__canvasEnginePhase1 !== 'function') {
+        throw new Error('Canvas engine accessor __canvasEnginePhase1 is missing');
     }
+    const engine = window.__canvasEnginePhase1();
+    if (!engine || !engine.viewportController || typeof engine.viewportController.fitToView !== 'function') {
+        throw new Error('Canvas viewport controller is unavailable');
+    }
+    const container = document.getElementById('dag-container');
+    const containerWidth = container && Number(container.clientWidth);
+    engine.viewportController.fitToView(engine.worldBounds, containerWidth);
 });
 
 invokeRender();
@@ -2612,8 +2060,8 @@ def _generate_flowchart_html_multi(tabs: dict[str, list[dict]]) -> str:
         "function _ensureDagShell() {\n"
         "    var dagContainer = document.getElementById(\"dag-container\");\n"
         "    if (!dagContainer) return;\n"
-        "    if (!document.getElementById(\"dag-svg\")) {\n"
-        "        dagContainer.innerHTML = '<svg class=\"dag-svg\" id=\"dag-svg\"></svg>';\n"
+        "    if (!document.getElementById(\"dag-stage\")) {\n"
+        "        dagContainer.innerHTML = '<div class=\"dag-stage\" id=\"dag-stage\"></div>';\n"
         "    }\n"
         "}\n"
         "function _showErrorPanel(errMsg, warnings) {\n"
