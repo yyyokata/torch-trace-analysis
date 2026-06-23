@@ -179,6 +179,8 @@
             initialized: false,
             initPromise: null,
             hasRenderedOnce: false,
+            lastKnownContainerW: null,
+            lastKnownContainerH: null,
             nodes: [],
             groups: [],
             edges: [],
@@ -370,6 +372,21 @@
     function getContainerHeight(container) {
         if (!container) { return null; }
         return numericOrNull(container.clientHeight || container.offsetHeight || container.height);
+    }
+
+    function resolveContainerSize(context) {
+        let cw = getContainerWidth(engine.container);
+        let ch = getContainerHeight(engine.container);
+        if (cw !== null && cw > 0 && ch !== null && ch > 0) {
+            engine.lastKnownContainerW = cw;
+            engine.lastKnownContainerH = ch;
+            return { w: cw, h: ch };
+        }
+        if (engine.lastKnownContainerW !== null && engine.lastKnownContainerW > 0 &&
+                engine.lastKnownContainerH !== null && engine.lastKnownContainerH > 0) {
+            return { w: engine.lastKnownContainerW, h: engine.lastKnownContainerH };
+        }
+        throw new Error('render_canvas.js: ' + context + ' requires positive container dimensions');
     }
 
     function applyViewport() {
@@ -1092,13 +1109,9 @@
         // the viewport so the whole DAG fits inside this fixed canvas.  Sizing the
         // renderer to svgW x svgH blows the canvas up to the entire graph and pushes
         // everything off-screen, which defeats the first-screen auto-fit.
-        const cw = getContainerWidth(engine.container);
-        const ch = getContainerHeight(engine.container);
-        if (cw === null || cw <= 0 || ch === null || ch <= 0) {
-            throw new Error('render_canvas.js: applyWorldLayout requires positive container dimensions');
-        }
+        const containerSize = resolveContainerSize('applyWorldLayout');
         if (engine.app && engine.app.renderer && typeof engine.app.renderer.resize === 'function') {
-            engine.app.renderer.resize(Math.ceil(cw), Math.ceil(ch));
+            engine.app.renderer.resize(Math.ceil(containerSize.w), Math.ceil(containerSize.h));
         }
         applyViewport();
     }
@@ -1117,11 +1130,9 @@
         if (!engine.worldBounds) {
             throw new Error('render_canvas.js: auto-fit requires worldBounds');
         }
-        const cw = getContainerWidth(engine.container);
-        const ch = getContainerHeight(engine.container);
-        if (cw === null || cw <= 0 || ch === null || ch <= 0) {
-            throw new Error('render_canvas.js: auto-fit requires positive container dimensions');
-        }
+        const containerSize = resolveContainerSize('auto-fit');
+        const cw = containerSize.w;
+        const ch = containerSize.h;
         const FIT_PADDING = 40;
         const vp = engine.viewportController.fitToView(engine.worldBounds, cw, ch, { padding: FIT_PADDING, maxScale: 1.0 });
         // Width-only fit: the canvas width fills the container so there is no
