@@ -1250,6 +1250,10 @@
             // making the canvas ~2.5x taller than expected and breaking layout.
             engine.app.canvas.style.width = '100%';
         }
+        // Apply the computed viewport transform to the world container.
+        // renderer.resize() may reset internal transforms; applyViewport() must
+        // be called AFTER resize so engine.world.x/y/scale reflect the fit result.
+        applyViewport();
         // The width-only fit top-aligns the world at y = padding inside a canvas
         // that was just grown to the full (tall) content height.  Growing the
         // canvas turns the #dag-stage into a vertical scroll container; on some
@@ -1259,6 +1263,11 @@
         // top so the freshly top-aligned fit is actually what the user sees.
         if (engine.container && typeof engine.container.scrollTop !== 'undefined') {
             engine.container.scrollTop = 0;
+        }
+        // Also snap the page scroll to top so the canvas header (title, tabs,
+        // legend) is visible and Input/Const nodes are in the initial viewport.
+        if (global.window && typeof global.window.scrollTo === 'function') {
+            global.window.scrollTo(0, 0);
         }
         return vp;
     }
