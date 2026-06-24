@@ -232,8 +232,8 @@
                     await eng.app.init({
                         backgroundAlpha: 0,
                         antialias: true,
-                        autoDensity: true,
-                        resolution: (global.devicePixelRatio || 1),
+                        autoDensity: false,
+                        resolution: 1,
                         preference: 'webgl',
                         width: Math.max(1, getContainerWidth(eng.container) || 1280),
                         height: Math.max(1, getContainerHeight(eng.container) || 720)
@@ -241,12 +241,6 @@
                 }
                 if (eng.app.canvas && typeof eng.container.appendChild === 'function') {
                     eng.container.appendChild(eng.app.canvas);
-                    // PixiJS autoDensity writes canvas.style.width = physicalPx + 'px' as inline
-                    // style, which overrides CSS class rules (e.g. max-width: 100%).  Force
-                    // width: 100% here so the canvas never inflates the container.
-                    // Do NOT clear style.height: with autoDensity+resolution=DPR, the renderer
-                    // sets style.height to the correct CSS-px value; clearing it would revert to
-                    // the physical-pixel height attribute (~DPR x too tall).
                     if (eng.app.canvas) {
                         eng.app.canvas.style.width = '100%';
                     }
@@ -1205,8 +1199,6 @@
             engine.app.renderer.resize(Math.ceil(containerSize.w), Math.ceil(containerSize.h));
         }
         if (engine.app && engine.app.canvas) {
-            // autoDensity sets style.width/height to CSS-px values; keep width=100% for
-            // horizontal fill but do NOT clear style.height (see performAutoFit comment).
             engine.app.canvas.style.width = '100%';
         }
         applyViewport();
@@ -1243,11 +1235,6 @@
             engine.app.renderer.resize(Math.ceil(cw), canvasHeight);
         }
         if (engine.app && engine.app.canvas) {
-            // Keep width=100% so the canvas fills the container horizontally.
-            // Do NOT clear style.height: PixiJS autoDensity+resolution=DPR sets
-            // style.height = canvasHeight+'px' (CSS px) on resize; clearing it
-            // reverts to the physical-pixel height attribute (~DPR x too tall),
-            // making the canvas ~2.5x taller than expected and breaking layout.
             engine.app.canvas.style.width = '100%';
         }
         // Apply the computed viewport transform to the world container.
@@ -1264,15 +1251,53 @@
         if (engine.container && typeof engine.container.scrollTop !== 'undefined') {
             engine.container.scrollTop = 0;
         }
-        // Chrome scroll anchoring fires after the resize reflow, which can override a
-        // same-frame scrollTo(0,0).  Schedule a second rAF so the snap runs *after*
-        // anchoring has settled.
-        if (global.window && typeof global.window.scrollTo === 'function') {
-            global.window.scrollTo(0, 0);
+        // The top IO pills are laid out correctly (cy≈50), but page chrome above the
+        // canvas can still leave them below the initial viewport on high-DPR setups.
+        // Scroll to the document Y of the top-most IO pill (rather than merely page
+        // top) so Input/Const are visible on first paint regardless of header height.
+        if (global.window && global.document && typeof global.window.scrollTo === 'function') {
             var _win = global.window;
+            var _doc = global.document;
+            var snapToTopInput = function () {
+                var canvas = engine.app && engine.app.canvas;
+                if (!canvas || typeof canvas.getBoundingClientRect !== 'function') {
+                    _win.scrollTo(0, 0);
+                    return;
+                }
+                var currentY = numericOrNull(_win.scrollY);
+                if (currentY === null && _doc.documentElement) {
+                    currentY = numericOrNull(_doc.documentElement.scrollTop);
+                }
+                if (currentY === null && _doc.body) {
+                    currentY = numericOrNull(_doc.body.scrollTop);
+                }
+                if (currentY === null) {
+                    currentY = 0;
+                }
+                var topPill = null;
+                (engine.io_pills || []).forEach(function (pill) {
+                    if (!pill || !Number.isFinite(pill.cy)) {
+                        return;
+                    }
+                    if (!topPill || pill.cy < topPill.cy) {
+                        topPill = pill;
+                    }
+                });
+                var rect = canvas.getBoundingClientRect();
+                var margin = 24;
+                var revealY = rect.top;
+                if (topPill && engine.viewport && Number.isFinite(engine.viewport.scale) && Number.isFinite(engine.viewport.y)) {
+                    revealY += engine.viewport.y + topPill.cy * engine.viewport.scale;
+                }
+                var targetY = Math.max(0, Math.round(currentY + revealY - margin));
+                _win.scrollTo(0, targetY);
+            };
+            snapToTopInput();
             if (typeof _win.requestAnimationFrame === 'function') {
                 _win.requestAnimationFrame(function () {
-                    _win.scrollTo(0, 0);
+                    _win.requestAnimationFrame(function () {
+                        snapToTopInput();
+                    });
                 });
             }
         }
@@ -1389,8 +1414,6 @@
             if (wantAutoFit) {
                 if (engine.app && engine.app.canvas) {
                     engine.app.canvas.style.width = '100%';
-                    // Do NOT clear style.height here; performAutoFit will resize the
-                    // renderer and autoDensity will set the correct CSS-px height.
                 }
                 await requestAnimationFramePromise(function () {
                     return performAutoFit();
