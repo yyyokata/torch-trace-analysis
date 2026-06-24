@@ -1706,9 +1706,24 @@
         engine.collapsedStateRef = ctx.collapsedState;
     }
 
-    function makeIncrGroupSnapshot(g, collapsed) {
+    function requireFiniteXYWH(kind, id, meta) {
+        if (!meta) {
+            throw new Error('computeVisibleScene: ' + kind + ' ' + id + ' has no layout meta in groupLayout');
+        }
+        if (!Number.isFinite(meta.x) || !Number.isFinite(meta.y) ||
+            !Number.isFinite(meta.w) || !Number.isFinite(meta.h)) {
+            throw new Error('computeVisibleScene: ' + kind + ' ' + id + ' has incomplete layout meta {x,y,w,h}');
+        }
+    }
+
+    function makeIncrGroupSnapshot(g, collapsed, groupMeta) {
+        // groupMeta carries the *real* absolute layout box (x/y/w/h) for the
+        // current collapsed state — never fabricate (0,0).  A missing/partial
+        // meta is a hard error (no silent fallback): it means computeVisibleScene
+        // walked a group the freshly-computed layout never positioned.
+        requireFiniteXYWH('group', g.id, groupMeta);
         return {
-            x: 0, y: 0, w: 200, h: 80,
+            x: groupMeta.x, y: groupMeta.y, w: groupMeta.w, h: groupMeta.h,
             label: String((g.label !== undefined && g.label !== null) ? g.label : (g.attr_name !== undefined && g.attr_name !== null ? g.attr_name : g.id)),
             type: String(g.node_type || 'module'),
             collapsed: collapsed[g.id] === true,
@@ -1718,9 +1733,12 @@
         };
     }
 
-    function makeIncrNodeSnapshot(n) {
+    function makeIncrNodeSnapshot(n, nodeMeta) {
+        // nodeMeta carries the *real* absolute layout box (x/y/w/h) for the
+        // current collapsed state.  Missing/partial meta is a hard error.
+        requireFiniteXYWH('node', n.id, nodeMeta);
         return {
-            x: 0, y: 0, w: 100, h: 40,
+            x: nodeMeta.x, y: nodeMeta.y, w: nodeMeta.w, h: nodeMeta.h,
             label: String((n.label !== undefined && n.label !== null) ? n.label : (n.attr_name !== undefined && n.attr_name !== null ? n.attr_name : n.id)),
             sublabel: String(n.class_name || ''),
             fill: 0x4a6fa5,
@@ -1729,14 +1747,80 @@
         };
     }
 
-    function makeIncrEdgeSnapshot(/* e */) {
+    function makeIncrEdgeSnapshot(e, edgeMeta) {
+        // edgeMeta.points is the real polyline derived from the visible
+        // endpoints' layout centres (computed against the same fresh layout as
+        // the node/group snapshots).  Edges are not stroked by the incremental
+        // patch path yet (patchEdgeView only updates alpha) but the snapshot
+        // still carries truthful geometry instead of the old (0,0)->(10,10) stub.
+        if (!edgeMeta || !Array.isArray(edgeMeta.points) || edgeMeta.points.length < 2) {
+            throw new Error('computeVisibleScene: edge ' +
+                (e && e.from !== undefined ? e.from : '?') + '->' + (e && e.to !== undefined ? e.to : '?') +
+                ' has no polyline meta from layout');
+        }
         return {
-            points: [{ x: 0, y: 0 }, { x: 10, y: 10 }],
+            points: edgeMeta.points,
             stroke: 0xaaaaaa,
             strokeWidth: 1.0,
             alpha: 1.0,
             dashed: false
         };
+    }
+
+    // Recompute the flowchart layout for the *current* ``collapsedState`` and
+    // flatten it into per-id absolute-coordinate meta maps.  This is the
+    // coordinate source for the incremental snapshots.
+    //
+    // Why not index ``engine.nodes`` / ``engine.groups`` (as the obvious "reuse
+    // the cache" idea suggests)?  Two source-verified reasons:
+    //   1. The walkGroup pass only pushes the *load-time visible* set, so every
+    //      node hidden inside an initially-collapsed group (default rule:
+    //      ``depth >= 2``) is absent — Expand-All would have nothing to read and
+    //      would throw for thousands of nodes.
+    //   2. Coordinates shift on every collapse/expand (the DAG re-flows), so the
+    //      load-time cache is stale the moment ``collapsedState`` changes.
+    // Recomputing the pure layout (no draw / no resize / no resetScene) yields
+    // correct, complete coordinates for whatever the next visible set will be.
+    function computeLayoutMeta(data) {
+        const computeLayout = requireInline('computeFlowchartLayout', lookupComputeFlowchartLayout());
+        resetInlineLayoutCache();
+        const layoutInfo = computeLayout(data, resolveContainerSize('computeVisibleScene').w);
+        const layoutMap = lookupGroupLayout();
+        if (!layoutMap) {
+            throw new Error('render_canvas.js: computeVisibleScene requires groupLayout after computeFlowchartLayout');
+        }
+        const nodeMeta = new Map();
+        const groupMeta = new Map();
+        function walk(gid, ox, oy) {
+            const pos = layoutMap[gid];
+            if (!pos) {
+                throw new Error('render_canvas.js: computeVisibleScene missing layout for group ' + gid);
+            }
+            groupMeta.set(String(gid), { x: ox, y: oy, w: pos.w, h: pos.h, collapsed: pos.collapsed === true });
+            if (pos.collapsed) { return; }
+            (pos.childPositions || []).forEach(function (child) {
+                const cx = ox + child.x;
+                const cy = oy + child.y;
+                if (child.type === 'node') {
+                    nodeMeta.set(String(child.id), { x: cx, y: cy, w: child.w, h: child.h });
+                } else if (child.type === 'group') {
+                    walk(child.id, cx, cy);
+                } else {
+                    throw new Error('render_canvas.js: computeVisibleScene unknown layout child type: ' + child.type);
+                }
+            });
+        }
+        (layoutInfo.rootPositions || []).forEach(function (root) {
+            walk(root.id, root.x, root.y);
+        });
+        return { nodeMeta: nodeMeta, groupMeta: groupMeta };
+    }
+
+    function edgeEndpointCenter(metaMaps, id) {
+        const key = String(id);
+        const m = metaMaps.nodeMeta.get(key) || metaMaps.groupMeta.get(key);
+        if (!m) { return null; }
+        return { x: m.x + m.w / 2, y: m.y + m.h / 2 };
     }
 
     function computeVisibleScene() {
@@ -1753,6 +1837,12 @@
         (data.groups || []).forEach(function (g) { groupById.set(String(g.id), g); });
         const nodeById = new Map();
         (data.nodes || []).forEach(function (n) { nodeById.set(String(n.id), n); });
+
+        // Real, current-state coordinates for every node/group the visible walk
+        // can possibly reach (see computeLayoutMeta's rationale).
+        const layoutMeta = computeLayoutMeta(data);
+        const nodeMetaById = layoutMeta.nodeMeta;
+        const groupMetaById = layoutMeta.groupMeta;
 
         const groupIds = [];
         const nodeIds = [];
@@ -1778,7 +1868,7 @@
             }
             visibleGroupSet.add(gid);
             groupIds.push(gid);
-            groupSnapshots[gid] = makeIncrGroupSnapshot(g, collapsed);
+            groupSnapshots[gid] = makeIncrGroupSnapshot(g, collapsed, groupMetaById.get(gid));
             if (collapsed[g.id] === true) { continue; }
             (g.children_group_ids || []).forEach(function (cgid) {
                 const sgid = String(cgid);
@@ -1793,7 +1883,7 @@
                     if (!node) {
                         throw new Error('render_canvas.js: computeVisibleScene found children_nodes entry with no matching node: ' + snid);
                     }
-                    nodeSnapshots[snid] = makeIncrNodeSnapshot(node);
+                    nodeSnapshots[snid] = makeIncrNodeSnapshot(node, nodeMetaById.get(snid));
                 }
             });
         }
@@ -1811,8 +1901,17 @@
                 : (fromS + '||' + toS + '||' + (e && e.type ? e.type : '') + '||' + (e && e.parent_class ? e.parent_class : ''));
             if (!key || seenEdgeKeys.has(key)) { return; }
             seenEdgeKeys.add(key);
+            // Build a real polyline from the visible endpoints' layout centres.
+            // Both endpoints are guaranteed visible by the filter above, so a
+            // missing centre means a layout/visibility mismatch — hard error.
+            const fromCenter = edgeEndpointCenter(layoutMeta, fromS);
+            const toCenter = edgeEndpointCenter(layoutMeta, toS);
+            if (!fromCenter || !toCenter) {
+                throw new Error('render_canvas.js: computeVisibleScene visible edge ' + fromS + '->' + toS +
+                    ' has an endpoint with no layout meta');
+            }
             edgeKeys.push(key);
-            edgeSnapshots[key] = makeIncrEdgeSnapshot(e);
+            edgeSnapshots[key] = makeIncrEdgeSnapshot(e, { points: [fromCenter, toCenter] });
         });
 
         return {
@@ -1823,25 +1922,6 @@
             nodeSnapshots: nodeSnapshots,
             edgeSnapshots: edgeSnapshots
         };
-    }
-
-    function populateIncrementalScene() {
-        // After the legacy initial render finishes, seed the pool + ``visible*``
-        // sets so the very first ``invokeIncrementalRender`` (e.g. user's first
-        // toggle / Expand-All click) has a valid ``prev`` snapshot to diff
-        // against.  Without this seed, a subsequent Collapse-All would run
-        // ``patchGroups`` with a stale empty prev and the recycle path would
-        // throw "missing groupView in pool".
-        ensureEngine();
-        if (!engine.dataRef || !engine.collapsedStateRef) {
-            // Inline runtime is responsible for installing the context; if it
-            // hasn't, leave the visible sets empty so the next toggle path
-            // raises a hard error instead of silently no-op'ing.
-            return;
-        }
-        const next = computeVisibleScene();
-        const prev = { groupIds: [], nodeIds: [], edgeKeys: [] };
-        diffAndPatch(prev, next);
     }
 
     function invokeIncrementalRender() {
@@ -2126,16 +2206,18 @@
                 await p.hideRenderProgress();
                 return;
             }
-            // Phase 2 step 4: seed the object pool + ``visible*`` sets so the
-            // first toggle / Expand-All / Collapse-All click has a valid prev
-            // basis to diff against.  This runs after the legacy walkGroup /
-            // drawGlobalEdges path has already drawn the scene, so visually we
-            // briefly carry both sets of display objects; that's an accepted
-            // tradeoff while the full migration to a pool-only init path is
-            // out of scope for Step 4 (see design/frontend_canvas_phase2.md
-            // §2.4.1 — "init via diffAndPatch(empty, firstVisible)" is the
-            // future-state target).
-            populateIncrementalScene();
+            // Phase 2 step 4 fix: the object pool is NOT seeded here.  The
+            // initial render draws the whole scene through the legacy walkGroup /
+            // drawGlobalEdges path (correct, fitted coordinates); seeding the
+            // pool on top of it used to double-draw every glyph and — with the
+            // old (0,0) snapshot stub — stacked the entire pool in the top-left
+            // corner.  The pool now fills lazily on the first toggle:
+            // ``invokeIncrementalRender`` runs ``diffAndPatch(emptyPrev, computed)``
+            // where ``computed`` carries real, current-state coordinates from
+            // ``computeLayoutMeta``.  ``engine.dataRef`` / ``collapsedStateRef``
+            // are still installed (by the inline runtime via
+            // ``__canvasSetIncrementalContext``) so that first toggle has its
+            // context.  Subsequent toggles diff against the previous visible sets.
             await p.hideRenderProgress();
             return buildSnapshot();
         } catch (err) {
