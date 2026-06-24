@@ -54,6 +54,7 @@ FLOWCHART_HTML_TEMPLATE = r"""<!DOCTYPE html>
 <title>Module DAG Flowchart - Torch Trace Analyzer</title>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { overflow-anchor: none; }
 body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #1a1a2e; color: #e0e0e0; padding: 20px; min-height: 100vh; }
 .header { text-align: center; margin-bottom: 24px; }
 .header h1 { font-size: 22px; color: #ffffff; margin-bottom: 6px; }
@@ -66,7 +67,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 .controls button:hover { background: rgba(255,255,255,0.15); color: #fff; }
 .controls button.active { background: rgba(100,181,246,0.2); border-color: #64b5f6; color: #64b5f6; }
 .dag-container { width: 100%; overflow-x: hidden; position: relative; }
-.dag-stage { display: block; margin: 0 auto; width: 100%; overflow: visible; }
+.dag-stage { display: block; margin: 0 auto; width: 100%; overflow: visible; overflow-anchor: none; }
 .dag-stage canvas { display: block; width: 100%; }
 .tooltip { position: fixed; background: #16213e; border: 1px solid rgba(100,181,246,0.3); border-radius: 8px; padding: 10px 14px; font-size: 11px; color: #e0e0e0; pointer-events: none; z-index: 1000; max-width: 300px; box-shadow: 0 4px 20px rgba(0,0,0,0.4); opacity: 0; transition: opacity 0.15s; }
 .tooltip.visible { opacity: 1; }
