@@ -189,6 +189,7 @@
             labels: [],
             cullingEnabled: true,
             worldBounds: null,
+            contentBounds: null,
             viewport: {
                 scale: 1,
                 x: 0,
@@ -437,6 +438,37 @@
             throw new Error('render_canvas.js: fitToView got invalid worldBounds');
         }
         return { x: x, y: y, w: w, h: h };
+    }
+
+    function expandBounds(acc, rect) {
+        const bounds = normalizeWorldBounds(rect);
+        if (!acc) {
+            return { x: bounds.x, y: bounds.y, w: bounds.w, h: bounds.h };
+        }
+        const minX = Math.min(acc.x, bounds.x);
+        const minY = Math.min(acc.y, bounds.y);
+        const maxX = Math.max(acc.x + acc.w, bounds.x + bounds.w);
+        const maxY = Math.max(acc.y + acc.h, bounds.y + bounds.h);
+        return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
+    }
+
+    function computeRenderableContentBounds() {
+        let bounds = null;
+        (engine.groups || []).forEach(function (g) {
+            bounds = expandBounds(bounds, { x: g.x, y: g.y, w: g.w, h: g.h });
+        });
+        (engine.io_pills || []).forEach(function (pill) {
+            bounds = expandBounds(bounds, {
+                x: pill.cx - pill.w / 2,
+                y: pill.cy - pill.h / 2,
+                w: pill.w,
+                h: pill.h
+            });
+        });
+        if (!bounds) {
+            throw new Error('render_canvas.js: auto-fit requires rendered content bounds');
+        }
+        return bounds;
     }
 
     function ViewportController(owner) {
@@ -1148,6 +1180,7 @@
         engine.io_pills = [];
         engine.labelsCreated = 0;
         engine.labels = [];
+        engine.contentBounds = null;
         const map = lookupNodePortMap();
         if (map) {
             Object.keys(map).forEach(function (k) { delete map[k]; });
@@ -1191,16 +1224,18 @@
         if (!engine.worldBounds) {
             throw new Error('render_canvas.js: auto-fit requires worldBounds');
         }
+        const fitBounds = computeRenderableContentBounds();
+        engine.contentBounds = fitBounds;
         const containerSize = resolveContainerSize('auto-fit');
         const cw = containerSize.w;
         const ch = containerSize.h;
         const FIT_PADDING = 40;
-        const vp = engine.viewportController.fitToView(engine.worldBounds, cw, ch, { padding: FIT_PADDING, maxScale: 1.0 });
+        const vp = engine.viewportController.fitToView(fitBounds, cw, ch, { padding: FIT_PADDING, maxScale: 1.0 });
         // Width-only fit: the canvas width fills the container so there is no
         // horizontal scroll.  The height is grown to the full scaled content so a
         // graph taller than the viewport overflows into the .dag-stage's vertical
         // scroll (matches the legacy SVG semantics) instead of being squeezed.
-        const contentHeight = Math.ceil(engine.worldBounds.h * vp.scale + 2 * FIT_PADDING);
+        const contentHeight = Math.ceil(fitBounds.h * vp.scale + 2 * FIT_PADDING);
         const canvasHeight = Math.max(Math.ceil(ch), contentHeight);
         if (engine.app && engine.app.renderer && typeof engine.app.renderer.resize === 'function') {
             engine.app.renderer.resize(Math.ceil(cw), canvasHeight);
