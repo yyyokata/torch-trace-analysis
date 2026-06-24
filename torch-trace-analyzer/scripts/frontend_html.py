@@ -2118,7 +2118,19 @@ def _generate_flowchart_html_multi(tabs: dict[str, list[dict]]) -> str:
         "    if (typeof indexGroupAncestors === \"function\" && DATA.root_groups) {\n"
         "        indexGroupAncestors(DATA.root_groups.map(rid => groupMap[rid]).filter(Boolean));\n"
         "    }\n"
+        # Re-seed io_group member -> io_group ancestor mapping that
+        # _resetSharedState() cleared.  Mirrors the initial-load setup in
+        # _generate_flowchart_html.  Without this, nodes living as members of
+        # a collapsed io_group lose their ancestor mapping after a tab switch,
+        # so resolveCollapsedAncestor() falls through to the raw node id
+        # (never registered in nodePortMap for collapsed io_groups) and
+        # drawGlobalEdges throws "global edge endpoint missing".
+        "    (DATA.io_groups || []).forEach(g => {\n"
+        "        (g.member_ids || []).forEach(nid => nodeAncestorGroups.set(nid, [g.id]));\n"
+        "    });\n"
         "    DATA.groups.forEach(g => { collapsedState[g.id] = g.depth >= 2 || g.is_native === true || g.synthetic_type === 'function_group' || g.synthetic_type === 'callloc_group'; });\n"
+        # Re-seed io_group collapsedState defaults that _resetSharedState() cleared.
+        "    (DATA.io_groups || []).forEach(g => { if (!(g.id in collapsedState)) collapsedState[g.id] = g.collapsed; });\n"
         "}\n"
         "function activateL1(mode) {\n"
         "    ACTIVE_L1 = mode;\n"
@@ -2303,7 +2315,15 @@ def _generate_flowchart_html_dual(data_train, data_infer):
         '    if (typeof indexGroupAncestors === "function" && DATA.root_groups){\n'
         '      indexGroupAncestors(DATA.root_groups.map(rid => groupMap[rid]).filter(Boolean));\n'
         '    }\n'
+        # Re-seed io_group member -> io_group ancestor mapping that
+        # _resetSharedState() cleared (see _generate_flowchart_html_multi for
+        # the full root-cause comment).
+        '    (DATA.io_groups || []).forEach(g => {\n'
+        '      (g.member_ids || []).forEach(nid => nodeAncestorGroups.set(nid, [g.id]));\n'
+        '    });\n'
         '    DATA.groups.forEach(g => { collapsedState[g.id] = g.depth >= 2 || g.is_native === true; });\n'
+        # Re-seed io_group collapsedState defaults that _resetSharedState() cleared.
+        '    (DATA.io_groups || []).forEach(g => { if (!(g.id in collapsedState)) collapsedState[g.id] = g.collapsed; });\n'
         '  }\n'
         '  function activateTab(mode){\n'
         '    var btns = document.querySelectorAll(".iter14-tab");\n'
