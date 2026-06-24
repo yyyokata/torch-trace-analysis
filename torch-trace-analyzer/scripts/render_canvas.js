@@ -221,23 +221,38 @@
         return engine;
     }
 
-    function ensureCanvasAttachedToCurrentContainer(eng) {
+    function ensureLiveContainer(eng) {
         const liveContainer = resolveContainer();
         if (!liveContainer) {
             throw new Error('render_canvas.js: #dag-stage container not found while mounting canvas');
         }
         eng.container = liveContainer;
-        if (!eng.app || !eng.app.canvas) {
-            return;
+        return liveContainer;
+    }
+
+    function attachInitializedCanvasToCurrentContainer(eng) {
+        const liveContainer = ensureLiveContainer(eng);
+        if (!eng.initialized) {
+            throw new Error('render_canvas.js: cannot attach canvas before Pixi application initialization completes');
         }
-        if (eng.app.canvas.parentNode !== liveContainer) {
+        if (!eng.app) {
+            throw new Error('render_canvas.js: engine.app is missing after Pixi application initialization');
+        }
+        const canvas = eng.app.canvas;
+        if (!canvas) {
+            if (eng.usingHeadlessPixi) {
+                return;
+            }
+            throw new Error('render_canvas.js: Pixi application did not expose canvas after initialization');
+        }
+        if (canvas.parentNode !== liveContainer) {
             if (typeof liveContainer.appendChild !== 'function') {
                 throw new Error('render_canvas.js: live #dag-stage container cannot accept canvas append');
             }
-            liveContainer.appendChild(eng.app.canvas);
+            liveContainer.appendChild(canvas);
         }
-        if (eng.app.canvas && eng.app.canvas.style) {
-            eng.app.canvas.style.width = '100%';
+        if (canvas.style) {
+            canvas.style.width = '100%';
         }
     }
 
@@ -246,12 +261,12 @@
     async function ensureStageMounted() {
         const eng = ensureEngine();
         if (eng.initialized) {
-            ensureCanvasAttachedToCurrentContainer(eng);
+            attachInitializedCanvasToCurrentContainer(eng);
             return eng;
         }
         if (!eng.initPromise) {
             eng.initPromise = (async function () {
-                ensureCanvasAttachedToCurrentContainer(eng);
+                ensureLiveContainer(eng);
                 if (typeof eng.app.init === 'function') {
                     await eng.app.init({
                         backgroundAlpha: 0,
@@ -263,12 +278,12 @@
                         height: Math.max(1, getContainerHeight(eng.container) || 720)
                     });
                 }
-                ensureCanvasAttachedToCurrentContainer(eng);
+                eng.initialized = true;
+                attachInitializedCanvasToCurrentContainer(eng);
                 // `init()` may (re)create app.stage; (re-)attach the world graph.
                 if (eng.app.stage && typeof eng.app.stage.addChild === 'function') {
                     eng.app.stage.addChild(eng.world);
                 }
-                eng.initialized = true;
             })();
         }
         await eng.initPromise;
