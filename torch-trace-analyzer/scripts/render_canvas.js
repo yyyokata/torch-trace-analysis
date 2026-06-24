@@ -76,6 +76,37 @@
             removed.forEach(function (c) { c.parent = null; });
             return removed;
         };
+        // Phase 2 step 3: headless Pixi mock gains a minimal EventEmitter so the
+        // node-side render probe can simulate click / dblclick / pointerdown on
+        // group hit boxes (real PixiJS v8 wires the same API through Federated
+        // Events).  Headless ``emit()`` is *synchronous*; tests rely on this to
+        // schedule click vs. dblclick disambiguation timers deterministically.
+        Container.prototype.on = function (name, fn) {
+            if (typeof fn !== 'function') {
+                throw new Error('render_canvas.js: headless Container.on requires a function listener for "' + name + '"');
+            }
+            if (!this.__listeners) { this.__listeners = {}; }
+            if (!this.__listeners[name]) { this.__listeners[name] = []; }
+            this.__listeners[name].push(fn);
+            return this;
+        };
+        Container.prototype.off = function (name, fn) {
+            if (!this.__listeners || !this.__listeners[name]) { return this; }
+            if (typeof fn !== 'function') {
+                this.__listeners[name] = [];
+                return this;
+            }
+            this.__listeners[name] = this.__listeners[name].filter(function (l) { return l !== fn; });
+            return this;
+        };
+        Container.prototype.emit = function (name, evt) {
+            if (!this.__listeners || !this.__listeners[name]) { return this; }
+            const listeners = this.__listeners[name].slice();
+            for (let i = 0; i < listeners.length; i++) {
+                listeners[i](evt);
+            }
+            return this;
+        };
         function Graphics() {
             Container.call(this);
             this.__isHeadlessGraphics = true;
@@ -210,7 +241,34 @@
                 worldHeight: 0,
                 minScale: 0.25,
                 maxScale: 4
+            },
+            // Phase 2 step 3: ``groupBoxes`` indexes the live group hit target
+            // (Graphics box) by gid so the inline runtime can attach click /
+            // dblclick handlers to whichever path drew it.  Both the legacy
+            // ``walkGroup`` path and the pool-driven ``createGroupView`` path
+            // register their box here.  ``selectedGroupId`` tracks the
+            // currently focused group for panel display.
+            groupBoxes: new Map(),
+            selectedGroupId: null
+        };
+        // Phase 2 step 3: ``engine.onGroupToggle`` / ``engine.onGroupSelect``
+        // are the *engine-side* interaction hooks fired by ``bindGroupBox()``.
+        // The inline runtime wires their behaviour by installing
+        // ``window.__canvasOnGroupToggle`` / ``window.__canvasOnGroupSelect``
+        // — render_canvas.js forwards to them at *call time* (not script load)
+        // so wire ordering does not matter as long as the globals exist by the
+        // first user click.  No silent fallback: missing globals throw hard.
+        built.onGroupToggle = function (gid) {
+            if (typeof global.__canvasOnGroupToggle !== 'function') {
+                throw new Error('render_canvas.js: window.__canvasOnGroupToggle is not wired by inline runtime');
             }
+            global.__canvasOnGroupToggle(gid);
+        };
+        built.onGroupSelect = function (gid) {
+            if (typeof global.__canvasOnGroupSelect !== 'function') {
+                throw new Error('render_canvas.js: window.__canvasOnGroupSelect is not wired by inline runtime');
+            }
+            global.__canvasOnGroupSelect(gid);
         };
         built.viewportController = new ViewportController(built);
         built.cullManager = new CullManager();
@@ -715,6 +773,68 @@
     }
 
     // ── GroupView ──────────────────────────────────────────────────────────
+    // Phase 2 step 3: bind click / dblclick / right-click / pointerdown
+    // handlers to a group hit box.  Idempotent — the second call on the same
+    // box is a no-op.  Click handlers are wired to ``engine.onGroupSelect``
+    // (single click, show panel) and ``engine.onGroupToggle`` (double click,
+    // collapse/expand) which forward to the inline-runtime hooks.
+    //
+    // click / dblclick disambiguation: a single click schedules a 200ms timer
+    // that fires ``onGroupSelect``; a dblclick received within that window
+    // cancels the timer and fires ``onGroupToggle`` instead, so a double click
+    // never opens the panel.  Each new click also cancels the prior pending
+    // timer, so click + click + dblclick (browser's native dblclick sequence)
+    // also cancels cleanly.
+    //
+    // pointerdown with button===2 is the right-mouse path: two within 250ms
+    // is reserved as the Semantic Zoom entry (Step 5).  Step 3 only defines
+    // the recognition handler and the body is a placeholder.  ``rightclick``
+    // is intercepted purely to suppress the browser context menu (Pixi v8
+    // emits ``rightclick`` synthetically on right-mouse-up).
+    function bindGroupBox(gid, box) {
+        if (!box) {
+            throw new Error('render_canvas.js: bindGroupBox missing box for group ' + gid);
+        }
+        if (box.__phase2EventsBound) { return; }
+        box.__phase2EventsBound = true;
+        box.eventMode = 'static';
+        const clickDelayMs = 200;
+        const rightDblIntervalMs = 250;
+        const state = { clickTimer: null, rightLastDown: 0 };
+        box.on('click', function (e) {
+            if (e && typeof e.stopPropagation === 'function') { e.stopPropagation(); }
+            if (state.clickTimer !== null) {
+                clearTimeout(state.clickTimer);
+                state.clickTimer = null;
+            }
+            state.clickTimer = setTimeout(function () {
+                state.clickTimer = null;
+                engine.onGroupSelect(gid);
+            }, clickDelayMs);
+        });
+        box.on('dblclick', function (e) {
+            if (e && typeof e.stopPropagation === 'function') { e.stopPropagation(); }
+            if (state.clickTimer !== null) {
+                clearTimeout(state.clickTimer);
+                state.clickTimer = null;
+            }
+            engine.onGroupToggle(gid);
+        });
+        box.on('rightclick', function (e) {
+            if (e && typeof e.preventDefault === 'function') { e.preventDefault(); }
+        });
+        box.on('pointerdown', function (e) {
+            if (!e || e.button !== 2) { return; }
+            const now = (typeof Date !== 'undefined' && typeof Date.now === 'function') ? Date.now() : 0;
+            if (now - state.rightLastDown < rightDblIntervalMs) {
+                state.rightLastDown = 0;
+                // TODO Step5: semantic zoom
+            } else {
+                state.rightLastDown = now;
+            }
+        });
+    }
+
     function drawCollapsedGroup(g, gid, ox, oy, pos) {
         const hasTiming = !!g.has_timing;
         const hasInfo = !!g.src_file;
@@ -728,6 +848,10 @@
             stroke: groupColor, strokeAlpha: 0.85, strokeWidth: 1.5
         });
         engine.layers.l2.addChild(box);
+        // Phase 2 step 3: index + wire the collapsed group hit target so
+        // single/double click reach the inline-runtime handlers.
+        engine.groupBoxes.set(String(gid), box);
+        bindGroupBox(gid, box);
         if (visible) {
             // Header text grows rightward from ox+10; reserve room on the right
             // for the info badge.  13px monospace ≈ 7.8px/char; the leading
@@ -774,6 +898,10 @@
         // header bar so the expanded container title stays legible
         box.roundRect(ox, oy, pos.w, 26, 8).fill({ color: groupColor, alpha: 0.35 });
         engine.layers.l2.addChild(box);
+        // Phase 2 step 3: index + wire the expanded group hit target so
+        // single/double click reach the inline-runtime handlers.
+        engine.groupBoxes.set(String(gid), box);
+        bindGroupBox(gid, box);
         if (visible) {
             // Expanded header shares the bar with the right-aligned info badge
             // and timing text; reserve room for whichever are present so the
@@ -1233,6 +1361,10 @@
         engine.labelsCreated = 0;
         engine.labels = [];
         engine.contentBounds = null;
+        // Phase 2 step 3: clear the per-frame group hit-box index.  Legacy
+        // walkGroup re-registers boxes on every render; pool entries that
+        // outlive resetScene re-register via patchGroups.
+        engine.groupBoxes.clear();
         resetNodePortMap();
     }
 
@@ -1287,11 +1419,15 @@
         root.visible = false;
         const box = makeGraphics('group-box:' + id);
         // Phase 2 step 3 wires the click / dblclick / right-dblclick handlers
-        // onto this hit target; step 1 only marks it as the eventMode-bearing
-        // surface so later steps can attach listeners without touching layout.
+        // onto this hit target; ``bindGroupBox`` flips ``eventMode='static'``
+        // and idempotently registers the listeners.
         box.eventMode = 'static';
         root.addChild(box);
         engine.layers.l2.addChild(root);
+        // Index this pool entry's box so the inline runtime / tests can find
+        // it via ``engine.groupBoxes`` once ``diffAndPatch`` reactivates it.
+        engine.groupBoxes.set(String(id), box);
+        bindGroupBox(id, box);
         return {
             id: String(id),
             root: root,
@@ -1914,6 +2050,15 @@
     global.__canvasDiffAndPatch = function (prevVisible, nextVisible) {
         ensureEngine();
         diffAndPatch(prevVisible, nextVisible);
+    };
+    // Phase 2 step 3: ``__canvasGetGroupBox`` returns the live group hit box
+    // (Graphics) for a given gid, regardless of whether the legacy walkGroup
+    // path or the pool path drew it.  Tests use this to simulate click /
+    // dblclick on the actual on-screen box; the inline runtime does not need
+    // it (the wiring runs through ``engine.onGroupToggle`` / ``onGroupSelect``).
+    global.__canvasGetGroupBox = function (gid) {
+        ensureEngine();
+        return engine.groupBoxes.get(String(gid)) || null;
     };
     global.__EdgeRoute = EdgeRoute;
     global.__EDGE_STYLE = EDGE_STYLE;
