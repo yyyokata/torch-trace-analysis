@@ -1520,13 +1520,10 @@ function invokeRender(renderOpts) {
 }
 
 async function render(renderOpts) {
-    if (typeof window !== 'undefined' && window.__phase1NoInteractionMode === true) {
-        if (typeof window.__canvasRenderPhase1 !== 'function') {
-            throw new Error('Canvas render entry __canvasRenderPhase1 is missing while phase1 no-interaction mode is enabled');
-        }
+    if (typeof window !== 'undefined' && typeof window.__canvasRenderPhase1 === 'function') {
         return window.__canvasRenderPhase1(DATA, renderOpts);
     }
-    throw new Error('Legacy SVG render path has been removed; Canvas Phase 1 requires render_canvas.js');
+    throw new Error('Canvas render entry __canvasRenderPhase1 is missing; engine bundle or render_canvas.js not loaded');
 }
 
 function toggleGroup(gid) {
