@@ -244,9 +244,11 @@
                     // PixiJS autoDensity writes canvas.style.width = physicalPx + 'px' as inline
                     // style, which overrides CSS class rules (e.g. max-width: 100%).  Force
                     // width: 100% here so the canvas never inflates the container.
+                    // Do NOT clear style.height: with autoDensity+resolution=DPR, the renderer
+                    // sets style.height to the correct CSS-px value; clearing it would revert to
+                    // the physical-pixel height attribute (~DPR x too tall).
                     if (eng.app.canvas) {
                         eng.app.canvas.style.width = '100%';
-                        eng.app.canvas.style.height = '';
                     }
                 }
                 // `init()` may (re)create app.stage; (re-)attach the world graph.
@@ -1203,8 +1205,9 @@
             engine.app.renderer.resize(Math.ceil(containerSize.w), Math.ceil(containerSize.h));
         }
         if (engine.app && engine.app.canvas) {
+            // autoDensity sets style.width/height to CSS-px values; keep width=100% for
+            // horizontal fill but do NOT clear style.height (see performAutoFit comment).
             engine.app.canvas.style.width = '100%';
-            engine.app.canvas.style.height = '';
         }
         applyViewport();
     }
@@ -1240,8 +1243,12 @@
             engine.app.renderer.resize(Math.ceil(cw), canvasHeight);
         }
         if (engine.app && engine.app.canvas) {
+            // Keep width=100% so the canvas fills the container horizontally.
+            // Do NOT clear style.height: PixiJS autoDensity+resolution=DPR sets
+            // style.height = canvasHeight+'px' (CSS px) on resize; clearing it
+            // reverts to the physical-pixel height attribute (~DPR x too tall),
+            // making the canvas ~2.5x taller than expected and breaking layout.
             engine.app.canvas.style.width = '100%';
-            engine.app.canvas.style.height = '';
         }
         // The width-only fit top-aligns the world at y = padding inside a canvas
         // that was just grown to the full (tall) content height.  Growing the
@@ -1366,7 +1373,8 @@
             if (wantAutoFit) {
                 if (engine.app && engine.app.canvas) {
                     engine.app.canvas.style.width = '100%';
-                    engine.app.canvas.style.height = '';
+                    // Do NOT clear style.height here; performAutoFit will resize the
+                    // renderer and autoDensity will set the correct CSS-px height.
                 }
                 await requestAnimationFramePromise(function () {
                     return performAutoFit();
