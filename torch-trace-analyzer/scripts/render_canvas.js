@@ -221,13 +221,37 @@
         return engine;
     }
 
+    function ensureCanvasAttachedToCurrentContainer(eng) {
+        const liveContainer = resolveContainer();
+        if (!liveContainer) {
+            throw new Error('render_canvas.js: #dag-stage container not found while mounting canvas');
+        }
+        eng.container = liveContainer;
+        if (!eng.app || !eng.app.canvas) {
+            return;
+        }
+        if (eng.app.canvas.parentNode !== liveContainer) {
+            if (typeof liveContainer.appendChild !== 'function') {
+                throw new Error('render_canvas.js: live #dag-stage container cannot accept canvas append');
+            }
+            liveContainer.appendChild(eng.app.canvas);
+        }
+        if (eng.app.canvas && eng.app.canvas.style) {
+            eng.app.canvas.style.width = '100%';
+        }
+    }
+
     // Stage 1.5: perform the async PixiJS v8 `app.init()` lazily on the first real
     // render.  Idempotent via `initPromise`; the headless mock resolves instantly.
     async function ensureStageMounted() {
         const eng = ensureEngine();
-        if (eng.initialized) { return eng; }
+        if (eng.initialized) {
+            ensureCanvasAttachedToCurrentContainer(eng);
+            return eng;
+        }
         if (!eng.initPromise) {
             eng.initPromise = (async function () {
+                ensureCanvasAttachedToCurrentContainer(eng);
                 if (typeof eng.app.init === 'function') {
                     await eng.app.init({
                         backgroundAlpha: 0,
@@ -239,12 +263,7 @@
                         height: Math.max(1, getContainerHeight(eng.container) || 720)
                     });
                 }
-                if (eng.app.canvas && typeof eng.container.appendChild === 'function') {
-                    eng.container.appendChild(eng.app.canvas);
-                    if (eng.app.canvas) {
-                        eng.app.canvas.style.width = '100%';
-                    }
-                }
+                ensureCanvasAttachedToCurrentContainer(eng);
                 // `init()` may (re)create app.stage; (re-)attach the world graph.
                 if (eng.app.stage && typeof eng.app.stage.addChild === 'function') {
                     eng.app.stage.addChild(eng.world);
