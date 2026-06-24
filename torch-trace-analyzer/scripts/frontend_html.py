@@ -810,6 +810,15 @@ DATA.groups.forEach(g => {
 // Top-level IO groups (Input/Param/Const) default to their adapter-provided collapsed state
 (DATA.io_groups || []).forEach(g => { if (!(g.id in collapsedState)) collapsedState[g.id] = g.collapsed; });
 
+// Phase 2 step 4: hand DATA + collapsedState references to render_canvas.js so
+// it can run the incremental render path (computeVisibleScene + diffAndPatch)
+// without going back through canvasRenderPhase1 / resetScene.  The setter is
+// only present once render_canvas.js has loaded; it is invoked once here at
+// startup and never again.
+if (typeof window !== 'undefined' && typeof window.__canvasSetIncrementalContext === 'function') {
+    window.__canvasSetIncrementalContext({ data: DATA, collapsedState: collapsedState });
+}
+
 function formatDur(us) {
     if (us >= 1e6) return (us/1e6).toFixed(3) + ' s';
     if (us >= 1e3) return (us/1e3).toFixed(2) + ' ms';
@@ -1554,15 +1563,31 @@ async function render(renderOpts) {
     throw new Error('Canvas render entry __canvasRenderPhase1 is missing; engine bundle or render_canvas.js not loaded');
 }
 
-// Phase 2 step 3: ``invokeIncrementalRender`` is the post-toggle render entry.
-// Step 3 lands the click / dblclick wiring and a minimal incremental path that
-// re-renders *without* auto-fitting (so the viewport stays put across toggles).
-// Step 4 will migrate Expand-All / Collapse-All away from ``invokeRender`` and
-// fully restrict ``resetScene()`` to first-render only — until then, this
-// helper simply triggers a non-auto-fit re-render so the design's
-// "no resize / no auto-fit" goal is partially honoured.
+// Phase 2 step 4: ``invokeIncrementalRender`` is the post-toggle render entry.
+// Step 4 routes it through ``__canvasInvokeIncrementalRender`` which captures
+// the current ``engine.visible*`` sets, computes the next visible scene from
+// ``DATA + collapsedState``, and drives ``diffAndPatch`` only.  This path
+// MUST NOT touch ``resetScene()``, ``renderer.resize()`` or trigger an
+// auto-fit; those remain reserved for the initial ``invokeRender()`` path.
 function invokeIncrementalRender(ctx) {
-    return invokeRender({ autoFit: false });
+    if (typeof window === 'undefined' || typeof window.__canvasInvokeIncrementalRender !== 'function') {
+        throw new Error('Canvas incremental render entry __canvasInvokeIncrementalRender is missing; render_canvas.js must be loaded before the inline runtime');
+    }
+    window.__canvasInvokeIncrementalRender(ctx);
+}
+
+// Phase 2 step 4: ``expandAll`` / ``collapseAll`` mutate ``collapsedState`` in
+// place and dispatch the incremental render path.  They never touch the
+// ``invokeRender`` (full pipeline) path, which is reserved for the very first
+// page load and explicit user-driven re-fits.
+function expandAll() {
+    DATA.groups.forEach(g => collapsedState[g.id] = false);
+    invokeIncrementalRender({ reason: 'expand-all' });
+}
+
+function collapseAll() {
+    DATA.groups.forEach(g => { if (g.depth >= 1) collapsedState[g.id] = true; });
+    invokeIncrementalRender({ reason: 'collapse-all' });
 }
 
 // Phase 2 step 3: click / dblclick handlers on group hit boxes forward to
@@ -1906,12 +1931,10 @@ document.addEventListener('keydown', (e) => {
 });
 
 document.getElementById('btn-expand-all').addEventListener('click', () => {
-    DATA.groups.forEach(g => collapsedState[g.id] = false);
-    invokeRender({ autoFit: true });
+    expandAll();
 });
 document.getElementById('btn-collapse-all').addEventListener('click', () => {
-    DATA.groups.forEach(g => { if (g.depth >= 1) collapsedState[g.id] = true; });
-    invokeRender({ autoFit: true });
+    collapseAll();
 });
 document.getElementById('btn-fit').addEventListener('click', () => {
     if (typeof window.__canvasEnginePhase1 !== 'function') {
