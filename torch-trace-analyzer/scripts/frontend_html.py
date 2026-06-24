@@ -1450,24 +1450,44 @@ function showRenderProgress(stageText) {
 async function hideRenderProgress() {
     const { overlay } = getRenderProgressElements();
     const ownerGeneration = overlay.dataset.renderGeneration || '';
+    if (ownerGeneration !== String(renderGeneration)) {
+        overlay.classList.add('closing');
+        overlay.classList.remove('visible');
+        overlay.setAttribute('aria-hidden', 'true');
+        return;
+    }
     setRenderProgress(100, '渲染完成');
     await nextFrame();
     if (ownerGeneration !== String(renderGeneration)) {
-        throw new Error(`hideRenderProgress aborted by newer render generation: ${ownerGeneration} -> ${renderGeneration}`);
+        overlay.classList.add('closing');
+        overlay.classList.remove('visible');
+        overlay.setAttribute('aria-hidden', 'true');
+        return;
     }
     overlay.classList.add('closing');
     overlay.classList.remove('visible');
     await new Promise((resolve) => setTimeout(resolve, 180));
     if (ownerGeneration !== String(renderGeneration)) {
-        throw new Error(`hideRenderProgress completion overtaken by render generation: ${ownerGeneration} -> ${renderGeneration}`);
+        overlay.setAttribute('aria-hidden', 'true');
+        return;
     }
     overlay.setAttribute('aria-hidden', 'true');
 }
 
 function assertActiveRenderGeneration(generation, stageText) {
-    if (generation !== renderGeneration) {
-        throw new Error(`render generation ${generation} expired during ${stageText}`);
+    if (typeof generation !== 'number' || !Number.isFinite(generation)) {
+        throw new Error(`invalid render generation ${generation} during ${stageText}`);
     }
+    if (typeof renderGeneration === 'undefined') {
+        throw new Error('renderGeneration is unavailable');
+    }
+    if (generation !== renderGeneration) {
+        return false;
+    }
+    return true;
+}
+if (typeof window !== 'undefined') {
+    window.__canvasAssertGeneration = assertActiveRenderGeneration;
 }
 
 async function runChunked(items, handler, options) {
@@ -1481,17 +1501,20 @@ async function runChunked(items, handler, options) {
         ? opts.allowedTypes
         : ['group', 'node', 'io', 'edge'];
     const allowedTypeSet = new Set(allowedTypes);
-    assertActiveRenderGeneration(generation, stageText);
+    if (!assertActiveRenderGeneration(generation, stageText)) {
+        return false;
+    }
     const total = items.length;
     if (total === 0) {
         setRenderProgress(phaseEnd, stageText);
         await nextFrame();
-        assertActiveRenderGeneration(generation, stageText);
-        return;
+        return assertActiveRenderGeneration(generation, stageText);
     }
     let processed = 0;
     while (processed < total) {
-        assertActiveRenderGeneration(generation, stageText);
+        if (!assertActiveRenderGeneration(generation, stageText)) {
+            return false;
+        }
         const upperBound = Math.min(processed + batchSize, total);
         for (let idx = processed; idx < upperBound; idx++) {
             const item = items[idx];
@@ -1499,7 +1522,9 @@ async function runChunked(items, handler, options) {
                 const actualType = item && typeof item.type === 'string' ? item.type : '<missing>';
                 throw new Error(`runChunked got unknown task type: ${actualType}`);
             }
-            assertActiveRenderGeneration(generation, stageText);
+            if (!assertActiveRenderGeneration(generation, stageText)) {
+                return false;
+            }
             await handler(item, idx);
         }
         processed = upperBound;
@@ -1507,7 +1532,7 @@ async function runChunked(items, handler, options) {
         setRenderProgress(progress, stageText);
         await nextFrame();
     }
-    assertActiveRenderGeneration(generation, stageText);
+    return assertActiveRenderGeneration(generation, stageText);
 }
 
 function invokeRender(renderOpts) {
