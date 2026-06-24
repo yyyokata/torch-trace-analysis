@@ -1264,10 +1264,17 @@
         if (engine.container && typeof engine.container.scrollTop !== 'undefined') {
             engine.container.scrollTop = 0;
         }
-        // Also snap the page scroll to top so the canvas header (title, tabs,
-        // legend) is visible and Input/Const nodes are in the initial viewport.
+        // Chrome scroll anchoring fires after the resize reflow, which can override a
+        // same-frame scrollTo(0,0).  Schedule a second rAF so the snap runs *after*
+        // anchoring has settled.
         if (global.window && typeof global.window.scrollTo === 'function') {
             global.window.scrollTo(0, 0);
+            var _win = global.window;
+            if (typeof _win.requestAnimationFrame === 'function') {
+                _win.requestAnimationFrame(function () {
+                    _win.scrollTo(0, 0);
+                });
+            }
         }
         return vp;
     }
