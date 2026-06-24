@@ -26,7 +26,6 @@ import os
 import sys
 import json as _json
 import re
-from collections import defaultdict
 from pathlib import Path
 
 # When this module is imported by ``analyze_trace.py`` the script directory is
@@ -1895,12 +1894,29 @@ def _build_source_map(file_paths: set[str]) -> dict[str, str]:
     return source_map
 
 
+def _inject_source_map(html_content: str, source_files: set[str]) -> str:
+    source_map = _build_source_map(source_files)
+    source_map_js = "const SOURCE_MAP = " + _json.dumps(source_map, ensure_ascii=True).replace("</", "<\\/") + ";"
+    return html_content.replace("// __SOURCE_MAP_PLACEHOLDER__", source_map_js)
+
+
+def _replace_data_preamble(base_html: str, preamble: str, *, context: str) -> str:
+    replaced_html, replace_count = re.subn(
+        r"const DATA = .*?(?=\nconst groupMap = \{\};)",
+        lambda _match: preamble,
+        base_html,
+        count=1,
+        flags=re.DOTALL,
+    )
+    if replace_count != 1:
+        raise RuntimeError(f"failed to replace DATA preamble for {context}")
+    return replaced_html
+
+
 def render_flowchart_to_file(flowchart_data, output_path):
     html_content = _generate_flowchart_html(flowchart_data)
     source_files = _collect_source_files(flowchart_data)
-    source_map = _build_source_map(source_files)
-    source_map_js = "const SOURCE_MAP = " + _json.dumps(source_map, ensure_ascii=True).replace("</", "<\\/") + ";"
-    html_content = html_content.replace("// __SOURCE_MAP_PLACEHOLDER__", source_map_js)
+    html_content = _inject_source_map(html_content, source_files)
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(html_content.encode("utf-8", "replace").decode("utf-8"))
     return output_path
@@ -1928,19 +1944,14 @@ def render_multi_tab_flowchart_to_file(
         for item in items:
             if "data" in item:
                 source_files.update(_collect_source_files(item["data"]))
-    
-    source_map = _build_source_map(source_files)
-    source_map_js = "const SOURCE_MAP = " + _json.dumps(source_map, ensure_ascii=True).replace("</", "<\\/") + ";"
-    html_content = html_content.replace("// __SOURCE_MAP_PLACEHOLDER__", source_map_js)
+
+    html_content = _inject_source_map(html_content, source_files)
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(html_content.encode("utf-8", "replace").decode("utf-8"))
     return output_path
 
 
 def _generate_flowchart_html_multi(tabs: dict[str, list[dict]]) -> str:
-    import json as _json
-    import re as _re
-
     if not tabs:
         raise ValueError("tabs must not be empty")
     first_mode = list(tabs.keys())[0]
@@ -1981,15 +1992,11 @@ def _generate_flowchart_html_multi(tabs: dict[str, list[dict]]) -> str:
         "let DATA = (ALL_TAB_DATA[ACTIVE_L1][ACTIVE_L2[ACTIVE_L1]].data || ALL_TAB_DATA[ACTIVE_L1][ACTIVE_L2[ACTIVE_L1]]);\n"
         "// __SOURCE_MAP_PLACEHOLDER__\n"
     )
-    base_html, n_sub = _re.subn(
-        r"const DATA = .*?(?=\nconst groupMap = \{\};)",
-        lambda _m: data_preamble,
+    base_html = _replace_data_preamble(
         base_html,
-        count=1,
-        flags=_re.DOTALL,
+        data_preamble,
+        context="multi-tab flowchart html",
     )
-    if n_sub != 1:
-        raise RuntimeError("failed to replace DATA preamble for multi-tab flowchart html")
 
     tab_styles = (
         "<style>\n"
@@ -2051,7 +2058,7 @@ def _generate_flowchart_html_multi(tabs: dict[str, list[dict]]) -> str:
         '<div class="multi-tabs-l1">' + "".join(l1_buttons) + "</div>\n"
         '<div class="multi-tabs-l2-container">' + "".join(l2_panels) + "</div>\n"
     )
-    base_html, body_sub = _re.subn(r"(<body[^>]*>)", r"\1\n" + tab_html, base_html, count=1)
+    base_html, body_sub = re.subn(r"(<body[^>]*>)", r"\1\n" + tab_html, base_html, count=1)
     if body_sub != 1:
         raise RuntimeError("failed to inject multi-tab bar into flowchart html body")
 
@@ -2191,8 +2198,6 @@ def _generate_flowchart_html_dual(data_train, data_infer):
     DOM, no cross-tab leakage (each switch fully resets ``groupMap`` /
     ``nodeMap`` / ``collapsedState`` / ``nodeAncestorGroups``).
     """
-    import json as _json
-    import re as _re
 
     # Use the train dataset to render the base template; the JSON payload will
     # be replaced with a dual-data preamble below.
@@ -2210,19 +2215,17 @@ def _generate_flowchart_html_dual(data_train, data_infer):
         "const DATA_TRAIN = " + train_json + ";\n"
         "const DATA_INFER = " + infer_json + ";\n"
     )
-    new_html, n_sub = _re.subn(
-        r'const DATA = .*?(?=\nconst groupMap = \{\};)',
-        lambda m: dual_preamble,
-        base_html,
-        count=1,
-        flags=_re.DOTALL,
-    )
-    if n_sub != 1:
+    try:
+        base_html = _replace_data_preamble(
+            base_html,
+            dual_preamble,
+            context="dual-tab flowchart html",
+        )
+    except RuntimeError:
         # Fall back to legacy iframe shell (extremely defensive — should never
         # trigger because _generate_flowchart_html always emits the marker).
         print("  ⚠️ 双 Tab: 未在内嵌模板中找到 DATA 注入锚点，回退为单 Tab(train) 输出")
         return base_html
-    base_html = new_html
 
     # ---- 2. inject the tab bar UI right after <body> ------------------------
     summary = lambda d: {
@@ -2275,7 +2278,7 @@ def _generate_flowchart_html_dual(data_train, data_infer):
         base_html = base_html.replace('</head>', tab_styles + '</head>', 1)
     else:
         base_html = tab_styles + base_html
-    base_html = _re.sub(r'(<body[^>]*>)', r'\1\n' + tab_html, base_html, count=1)
+    base_html = re.sub(r'(<body[^>]*>)', r'\1\n' + tab_html, base_html, count=1)
 
     # ---- 3. inject tab-switching JS at the very end (after final render()) --
     switch_js = (
