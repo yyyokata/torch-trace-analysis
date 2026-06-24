@@ -382,15 +382,29 @@
     }
 
     function resolveContainerSize(context) {
-        // Prefer the parent element (#dag-container) for width measurement.
-        // engine.container (#dag-stage) has a canvas child whose PixiJS autoDensity
-        // writes canvas.style.width = physicalPx, which inflates #dag-stage.clientWidth
-        // before CSS reflow corrects it.  The parent is never affected by the canvas
-        // inline style and always returns the stable CSS layout width.
-        const widthSource = (engine.container && engine.container.parentElement)
-            ? engine.container.parentElement
-            : engine.container;
-        let cw = getContainerWidth(widthSource);
+        // Width is the canvas-usable width.  Two failure modes must be guarded:
+        //   1. The #dag-stage reserves a vertical-scrollbar gutter (scrollbar-gutter:
+        //      stable), so its clientWidth is the real drawable width MINUS the
+        //      scrollbar (~15px on Windows classic scrollbars).  Laying out against
+        //      the wider parent (#dag-container, no scrollbar) over-sizes the world
+        //      and clips its right edge under the scrollbar.
+        //   2. PixiJS autoDensity transiently writes canvas.style.width = physicalPx,
+        //      which can INFLATE #dag-stage.clientWidth before reflow settles.
+        // Taking the min of the stage and its parent satisfies both: normally the
+        // stage (scrollbar-excluded) is the smaller, correct value; if the stage is
+        // momentarily inflated, the parent's stable layout width wins instead.
+        const stageW = getContainerWidth(engine.container);
+        const parentW = (engine.container && engine.container.parentElement)
+            ? getContainerWidth(engine.container.parentElement)
+            : null;
+        let cw = null;
+        if (stageW !== null && stageW > 0 && parentW !== null && parentW > 0) {
+            cw = Math.min(stageW, parentW);
+        } else if (parentW !== null && parentW > 0) {
+            cw = parentW;
+        } else if (stageW !== null && stageW > 0) {
+            cw = stageW;
+        }
         let ch = getContainerHeight(engine.container);
         if (cw !== null && cw > 0 && ch !== null && ch > 0) {
             engine.lastKnownContainerW = cw;
@@ -1194,6 +1208,16 @@
         if (engine.app && engine.app.canvas) {
             engine.app.canvas.style.width = '100%';
             engine.app.canvas.style.height = '';
+        }
+        // The width-only fit top-aligns the world at y = padding inside a canvas
+        // that was just grown to the full (tall) content height.  Growing the
+        // canvas turns the #dag-stage into a vertical scroll container; on some
+        // browsers (Chrome scroll anchoring) the stage is left scrolled away from
+        // the top when its content resizes, which hides the top-of-graph
+        // Input/Const nodes on first load.  Explicitly snap the stage back to the
+        // top so the freshly top-aligned fit is actually what the user sees.
+        if (engine.container && typeof engine.container.scrollTop !== 'undefined') {
+            engine.container.scrollTop = 0;
         }
         return vp;
     }
