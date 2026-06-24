@@ -1717,7 +1717,7 @@
             // works unchanged; the migration is done in a later step.
             resetScene();
             let layoutInfo = null;
-            await p.runChunked([{ type: 'group', taskKind: 'layout' }], async function () {
+            if (!await p.runChunked([{ type: 'group', taskKind: 'layout' }], async function () {
                 resetInlineLayoutCache();
                 layoutInfo = computeLayout(data, resolveContainerSize('layout').w);
             }, {
@@ -1727,8 +1727,11 @@
                 stageText: '正在计算 DAG 布局…',
                 generation: generation,
                 allowedTypes: ['group']
-            });
-            await p.runChunked([{ type: 'group', taskKind: 'draw-scene' }], async function () {
+            })) {
+                await p.hideRenderProgress();
+                return;
+            }
+            if (!await p.runChunked([{ type: 'group', taskKind: 'draw-scene' }], async function () {
                 layoutAndDrawRoots(layoutInfo);
             }, {
                 batchSize: 1,
@@ -1737,8 +1740,11 @@
                 stageText: '正在渲染模块节点…',
                 generation: generation,
                 allowedTypes: ['group']
-            });
-            await p.runChunked([{ type: 'edge', taskKind: 'draw-edges' }], async function () {
+            })) {
+                await p.hideRenderProgress();
+                return;
+            }
+            if (!await p.runChunked([{ type: 'edge', taskKind: 'draw-edges' }], async function () {
                 drawGlobalEdges(data);
             }, {
                 batchSize: 1,
@@ -1747,8 +1753,14 @@
                 stageText: '正在渲染依赖边…',
                 generation: generation,
                 allowedTypes: ['edge']
-            });
-            p.assertActiveRenderGeneration(generation, '收尾阶段');
+            })) {
+                await p.hideRenderProgress();
+                return;
+            }
+            if (!p.assertActiveRenderGeneration(generation, '收尾阶段')) {
+                await p.hideRenderProgress();
+                return;
+            }
             const wantAutoFit = (!engine.hasRenderedOnce) || (renderOpts && renderOpts.autoFit === true);
             if (wantAutoFit) {
                 if (engine.app && engine.app.canvas) {
@@ -1762,7 +1774,10 @@
             p.setRenderProgress(98, '正在更新图例和摘要…');
             await p.nextFrame();
             updateLegendAndSummary(data);
-            p.assertActiveRenderGeneration(generation, '完成阶段');
+            if (!p.assertActiveRenderGeneration(generation, '完成阶段')) {
+                await p.hideRenderProgress();
+                return;
+            }
             await p.hideRenderProgress();
             return buildSnapshot();
         } catch (err) {
