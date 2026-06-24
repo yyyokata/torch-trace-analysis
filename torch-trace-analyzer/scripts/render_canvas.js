@@ -185,6 +185,18 @@
             groups: [],
             edges: [],
             io_pills: [],
+            // Phase 2 step 1: object pools persist across renders so toggle /
+            // expand-all / focus paths can patch existing views instead of
+            // running resetScene() and rebuilding every Pixi DisplayObject.
+            // ``visible*`` sets describe the *current* frame and are updated by
+            // ``diffAndPatch()``; pool entries themselves are never destroyed
+            // here, only set ``visible=false``.
+            nodePool: new Map(),
+            groupPool: new Map(),
+            edgePool: new Map(),
+            visibleNodeIds: new Set(),
+            visibleGroupIds: new Set(),
+            visibleEdgeKeys: new Set(),
             labelsCreated: 0,
             labels: [],
             cullingEnabled: true,
@@ -1224,6 +1236,282 @@
         resetNodePortMap();
     }
 
+    // ── Phase 2 step 1: object pool + diffAndPatch ─────────────────────────
+    // The factories below build the long-lived NodeView / GroupView / EdgeView
+    // entries that ``diffAndPatch()`` populates and patches.  Each factory
+    // attaches its root container to the appropriate scene-graph layer once at
+    // create time so subsequent renders only flip ``visible`` and patch
+    // snapshot fields — they never re-add to the layer or re-create Pixi
+    // DisplayObjects.
+    //
+    // Required snapshot fields are listed for each kind below; callers must
+    // hand in fully-populated snapshots and ``diffAndPatch()`` will throw if
+    // any field is missing (no silent default fill, no fallback).
+    const NODE_SNAPSHOT_FIELDS  = ['x', 'y', 'w', 'h', 'label', 'sublabel', 'fill', 'stroke', 'alpha'];
+    const GROUP_SNAPSHOT_FIELDS = ['x', 'y', 'w', 'h', 'label', 'type', 'collapsed', 'alpha', 'childCount', 'metaVersion'];
+    const EDGE_SNAPSHOT_FIELDS  = ['points', 'stroke', 'strokeWidth', 'alpha', 'dashed'];
+
+    function requireSnapshotFields(kind, id, snapshot, fields) {
+        if (!snapshot || typeof snapshot !== 'object') {
+            throw new Error('render_canvas.js: diffAndPatch missing ' + kind + ' snapshot for ' + id);
+        }
+        for (let i = 0; i < fields.length; i++) {
+            const f = fields[i];
+            if (!Object.prototype.hasOwnProperty.call(snapshot, f)) {
+                throw new Error('render_canvas.js: diffAndPatch ' + kind + ' snapshot missing field "' + f + '" for ' + id);
+            }
+        }
+    }
+
+    function createNodeView(id) {
+        const root = new engine.pixi.Container();
+        root.name = 'node-view:' + id;
+        root.visible = false;
+        const box = makeGraphics('node-box:' + id);
+        root.addChild(box);
+        engine.layers.l3.addChild(root);
+        return {
+            id: String(id),
+            root: root,
+            box: box,
+            titleText: null,
+            subText: null,
+            visible: false,
+            snapshot: null
+        };
+    }
+
+    function createGroupView(id) {
+        const root = new engine.pixi.Container();
+        root.name = 'group-view:' + id;
+        root.visible = false;
+        const box = makeGraphics('group-box:' + id);
+        // Phase 2 step 3 wires the click / dblclick / right-dblclick handlers
+        // onto this hit target; step 1 only marks it as the eventMode-bearing
+        // surface so later steps can attach listeners without touching layout.
+        box.eventMode = 'static';
+        root.addChild(box);
+        engine.layers.l2.addChild(root);
+        return {
+            id: String(id),
+            root: root,
+            box: box,
+            headerText: null,
+            timingText: null,
+            infoBadge: null,
+            visible: false,
+            interactionEnabled: false,
+            snapshot: null
+        };
+    }
+
+    function createEdgeView(key) {
+        const root = new engine.pixi.Container();
+        root.name = 'edge-view:' + key;
+        root.visible = false;
+        const path = makeGraphics('edge-path:' + key);
+        root.addChild(path);
+        engine.layers.l1.addChild(root);
+        return {
+            key: String(key),
+            root: root,
+            path: path,
+            arrow: null,
+            visible: false,
+            snapshot: null
+        };
+    }
+
+    function patchNodeView(view, snapshot) {
+        requireSnapshotFields('node', view.id, snapshot, NODE_SNAPSHOT_FIELDS);
+        const prev = view.snapshot;
+        if (!prev || prev.x !== snapshot.x) { view.root.x = snapshot.x; }
+        if (!prev || prev.y !== snapshot.y) { view.root.y = snapshot.y; }
+        if (!prev || prev.alpha !== snapshot.alpha) { view.root.alpha = snapshot.alpha; }
+        if (!prev || prev.label !== snapshot.label) {
+            const labelText = (snapshot.label === null || snapshot.label === undefined) ? '' : String(snapshot.label);
+            if (labelText === '') {
+                if (view.titleText) { view.titleText.visible = false; }
+            } else if (!view.titleText) {
+                view.titleText = makeText(labelText, 'node-label:' + view.id, TEXT_STYLE.nodeTitle);
+                view.titleText.visible = true;
+                view.root.addChild(view.titleText);
+            } else {
+                view.titleText.text = labelText;
+                view.titleText.visible = true;
+            }
+        }
+        if (!prev || prev.sublabel !== snapshot.sublabel) {
+            const subText = (snapshot.sublabel === null || snapshot.sublabel === undefined) ? '' : String(snapshot.sublabel);
+            if (subText === '') {
+                if (view.subText) { view.subText.visible = false; }
+            } else if (!view.subText) {
+                view.subText = makeText(subText, 'node-sublabel:' + view.id, TEXT_STYLE.nodeSub);
+                view.subText.visible = true;
+                view.root.addChild(view.subText);
+            } else {
+                view.subText.text = subText;
+                view.subText.visible = true;
+            }
+        }
+        view.snapshot = snapshot;
+    }
+
+    function patchGroupView(view, snapshot) {
+        requireSnapshotFields('group', view.id, snapshot, GROUP_SNAPSHOT_FIELDS);
+        const prev = view.snapshot;
+        if (!prev || prev.x !== snapshot.x) { view.root.x = snapshot.x; }
+        if (!prev || prev.y !== snapshot.y) { view.root.y = snapshot.y; }
+        if (!prev || prev.alpha !== snapshot.alpha) { view.root.alpha = snapshot.alpha; }
+        if (!prev || prev.label !== snapshot.label) {
+            const labelText = (snapshot.label === null || snapshot.label === undefined) ? '' : String(snapshot.label);
+            if (labelText === '') {
+                if (view.headerText) { view.headerText.visible = false; }
+            } else if (!view.headerText) {
+                view.headerText = makeText(labelText, 'group-header:' + view.id, TEXT_STYLE.groupHeader);
+                view.headerText.visible = true;
+                view.root.addChild(view.headerText);
+            } else {
+                view.headerText.text = labelText;
+                view.headerText.visible = true;
+            }
+        }
+        view.snapshot = snapshot;
+    }
+
+    function patchEdgeView(view, snapshot) {
+        requireSnapshotFields('edge', view.key, snapshot, EDGE_SNAPSHOT_FIELDS);
+        const prev = view.snapshot;
+        if (!prev || prev.alpha !== snapshot.alpha) { view.root.alpha = snapshot.alpha; }
+        view.snapshot = snapshot;
+    }
+
+    function getSnapshotEntry(map, id) {
+        if (!map || typeof map !== 'object') {
+            throw new Error('render_canvas.js: diffAndPatch missing snapshot map for id ' + id);
+        }
+        const key = String(id);
+        if (Object.prototype.hasOwnProperty.call(map, key)) { return map[key]; }
+        if (Object.prototype.hasOwnProperty.call(map, id)) { return map[id]; }
+        throw new Error('render_canvas.js: diffAndPatch missing snapshot entry for id ' + id);
+    }
+
+    function patchGroups(prevIds, nextIds, snapshotMap) {
+        const prevSet = (prevIds instanceof Set) ? prevIds : new Set(prevIds || []);
+        const nextSet = (nextIds instanceof Set) ? nextIds : new Set(nextIds || []);
+        nextSet.forEach(function (gid) {
+            const key = String(gid);
+            let view = engine.groupPool.get(key);
+            if (!view) {
+                view = createGroupView(gid);
+                engine.groupPool.set(key, view);
+            }
+            view.root.visible = true;
+            view.visible = true;
+            view.box.eventMode = 'static';
+            view.interactionEnabled = true;
+            patchGroupView(view, getSnapshotEntry(snapshotMap, gid));
+        });
+        prevSet.forEach(function (gid) {
+            if (nextSet.has(gid)) { return; }
+            const key = String(gid);
+            const view = engine.groupPool.get(key);
+            if (!view) {
+                throw new Error('render_canvas.js: diffAndPatch recycle missing groupView in pool: ' + gid);
+            }
+            view.root.visible = false;
+            view.visible = false;
+            view.box.eventMode = 'none';
+            view.interactionEnabled = false;
+        });
+    }
+
+    function patchNodes(prevIds, nextIds, snapshotMap) {
+        const prevSet = (prevIds instanceof Set) ? prevIds : new Set(prevIds || []);
+        const nextSet = (nextIds instanceof Set) ? nextIds : new Set(nextIds || []);
+        nextSet.forEach(function (nid) {
+            const key = String(nid);
+            let view = engine.nodePool.get(key);
+            if (!view) {
+                view = createNodeView(nid);
+                engine.nodePool.set(key, view);
+            }
+            view.root.visible = true;
+            view.visible = true;
+            patchNodeView(view, getSnapshotEntry(snapshotMap, nid));
+        });
+        prevSet.forEach(function (nid) {
+            if (nextSet.has(nid)) { return; }
+            const key = String(nid);
+            const view = engine.nodePool.get(key);
+            if (!view) {
+                throw new Error('render_canvas.js: diffAndPatch recycle missing nodeView in pool: ' + nid);
+            }
+            view.root.visible = false;
+            view.visible = false;
+        });
+    }
+
+    function patchEdges(prevKeys, nextKeys, snapshotMap) {
+        const prevSet = (prevKeys instanceof Set) ? prevKeys : new Set(prevKeys || []);
+        const nextSet = (nextKeys instanceof Set) ? nextKeys : new Set(nextKeys || []);
+        nextSet.forEach(function (ek) {
+            const key = String(ek);
+            let view = engine.edgePool.get(key);
+            if (!view) {
+                view = createEdgeView(ek);
+                engine.edgePool.set(key, view);
+            }
+            view.root.visible = true;
+            view.visible = true;
+            patchEdgeView(view, getSnapshotEntry(snapshotMap, ek));
+        });
+        prevSet.forEach(function (ek) {
+            if (nextSet.has(ek)) { return; }
+            const key = String(ek);
+            const view = engine.edgePool.get(key);
+            if (!view) {
+                throw new Error('render_canvas.js: diffAndPatch recycle missing edgeView in pool: ' + ek);
+            }
+            view.root.visible = false;
+            view.visible = false;
+        });
+    }
+
+    function diffAndPatch(prevVisible, nextVisible) {
+        if (!prevVisible || typeof prevVisible !== 'object') {
+            throw new Error('render_canvas.js: diffAndPatch requires prevVisible');
+        }
+        if (!nextVisible || typeof nextVisible !== 'object') {
+            throw new Error('render_canvas.js: diffAndPatch requires nextVisible');
+        }
+        const required = ['nodeIds', 'groupIds', 'edgeKeys', 'nodeSnapshots', 'groupSnapshots', 'edgeSnapshots'];
+        for (let i = 0; i < required.length; i++) {
+            const f = required[i];
+            if (!Object.prototype.hasOwnProperty.call(nextVisible, f)) {
+                throw new Error('render_canvas.js: diffAndPatch nextVisible missing field "' + f + '"');
+            }
+        }
+        // Pre-validate every snapshot **before** mutating any pool so a
+        // malformed frame leaves the existing pool state untouched (no
+        // half-built views, no fabricated default fields).
+        (nextVisible.groupIds || []).forEach(function (gid) {
+            requireSnapshotFields('group', gid, getSnapshotEntry(nextVisible.groupSnapshots, gid), GROUP_SNAPSHOT_FIELDS);
+        });
+        (nextVisible.nodeIds || []).forEach(function (nid) {
+            requireSnapshotFields('node', nid, getSnapshotEntry(nextVisible.nodeSnapshots, nid), NODE_SNAPSHOT_FIELDS);
+        });
+        (nextVisible.edgeKeys || []).forEach(function (ek) {
+            requireSnapshotFields('edge', ek, getSnapshotEntry(nextVisible.edgeSnapshots, ek), EDGE_SNAPSHOT_FIELDS);
+        });
+        patchGroups(prevVisible.groupIds, nextVisible.groupIds, nextVisible.groupSnapshots);
+        patchNodes(prevVisible.nodeIds, nextVisible.nodeIds, nextVisible.nodeSnapshots);
+        patchEdges(prevVisible.edgeKeys, nextVisible.edgeKeys, nextVisible.edgeSnapshots);
+        engine.visibleGroupIds = new Set((nextVisible.groupIds || []).map(String));
+        engine.visibleNodeIds  = new Set((nextVisible.nodeIds  || []).map(String));
+        engine.visibleEdgeKeys = new Set((nextVisible.edgeKeys || []).map(String));
+    }
+
     function applyWorldLayout(layoutInfo) {
         if (!layoutInfo || !Number.isFinite(layoutInfo.svgW) || !Number.isFinite(layoutInfo.svgH)) {
             throw new Error('render_canvas.js: computeFlowchartLayout returned invalid world bounds');
@@ -1419,6 +1707,14 @@
         try {
             resetInlineLayoutCache();
             resetNodePortMap();
+            // TODO Phase2: migrate to diffAndPatch
+            // The phase-2 design (``design/frontend_canvas_phase2.md`` §2.4.1)
+            // restricts ``resetScene()`` to a single first-render call; later
+            // steps replace the per-render full clear with the object-pool
+            // ``diffAndPatch()`` path.  Step 1 keeps this call site so the
+            // existing draw pipeline (``layoutAndDrawRoots`` /
+            // ``drawGlobalEdges`` writing into ``engine.nodes`` etc.) still
+            // works unchanged; the migration is done in a later step.
             resetScene();
             let layoutInfo = null;
             await p.runChunked([{ type: 'group', taskKind: 'layout' }], async function () {
@@ -1501,6 +1797,48 @@
         return out;
     }
 
+    function poolSnapshot() {
+        const groups = [];
+        engine.groupPool.forEach(function (view) {
+            groups.push({
+                id: view.id,
+                visible: view.visible === true,
+                interactionEnabled: view.interactionEnabled === true,
+                eventMode: (view.box && view.box.eventMode) ? view.box.eventMode : null,
+                rootVisible: view.root.visible === true,
+                snapshot: view.snapshot
+            });
+        });
+        const nodes = [];
+        engine.nodePool.forEach(function (view) {
+            nodes.push({
+                id: view.id,
+                visible: view.visible === true,
+                rootVisible: view.root.visible === true,
+                snapshot: view.snapshot
+            });
+        });
+        const edges = [];
+        engine.edgePool.forEach(function (view) {
+            edges.push({
+                key: view.key,
+                visible: view.visible === true,
+                rootVisible: view.root.visible === true,
+                snapshot: view.snapshot
+            });
+        });
+        return {
+            groups: groups,
+            nodes: nodes,
+            edges: edges,
+            visible: {
+                groupIds: Array.from(engine.visibleGroupIds),
+                nodeIds: Array.from(engine.visibleNodeIds),
+                edgeKeys: Array.from(engine.visibleEdgeKeys)
+            }
+        };
+    }
+
     function buildSnapshot() {
         if (!engine) {
             throw new Error('render_canvas.js: __renderSnapshot called before the Canvas engine was initialized');
@@ -1543,6 +1881,10 @@
             layers: layerChildCounts(),
             labelsCreated: engine.labelsCreated,
             labels: (engine.labels || []).map(function (l) { return { name: l.name, x: l.x, y: l.y }; }),
+            // Phase 2 step 1: pool + visible-set introspection.  Tests assert
+            // that the three pools persist across diffAndPatch() calls and that
+            // recycled entries stay in the pool with ``visible=false``.
+            pool: poolSnapshot(),
             flags: {
                 noInteractionMode: global.__phase1NoInteractionMode === true,
                 cullingEnabled: engine.cullingEnabled === true
@@ -1554,6 +1896,10 @@
     global.__canvasRenderPhase1 = canvasRenderPhase1;
     global.__initCanvasEngine = initCanvasEngine;
     global.__canvasEnginePhase1 = function () { return engine; };
+    global.__canvasDiffAndPatch = function (prevVisible, nextVisible) {
+        ensureEngine();
+        diffAndPatch(prevVisible, nextVisible);
+    };
     global.__EdgeRoute = EdgeRoute;
     global.__EDGE_STYLE = EDGE_STYLE;
     global.__renderSnapshot = function () {
