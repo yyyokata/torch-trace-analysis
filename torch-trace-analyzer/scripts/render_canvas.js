@@ -110,13 +110,16 @@
         function Graphics() {
             Container.call(this);
             this.__isHeadlessGraphics = true;
+            this.__drawOps = [];
         }
         Graphics.prototype = Object.create(Container.prototype);
         Graphics.prototype.constructor = Graphics;
         ['clear', 'roundRect', 'rect', 'circle', 'ellipse', 'poly', 'fill', 'stroke',
          'setStrokeStyle', 'setFillStyle', 'moveTo', 'lineTo', 'closePath', 'beginPath']
             .forEach(function (name) {
-                Graphics.prototype[name] = function () { return this; };
+                Graphics.prototype[name] = (name === 'clear')
+                    ? function () { this.__drawOps = []; return this; }
+                    : function () { this.__drawOps.push(name); return this; };
             });
         function Text(arg) {
             Container.call(this);
@@ -255,14 +258,19 @@
             // (re)compute the visible scene without going back through the full
             // ``canvasRenderPhase1`` pipeline.  The inline runtime installs them
             // exactly once via ``__canvasSetIncrementalContext`` — never mutated
-            // afterwards.  ``resetSceneCallCount`` / ``rendererResizeCallCount``
-            // are diagnostic counters used by the phase-2 step-4 regression
-            // tests (T9 / T10) to confirm the toggle / Expand-All / Collapse-All
-            // path no longer falls back to ``resetScene()`` or ``renderer.resize()``.
+            // afterwards.  ``rendererResizeCallCount`` is a diagnostic counter
+            // used by the phase-2 step-4 regression tests to confirm the toggle /
+            // Expand-All / Collapse-All path never re-runs ``renderer.resize()``
+            // (only the initial render / auto-fit path may bump it).
             dataRef: null,
             collapsedStateRef: null,
-            resetSceneCallCount: 0,
-            rendererResizeCallCount: 0
+            rendererResizeCallCount: 0,
+            // Phase 2 step 4: positive diagnostic counter bumped once per
+            // ``invokeIncrementalRender`` (toggle / Expand-All / Collapse-All).
+            // The regression tests assert this advances while
+            // ``rendererResizeCallCount`` stays put — proving the pool-first
+            // incremental path ran instead of a full re-render.
+            incrementalRenderCount: 0
         };
         // Phase 2 step 3: ``engine.onGroupToggle`` / ``engine.onGroupSelect``
         // are the *engine-side* interaction hooks fired by ``bindGroupBox()``.
@@ -384,6 +392,7 @@
     function lookupIsEdgeVisible() { return (typeof isEdgeVisible === 'function') ? isEdgeVisible : null; }
     function lookupResolveCollapsedAncestor() { return (typeof resolveCollapsedAncestor === 'function') ? resolveCollapsedAncestor : null; }
     function lookupEdgeKey() { return (typeof edgeKey === 'function') ? edgeKey : null; }
+    function lookupCollapsedState() { return (typeof collapsedState !== 'undefined') ? collapsedState : null; }
     function lookupEdgeBundleMeta() { return (typeof EDGE_BUNDLE_META !== 'undefined') ? EDGE_BUNDLE_META : null; }
     function lookupComputeFlowchartLayout() { return (typeof computeFlowchartLayout === 'function') ? computeFlowchartLayout : null; }
     function lookupComputeIOGroupExpandedLayout() { return (typeof computeIOGroupExpandedLayout === 'function') ? computeIOGroupExpandedLayout : null; }
@@ -470,6 +479,22 @@
         engine.labelsCreated += 1;
         engine.labels.push({ name: name, x: px, y: py });
         return t;
+    }
+
+    // Pool-first scene-label bookkeeping.  The pool view text glyphs are created
+    // lazily inside the patch functions (not via addLabel, since they are parented
+    // to the recyclable view root, not a layer).  This records a label entry in
+    // the same ``engine.labels`` / ``engine.labelsCreated`` model the legacy draw
+    // path used, so the snapshot label introspection (count, names, coords) and
+    // the culling regression tests keep working with absolute world coordinates.
+    function registerSceneLabel(name, absX, absY) {
+        const x = numericOrNull(absX);
+        const y = numericOrNull(absY);
+        if (x === null || y === null) {
+            throw new Error('render_canvas.js: registerSceneLabel requires numeric x/y for ' + name);
+        }
+        engine.labels.push({ name: name, x: x, y: y });
+        engine.labelsCreated += 1;
     }
 
     // Stage 1.5: shared rounded-box painter on the v8 Graphics builder.  `fill` /
@@ -574,8 +599,19 @@
 
     function computeRenderableContentBounds() {
         let bounds = null;
-        (engine.groups || []).forEach(function (g) {
-            bounds = expandBounds(bounds, { x: g.x, y: g.y, w: g.w, h: g.h });
+        // Pool-first: the rendered content lives in the object pools (the legacy
+        // engine.nodes / engine.groups arrays are no longer populated).  Walk the
+        // currently-visible group + node views and take their snapshot boxes
+        // (absolute world coordinates) as the content extent.
+        engine.groupPool.forEach(function (view) {
+            if (view.visible !== true || !view.snapshot) { return; }
+            const s = view.snapshot;
+            bounds = expandBounds(bounds, { x: s.x, y: s.y, w: s.w, h: s.h });
+        });
+        engine.nodePool.forEach(function (view) {
+            if (view.visible !== true || !view.snapshot) { return; }
+            const s = view.snapshot;
+            bounds = expandBounds(bounds, { x: s.x, y: s.y, w: s.w, h: s.h });
         });
         (engine.io_pills || []).forEach(function (pill) {
             bounds = expandBounds(bounds, {
@@ -721,6 +757,10 @@
         map[nid + '__out'] = { cx: x + w / 2, cy: y + h };
     }
 
+    // Collapsed-group port registration (ported verbatim from the legacy
+    // walkGroup/drawCollapsedGroup path).  A collapsed group redirects its
+    // boundary in/out port node_ids onto the single collapsed box so global
+    // edges aimed at hidden inner nodes land on the visible box edge.
     function registerCollapsedGroupPorts(g, gid, ox, oy, pos) {
         const map = lookupNodePortMap();
         if (!map) {
@@ -735,6 +775,9 @@
         for (const port of (g.out_ports || [])) { map[port.node_id] = outPoint; }
     }
 
+    // Expanded-group port registration (ported verbatim from the legacy
+    // walkGroup post-walk step).  Must run AFTER the group's child leaf ports so
+    // the group's in/out override wins over the individual leaf ports.
     function registerExpandedGroupPorts(g, gid, ox, oy, pos) {
         const map = lookupNodePortMap();
         if (!map) {
@@ -746,43 +789,6 @@
         map[gid + '__out'] = outPoint;
         for (const port of (g.in_ports || [])) { map[port.node_id] = inPoint; }
         for (const port of (g.out_ports || [])) { map[port.node_id] = outPoint; }
-    }
-
-    // ── NodeView ───────────────────────────────────────────────────────────
-    function drawNode(nid, x, y, w, h) {
-        const nodes = lookupNodeMap();
-        const n = nodes ? nodes[nid] : null;
-        if (!n) { return; }
-        const color = nodeColorOf(n);
-        // Truncate the title to the node box width (12px monospace ≈ 7.2px/char,
-        // 8px total side padding) so long class names no longer overflow the box.
-        const label = truncateLabel(n.class_name, maxCharsForWidth(w, 7.2, 8));
-        const sublabel = n.has_timing ? (n.pct.toFixed(1) + '%') : '';
-        const rect = { x: x, y: y, w: w, h: h };
-        const visible = shouldCreateLabel(rect);
-
-        const box = makeGraphics('node-box:' + nid);
-        fillStrokeBox(box, x, y, w, h, {
-            radius: 7, fill: color, fillAlpha: 0.95,
-            stroke: 0xffffff, strokeAlpha: 0.14, strokeWidth: 1
-        });
-        engine.layers.l3.addChild(box);
-        if (visible) {
-            const cx = x + w / 2;
-            const cy = y + h / 2;
-            addLabel(engine.layers.l3, label, 'node-label:' + nid,
-                cx, sublabel ? cy - 7 : cy, TEXT_STYLE.nodeTitle, { ax: 0.5, ay: 0.5 });
-            if (sublabel) {
-                addLabel(engine.layers.l3, sublabel, 'node-sublabel:' + nid,
-                    cx, cy + 8, TEXT_STYLE.nodeSub, { ax: 0.5, ay: 0.5 });
-            }
-        }
-
-        engine.nodes.push({
-            id: nid, x: x, y: y, w: w, h: h,
-            color: color, label: label, sublabel: sublabel, visible: true
-        });
-        registerNodePorts(nid, x, y, w, h);
     }
 
     // ── GroupView ──────────────────────────────────────────────────────────
@@ -846,134 +852,6 @@
                 state.rightLastDown = now;
             }
         });
-    }
-
-    function drawCollapsedGroup(g, gid, ox, oy, pos) {
-        const hasTiming = !!g.has_timing;
-        const hasInfo = !!g.src_file;
-        const rect = { x: ox, y: oy, w: pos.w, h: pos.h };
-        const visible = shouldCreateLabel(rect);
-
-        const groupColor = nodeColorOf(g);
-        const box = makeGraphics('group-box:' + gid);
-        fillStrokeBox(box, ox, oy, pos.w, pos.h, {
-            radius: 8, fill: groupColor, fillAlpha: 0.22,
-            stroke: groupColor, strokeAlpha: 0.85, strokeWidth: 1.5
-        });
-        engine.layers.l2.addChild(box);
-        // Phase 2 step 3: index + wire the collapsed group hit target so
-        // single/double click reach the inline-runtime handlers.
-        engine.groupBoxes.set(String(gid), box);
-        bindGroupBox(gid, box);
-        if (visible) {
-            // Header text grows rightward from ox+10; reserve room on the right
-            // for the info badge.  13px monospace ≈ 7.8px/char; the leading
-            // arrow glyph + space cost 2 chars and must not be truncated.
-            const headerChars = maxCharsForWidth(pos.w - 10 - (hasInfo ? 26 : 10), 7.8, 0) - 2;
-            addLabel(engine.layers.l2, '\u25B6 ' + truncateLabel(g.class_name, headerChars), 'group-label:' + gid,
-                ox + 10, oy + 15, TEXT_STYLE.groupHeader, { ax: 0, ay: 0.5 });
-            if (hasTiming) {
-                addLabel(engine.layers.l2, 'Kernel ' + g.pct.toFixed(1) + '% \u00B7 ' + formatDurOf(g.dur_us),
-                    'group-timing:' + gid, ox + 10, oy + 32, TEXT_STYLE.groupTiming, { ax: 0, ay: 0.5 });
-            }
-            if (hasInfo) {
-                const info = makeGraphics('group-info-hit:' + gid);
-                info.circle(ox + pos.w - 13, oy + 13, 8).fill({ color: 0x000000, alpha: 0.35 }).stroke({ color: 0xffffff, width: 1, alpha: 0.6 });
-                engine.layers.l2.addChild(info);
-                addLabel(engine.layers.l2, 'i', 'group-info:' + gid,
-                    ox + pos.w - 13, oy + 13, TEXT_STYLE.info, { ax: 0.5, ay: 0.5 });
-            }
-        } else if (hasInfo) {
-            const info = makeGraphics('group-info-hit:' + gid);
-            info.circle(ox + pos.w - 13, oy + 13, 8).fill({ color: 0x000000, alpha: 0.35 });
-            engine.layers.l2.addChild(info);
-        }
-
-        engine.groups.push({
-            id: gid, collapsed: true, x: ox, y: oy, w: pos.w, h: pos.h,
-            has_header: false, has_info: hasInfo, has_timing: hasTiming
-        });
-        registerCollapsedGroupPorts(g, gid, ox, oy, pos);
-    }
-
-    function drawExpandedGroupShell(g, gid, ox, oy, pos) {
-        const hasTiming = !!g.has_timing;
-        const hasInfo = !!g.src_file;
-        const rect = { x: ox, y: oy, w: pos.w, h: pos.h };
-        const visible = shouldCreateLabel(rect);
-
-        const groupColor = nodeColorOf(g);
-        const box = makeGraphics('group-box:' + gid);
-        fillStrokeBox(box, ox, oy, pos.w, pos.h, {
-            radius: 8, fill: groupColor, fillAlpha: 0.08,
-            stroke: groupColor, strokeAlpha: 0.7, strokeWidth: 1.5
-        });
-        // header bar so the expanded container title stays legible
-        box.roundRect(ox, oy, pos.w, 26, 8).fill({ color: groupColor, alpha: 0.35 });
-        engine.layers.l2.addChild(box);
-        // Phase 2 step 3: index + wire the expanded group hit target so
-        // single/double click reach the inline-runtime handlers.
-        engine.groupBoxes.set(String(gid), box);
-        bindGroupBox(gid, box);
-        if (visible) {
-            // Expanded header shares the bar with the right-aligned info badge
-            // and timing text; reserve room for whichever are present so the
-            // truncated title never collides with them.
-            const rightReserve = (hasInfo ? 26 : 10) + (hasTiming ? 130 : 0);
-            const headerChars = maxCharsForWidth(pos.w - 10 - rightReserve, 7.8, 0) - 2;
-            addLabel(engine.layers.l2, '\u25BC ' + truncateLabel(g.class_name, headerChars), 'group-header:' + gid,
-                ox + 10, oy + 13, TEXT_STYLE.groupHeader, { ax: 0, ay: 0.5 });
-            if (hasInfo) {
-                const info = makeGraphics('group-info-hit:' + gid);
-                info.circle(ox + pos.w - 13, oy + 13, 8).fill({ color: 0x000000, alpha: 0.35 }).stroke({ color: 0xffffff, width: 1, alpha: 0.6 });
-                engine.layers.l2.addChild(info);
-                addLabel(engine.layers.l2, 'i', 'group-info:' + gid,
-                    ox + pos.w - 13, oy + 13, TEXT_STYLE.info, { ax: 0.5, ay: 0.5 });
-            }
-            if (hasTiming) {
-                addLabel(engine.layers.l2, 'Kernel ' + g.pct.toFixed(1) + '% \u00B7 ' + formatDurOf(g.dur_us),
-                    'group-timing:' + gid, ox + pos.w - 26, oy + 13, TEXT_STYLE.groupTiming, { ax: 1, ay: 0.5 });
-            }
-        } else if (hasInfo) {
-            const info = makeGraphics('group-info-hit:' + gid);
-            info.circle(ox + pos.w - 13, oy + 13, 8).fill({ color: 0x000000, alpha: 0.35 });
-            engine.layers.l2.addChild(info);
-        }
-
-        engine.groups.push({
-            id: gid, collapsed: false, x: ox, y: oy, w: pos.w, h: pos.h,
-            has_header: true, has_info: hasInfo, has_timing: hasTiming
-        });
-    }
-
-    function walkGroup(gid, ox, oy) {
-        const groups = lookupGroupMap();
-        const layout = lookupGroupLayout();
-        const g = groups ? groups[gid] : null;
-        if (!g) {
-            throw new Error('render_canvas.js: group not found while drawing: ' + gid);
-        }
-        const pos = (layout && Object.prototype.hasOwnProperty.call(layout, gid)) ? layout[gid] : null;
-        if (!pos) {
-            throw new Error('render_canvas.js: missing layout for group: ' + gid);
-        }
-
-        if (pos.collapsed) {
-            drawCollapsedGroup(g, gid, ox, oy, pos);
-            return;
-        }
-
-        drawExpandedGroupShell(g, gid, ox, oy, pos);
-        for (const child of (pos.childPositions || [])) {
-            if (child.type === 'node') {
-                drawNode(child.id, ox + child.x, oy + child.y, child.w, child.h);
-            } else if (child.type === 'group') {
-                walkGroup(child.id, ox + child.x, oy + child.y);
-            } else {
-                throw new Error('render_canvas.js: unknown child type while drawing: ' + child.type);
-            }
-        }
-        registerExpandedGroupPorts(g, gid, ox, oy, pos);
     }
 
     // ── EdgeRoute (pure geometry) ──────────────────────────────────────────
@@ -1078,41 +956,6 @@
         }
     };
 
-    // ── EdgeBatch ──────────────────────────────────────────────────────────
-    function EdgeBatch() {
-        this.buckets = { dep: [], internal: [], default: [] };
-    }
-    EdgeBatch.prototype.collect = function (edge, start, end, routeMeta, routingMode) {
-        const mode = routingMode || 'direct';
-        const route = EdgeRoute.compute(mode, start.cx, start.cy, end.cx, end.cy, routeMeta);
-        if (!route) { return; }
-        const type = edge.type || 'dep';
-        const colorKey = colorKeyForType(type);
-        this.buckets[colorKey].push({ points: route.points, dashed: route.dashed });
-        engine.edges.push({
-            from: edge.from, to: edge.to, type: type, colorKey: colorKey,
-            start: { cx: start.cx, cy: start.cy },
-            end: { cx: end.cx, cy: end.cy },
-            branch: route.branch, dashed: route.dashed, arrow: true
-        });
-    };
-    EdgeBatch.prototype.flush = function () {
-        const self = this;
-        Object.keys(self.buckets).forEach(function (colorKey) {
-            const items = self.buckets[colorKey];
-            if (!items.length) { return; }
-            const style = EDGE_STYLE[colorKey];
-            const strokeG = makeGraphics('edge-stroke:' + colorKey);
-            const arrowG = makeGraphics('edge-arrow:' + colorKey);
-            items.forEach(function (item) {
-                strokePolyline(strokeG, item.points, style);
-                drawArrowHead(arrowG, item.points, style);
-            });
-            engine.layers.l1.addChild(strokeG);
-            engine.layers.l1.addChild(arrowG);
-        });
-    };
-
     function strokePolyline(g, points, style) {
         if (!points || points.length < 2) { return; }
         g.moveTo(points[0].x, points[0].y);
@@ -1143,34 +986,6 @@
             baseX - px * half, baseY - py * half
         ]);
         g.fill({ color: style.color, alpha: style.arrowAlpha });
-    }
-
-    function drawGlobalEdges(data) {
-        const edges = (data && Array.isArray(data.edges)) ? data.edges : [];
-        if (edges.length === 0) { return; }
-        const portMap = lookupNodePortMap();
-        const isVisible = lookupIsEdgeVisible();
-        const resolveAncestor = lookupResolveCollapsedAncestor();
-        const keyOf = lookupEdgeKey();
-        const bundleMeta = lookupEdgeBundleMeta();
-        if (!portMap || !isVisible || !resolveAncestor || !keyOf || !bundleMeta) {
-            throw new Error('render_canvas.js: inline edge globals unavailable while drawing edges');
-        }
-        const batch = new EdgeBatch();
-        for (const edge of edges) {
-            if (!isVisible(edge)) { continue; }
-            const fromId = resolveAncestor(edge.from);
-            const toId = resolveAncestor(edge.to);
-            if (fromId === toId) { continue; }
-            const fromPos = portMap[fromId + '__out'] || portMap[fromId];
-            const toPos = portMap[toId + '__in'] || portMap[toId];
-            if (!fromPos || !toPos) {
-                throw new Error('global edge endpoint missing: ' + edge.from + ' -> ' + edge.to);
-            }
-            const routeMeta = bundleMeta.get(keyOf(edge)) || null;
-            batch.collect(edge, fromPos, toPos, routeMeta, 'direct');
-        }
-        batch.flush();
     }
 
     // ── IO layer (L5) ──────────────────────────────────────────────────────
@@ -1359,35 +1174,6 @@
         }
     }
 
-    // ── scene reset + layout orchestration ─────────────────────────────────
-    function resetScene() {
-        // Phase 2 step 4: bump the diagnostic counter *before* the actual reset
-        // so the T9 / T10 regression tests can assert the count.  ``resetScene``
-        // remains permitted on the initial render path (full draw via
-        // ``walkGroup`` / ``drawGlobalEdges``); the toggle / Expand-All /
-        // Collapse-All path goes through ``invokeIncrementalRender`` instead
-        // and must NOT increment this counter.
-        engine.resetSceneCallCount = (engine.resetSceneCallCount || 0) + 1;
-        LAYER_KEYS.forEach(function (key) {
-            const layer = engine.layers[key];
-            if (layer && typeof layer.removeChildren === 'function') {
-                layer.removeChildren();
-            }
-        });
-        engine.nodes = [];
-        engine.groups = [];
-        engine.edges = [];
-        engine.io_pills = [];
-        engine.labelsCreated = 0;
-        engine.labels = [];
-        engine.contentBounds = null;
-        // Phase 2 step 3: clear the per-frame group hit-box index.  Legacy
-        // walkGroup re-registers boxes on every render; pool entries that
-        // outlive resetScene re-register via patchGroups.
-        engine.groupBoxes.clear();
-        resetNodePortMap();
-    }
-
     // ── Phase 2 step 1: object pool + diffAndPatch ─────────────────────────
     // The factories below build the long-lived NodeView / GroupView / EdgeView
     // entries that ``diffAndPatch()`` populates and patches.  Each factory
@@ -1400,8 +1186,8 @@
     // hand in fully-populated snapshots and ``diffAndPatch()`` will throw if
     // any field is missing (no silent default fill, no fallback).
     const NODE_SNAPSHOT_FIELDS  = ['x', 'y', 'w', 'h', 'label', 'sublabel', 'fill', 'stroke', 'alpha'];
-    const GROUP_SNAPSHOT_FIELDS = ['x', 'y', 'w', 'h', 'label', 'type', 'collapsed', 'alpha', 'childCount', 'metaVersion'];
-    const EDGE_SNAPSHOT_FIELDS  = ['points', 'stroke', 'strokeWidth', 'alpha', 'dashed'];
+    const GROUP_SNAPSHOT_FIELDS = ['x', 'y', 'w', 'h', 'label', 'collapsed', 'fill', 'alpha', 'hasInfo', 'hasTiming', 'timingText'];
+    const EDGE_SNAPSHOT_FIELDS  = ['points', 'stroke', 'strokeWidth', 'alpha', 'dashed', 'arrowAlpha'];
 
     function requireSnapshotFields(kind, id, snapshot, fields) {
         if (!snapshot || typeof snapshot !== 'object') {
@@ -1453,8 +1239,9 @@
             root: root,
             box: box,
             headerText: null,
-            timingText: null,
-            infoBadge: null,
+            timingTextNode: null,
+            infoGfx: null,
+            infoText: null,
             visible: false,
             interactionEnabled: false,
             snapshot: null
@@ -1480,65 +1267,169 @@
 
     function patchNodeView(view, snapshot) {
         requireSnapshotFields('node', view.id, snapshot, NODE_SNAPSHOT_FIELDS);
-        const prev = view.snapshot;
-        if (!prev || prev.x !== snapshot.x) { view.root.x = snapshot.x; }
-        if (!prev || prev.y !== snapshot.y) { view.root.y = snapshot.y; }
-        if (!prev || prev.alpha !== snapshot.alpha) { view.root.alpha = snapshot.alpha; }
-        if (!prev || prev.label !== snapshot.label) {
-            const labelText = (snapshot.label === null || snapshot.label === undefined) ? '' : String(snapshot.label);
-            if (labelText === '') {
-                if (view.titleText) { view.titleText.visible = false; }
-            } else if (!view.titleText) {
-                view.titleText = makeText(labelText, 'node-label:' + view.id, TEXT_STYLE.nodeTitle);
-                view.titleText.visible = true;
+        view.root.x = snapshot.x;
+        view.root.y = snapshot.y;
+        view.root.alpha = snapshot.alpha;
+        view.box.clear();
+        fillStrokeBox(view.box, 0, 0, snapshot.w, snapshot.h, {
+            radius: 7, fill: snapshot.fill, fillAlpha: 0.95,
+            stroke: snapshot.stroke, strokeAlpha: 0.14, strokeWidth: 1
+        });
+        // title + sublabel are culled (the box itself is always drawn).  On the
+        // first render shouldCreateLabel() returns true unconditionally; once the
+        // graph has rendered once, off-screen labels are skipped (and any existing
+        // recycled glyph is hidden) so labelsCreated tracks only on-screen text.
+        const showLabels = shouldCreateLabel({ x: snapshot.x, y: snapshot.y, w: snapshot.w, h: snapshot.h });
+        if (showLabels) {
+            // title (lazily created, parented to view.root)
+            if (!view.titleText) {
+                view.titleText = makeText(snapshot.label, 'node-label:' + view.id, TEXT_STYLE.nodeTitle);
                 view.root.addChild(view.titleText);
-            } else {
-                view.titleText.text = labelText;
-                view.titleText.visible = true;
             }
-        }
-        if (!prev || prev.sublabel !== snapshot.sublabel) {
-            const subText = (snapshot.sublabel === null || snapshot.sublabel === undefined) ? '' : String(snapshot.sublabel);
-            if (subText === '') {
-                if (view.subText) { view.subText.visible = false; }
-            } else if (!view.subText) {
-                view.subText = makeText(subText, 'node-sublabel:' + view.id, TEXT_STYLE.nodeSub);
+            view.titleText.text = snapshot.label;
+            view.titleText.anchor.set(0.5, 0.5);
+            view.titleText.x = snapshot.w / 2;
+            view.titleText.y = snapshot.sublabel ? (snapshot.h / 2 - 7) : (snapshot.h / 2);
+            view.titleText.visible = true;
+            registerSceneLabel('node-label:' + view.id,
+                snapshot.x + snapshot.w / 2,
+                snapshot.y + (snapshot.sublabel ? (snapshot.h / 2 - 7) : (snapshot.h / 2)));
+            // sublabel
+            if (snapshot.sublabel) {
+                if (!view.subText) {
+                    view.subText = makeText(snapshot.sublabel, 'node-sublabel:' + view.id, TEXT_STYLE.nodeSub);
+                    view.root.addChild(view.subText);
+                }
+                view.subText.text = snapshot.sublabel;
+                view.subText.anchor.set(0.5, 0.5);
+                view.subText.x = snapshot.w / 2;
+                view.subText.y = snapshot.h / 2 + 8;
                 view.subText.visible = true;
-                view.root.addChild(view.subText);
-            } else {
-                view.subText.text = subText;
-                view.subText.visible = true;
+                registerSceneLabel('node-sublabel:' + view.id,
+                    snapshot.x + snapshot.w / 2, snapshot.y + snapshot.h / 2 + 8);
+            } else if (view.subText) {
+                view.subText.visible = false;
             }
+        } else {
+            if (view.titleText) { view.titleText.visible = false; }
+            if (view.subText) { view.subText.visible = false; }
         }
         view.snapshot = snapshot;
     }
 
     function patchGroupView(view, snapshot) {
         requireSnapshotFields('group', view.id, snapshot, GROUP_SNAPSHOT_FIELDS);
-        const prev = view.snapshot;
-        if (!prev || prev.x !== snapshot.x) { view.root.x = snapshot.x; }
-        if (!prev || prev.y !== snapshot.y) { view.root.y = snapshot.y; }
-        if (!prev || prev.alpha !== snapshot.alpha) { view.root.alpha = snapshot.alpha; }
-        if (!prev || prev.label !== snapshot.label) {
-            const labelText = (snapshot.label === null || snapshot.label === undefined) ? '' : String(snapshot.label);
-            if (labelText === '') {
-                if (view.headerText) { view.headerText.visible = false; }
-            } else if (!view.headerText) {
-                view.headerText = makeText(labelText, 'group-header:' + view.id, TEXT_STYLE.groupHeader);
-                view.headerText.visible = true;
+        view.root.x = snapshot.x;
+        view.root.y = snapshot.y;
+        view.root.alpha = snapshot.alpha;
+        view.box.clear();
+        const gc = snapshot.fill;
+        if (snapshot.collapsed) {
+            fillStrokeBox(view.box, 0, 0, snapshot.w, snapshot.h, {
+                radius: 8, fill: gc, fillAlpha: 0.22, stroke: gc, strokeAlpha: 0.85, strokeWidth: 1.5
+            });
+        } else {
+            fillStrokeBox(view.box, 0, 0, snapshot.w, snapshot.h, {
+                radius: 8, fill: gc, fillAlpha: 0.08, stroke: gc, strokeAlpha: 0.7, strokeWidth: 1.5
+            });
+            view.box.roundRect(0, 0, snapshot.w, 26, 8).fill({ color: gc, alpha: 0.35 }); // header bar
+        }
+        // Header / info-'i' / timing glyphs are culled (the box + the info circle
+        // graphic are always drawn).  Mirrors the legacy draw path which always
+        // painted the container chrome but only created the text labels for
+        // on-screen groups.
+        const showLabels = shouldCreateLabel({ x: snapshot.x, y: snapshot.y, w: snapshot.w, h: snapshot.h });
+        // header text (lazily created, parented to view.root)
+        const arrow = snapshot.collapsed ? '\u25B6 ' : '\u25BC ';
+        const rightReserve = snapshot.collapsed
+            ? (snapshot.hasInfo ? 26 : 10)
+            : ((snapshot.hasInfo ? 26 : 10) + (snapshot.hasTiming ? 130 : 0));
+        const headerChars = maxCharsForWidth(snapshot.w - 10 - rightReserve, 7.8, 0) - 2;
+        if (showLabels) {
+            if (!view.headerText) {
+                view.headerText = makeText('', 'group-header:' + view.id, TEXT_STYLE.groupHeader);
                 view.root.addChild(view.headerText);
-            } else {
-                view.headerText.text = labelText;
-                view.headerText.visible = true;
             }
+            view.headerText.text = arrow + truncateLabel(snapshot.label, headerChars);
+            view.headerText.anchor.set(0, 0.5);
+            view.headerText.x = 10;
+            view.headerText.y = snapshot.collapsed ? 15 : 13;
+            view.headerText.visible = true;
+            registerSceneLabel('group-header:' + view.id,
+                snapshot.x + 10, snapshot.y + (snapshot.collapsed ? 15 : 13));
+        } else if (view.headerText) {
+            view.headerText.visible = false;
+        }
+        // info badge: the circle graphic is always drawn when hasInfo; the 'i'
+        // text glyph is culled like the other labels.
+        if (snapshot.hasInfo) {
+            if (!view.infoGfx) {
+                view.infoGfx = makeGraphics('group-info-hit:' + view.id);
+                view.root.addChild(view.infoGfx);
+            }
+            view.infoGfx.clear();
+            view.infoGfx.circle(snapshot.w - 13, 13, 8).fill({ color: 0x000000, alpha: 0.35 }).stroke({ color: 0xffffff, width: 1, alpha: 0.6 });
+            view.infoGfx.visible = true;
+            if (showLabels) {
+                if (!view.infoText) {
+                    view.infoText = makeText('i', 'group-info:' + view.id, TEXT_STYLE.info);
+                    view.root.addChild(view.infoText);
+                }
+                view.infoText.anchor.set(0.5, 0.5);
+                view.infoText.x = snapshot.w - 13;
+                view.infoText.y = 13;
+                view.infoText.visible = true;
+                registerSceneLabel('group-info:' + view.id, snapshot.x + snapshot.w - 13, snapshot.y + 13);
+            } else if (view.infoText) {
+                view.infoText.visible = false;
+            }
+        } else {
+            if (view.infoGfx) { view.infoGfx.visible = false; }
+            if (view.infoText) { view.infoText.visible = false; }
+        }
+        // timing text (lazily created, parented to view.root)
+        if (snapshot.hasTiming && showLabels) {
+            if (!view.timingTextNode) {
+                view.timingTextNode = makeText('', 'group-timing:' + view.id, TEXT_STYLE.groupTiming);
+                view.root.addChild(view.timingTextNode);
+            }
+            view.timingTextNode.text = snapshot.timingText;
+            let timingX;
+            let timingY;
+            if (snapshot.collapsed) {
+                view.timingTextNode.anchor.set(0, 0.5);
+                view.timingTextNode.x = 10;
+                view.timingTextNode.y = 32;
+                timingX = snapshot.x + 10;
+                timingY = snapshot.y + 32;
+            } else {
+                view.timingTextNode.anchor.set(1, 0.5);
+                view.timingTextNode.x = snapshot.w - 26;
+                view.timingTextNode.y = 13;
+                timingX = snapshot.x + snapshot.w - 26;
+                timingY = snapshot.y + 13;
+            }
+            view.timingTextNode.visible = true;
+            registerSceneLabel('group-timing:' + view.id, timingX, timingY);
+        } else if (view.timingTextNode) {
+            view.timingTextNode.visible = false;
         }
         view.snapshot = snapshot;
     }
 
     function patchEdgeView(view, snapshot) {
         requireSnapshotFields('edge', view.key, snapshot, EDGE_SNAPSHOT_FIELDS);
-        const prev = view.snapshot;
-        if (!prev || prev.alpha !== snapshot.alpha) { view.root.alpha = snapshot.alpha; }
+        view.root.alpha = snapshot.alpha;
+        view.path.clear();
+        const style = {
+            color: snapshot.stroke,
+            width: snapshot.strokeWidth,
+            alpha: snapshot.alpha,
+            arrowAlpha: snapshot.arrowAlpha,
+            dashed: snapshot.dashed
+        };
+        strokePolyline(view.path, snapshot.points, style);
+        drawArrowHead(view.path, snapshot.points, style);
         view.snapshot = snapshot;
     }
 
@@ -1722,14 +1613,19 @@
         // meta is a hard error (no silent fallback): it means computeVisibleScene
         // walked a group the freshly-computed layout never positioned.
         requireFiniteXYWH('group', g.id, groupMeta);
+        const groupColor = nodeColorOf(g);
+        const hasTiming = !!g.has_timing;
+        const hasInfo = !!g.src_file;
         return {
+            id: g.id,
             x: groupMeta.x, y: groupMeta.y, w: groupMeta.w, h: groupMeta.h,
-            label: String((g.label !== undefined && g.label !== null) ? g.label : (g.attr_name !== undefined && g.attr_name !== null ? g.attr_name : g.id)),
-            type: String(g.node_type || 'module'),
+            label: String(g.class_name),
             collapsed: collapsed[g.id] === true,
+            fill: groupColor,
             alpha: 1.0,
-            childCount: ((g.children_nodes || []).length) + ((g.children_group_ids || []).length),
-            metaVersion: 1
+            hasInfo: hasInfo,
+            hasTiming: hasTiming,
+            timingText: hasTiming ? ('Kernel ' + g.pct.toFixed(1) + '% \u00B7 ' + formatDurOf(g.dur_us)) : ''
         };
     }
 
@@ -1738,10 +1634,11 @@
         // current collapsed state.  Missing/partial meta is a hard error.
         requireFiniteXYWH('node', n.id, nodeMeta);
         return {
+            id: n.id,
             x: nodeMeta.x, y: nodeMeta.y, w: nodeMeta.w, h: nodeMeta.h,
-            label: String((n.label !== undefined && n.label !== null) ? n.label : (n.attr_name !== undefined && n.attr_name !== null ? n.attr_name : n.id)),
-            sublabel: String(n.class_name || ''),
-            fill: 0x4a6fa5,
+            label: truncateLabel(n.class_name, maxCharsForWidth(nodeMeta.w, 7.2, 8)),
+            sublabel: n.has_timing ? (n.pct.toFixed(1) + '%') : '',
+            fill: nodeColorOf(n),
             stroke: 0xffffff,
             alpha: 1.0
         };
@@ -1750,9 +1647,8 @@
     function makeIncrEdgeSnapshot(e, edgeMeta) {
         // edgeMeta.points is the real polyline derived from the visible
         // endpoints' layout centres (computed against the same fresh layout as
-        // the node/group snapshots).  Edges are not stroked by the incremental
-        // patch path yet (patchEdgeView only updates alpha) but the snapshot
-        // still carries truthful geometry instead of the old (0,0)->(10,10) stub.
+        // the node/group snapshots), routed through EdgeRoute and styled via
+        // EDGE_STYLE.  All draw fields are carried truthfully — no fallback.
         if (!edgeMeta || !Array.isArray(edgeMeta.points) || edgeMeta.points.length < 2) {
             throw new Error('computeVisibleScene: edge ' +
                 (e && e.from !== undefined ? e.from : '?') + '->' + (e && e.to !== undefined ? e.to : '?') +
@@ -1760,10 +1656,22 @@
         }
         return {
             points: edgeMeta.points,
-            stroke: 0xaaaaaa,
-            strokeWidth: 1.0,
-            alpha: 1.0,
-            dashed: false
+            stroke: edgeMeta.stroke,
+            strokeWidth: edgeMeta.strokeWidth,
+            alpha: edgeMeta.alpha,
+            dashed: edgeMeta.dashed,
+            arrowAlpha: edgeMeta.arrowAlpha,
+            // Legacy edge-record fields consumed by buildSnapshot()'s snap.edges
+            // reconstruction (from/to are the *original* endpoint ids; start/end
+            // are the *redirected* port positions).
+            from: e.from,
+            to: e.to,
+            type: edgeMeta.type,
+            colorKey: edgeMeta.colorKey,
+            start: edgeMeta.start,
+            end: edgeMeta.end,
+            branch: edgeMeta.branch,
+            arrow: edgeMeta.arrow
         };
     }
 
@@ -1816,13 +1724,6 @@
         return { nodeMeta: nodeMeta, groupMeta: groupMeta };
     }
 
-    function edgeEndpointCenter(metaMaps, id) {
-        const key = String(id);
-        const m = metaMaps.nodeMeta.get(key) || metaMaps.groupMeta.get(key);
-        if (!m) { return null; }
-        return { x: m.x + m.w / 2, y: m.y + m.h / 2 };
-    }
-
     function computeVisibleScene() {
         ensureEngine();
         const data = engine.dataRef;
@@ -1853,65 +1754,108 @@
         const visibleGroupSet = new Set();
         const visibleNodeSet = new Set();
 
-        const queue = [];
-        const enqueued = new Set();
-        (data.root_groups || []).forEach(function (rid) {
-            const key = String(rid);
-            if (!enqueued.has(key)) { queue.push(key); enqueued.add(key); }
-        });
-        while (queue.length) {
-            const gid = queue.shift();
-            if (visibleGroupSet.has(gid)) { continue; }
+        // Recursive top-down walk that mirrors the legacy ``walkGroup`` order so
+        // the ``nodePortMap`` it populates is byte-identical to the deleted draw
+        // path.  Port registration ordering matters:
+        //   * each visible leaf registers its node ports as it is visited;
+        //   * a collapsed group registers its in/out/center ports (and redirects
+        //     its boundary port node_ids onto the collapsed box) instead of
+        //     recursing into its now-hidden children;
+        //   * an expanded group registers its boundary ports AFTER its subtree so
+        //     the group-level in/out override wins over the child leaf ports.
+        function walk(gidRaw) {
+            const gid = String(gidRaw);
+            if (visibleGroupSet.has(gid)) { return; }
             const g = groupById.get(gid);
             if (!g) {
-                throw new Error('render_canvas.js: computeVisibleScene found root_groups entry with no matching group: ' + gid);
+                throw new Error('render_canvas.js: computeVisibleScene found root_groups/children entry with no matching group: ' + gid);
             }
+            const gmeta = groupMetaById.get(gid);
+            requireFiniteXYWH('group', g.id, gmeta);
             visibleGroupSet.add(gid);
             groupIds.push(gid);
-            groupSnapshots[gid] = makeIncrGroupSnapshot(g, collapsed, groupMetaById.get(gid));
-            if (collapsed[g.id] === true) { continue; }
-            (g.children_group_ids || []).forEach(function (cgid) {
-                const sgid = String(cgid);
-                if (!enqueued.has(sgid)) { queue.push(sgid); enqueued.add(sgid); }
-            });
+            groupSnapshots[gid] = makeIncrGroupSnapshot(g, collapsed, gmeta);
+            if (collapsed[g.id] === true) {
+                registerCollapsedGroupPorts(g, g.id, gmeta.x, gmeta.y, { w: gmeta.w, h: gmeta.h });
+                return;
+            }
             (g.children_nodes || []).forEach(function (cnid) {
                 const snid = String(cnid);
-                if (!visibleNodeSet.has(snid)) {
-                    visibleNodeSet.add(snid);
-                    nodeIds.push(snid);
-                    const node = nodeById.get(snid);
-                    if (!node) {
-                        throw new Error('render_canvas.js: computeVisibleScene found children_nodes entry with no matching node: ' + snid);
-                    }
-                    nodeSnapshots[snid] = makeIncrNodeSnapshot(node, nodeMetaById.get(snid));
+                if (visibleNodeSet.has(snid)) { return; }
+                const node = nodeById.get(snid);
+                if (!node) {
+                    throw new Error('render_canvas.js: computeVisibleScene found children_nodes entry with no matching node: ' + snid);
                 }
+                const nmeta = nodeMetaById.get(snid);
+                requireFiniteXYWH('node', node.id, nmeta);
+                visibleNodeSet.add(snid);
+                nodeIds.push(snid);
+                nodeSnapshots[snid] = makeIncrNodeSnapshot(node, nmeta);
+                registerNodePorts(node.id, nmeta.x, nmeta.y, nmeta.w, nmeta.h);
             });
+            (g.children_group_ids || []).forEach(function (cgid) {
+                walk(cgid);
+            });
+            registerExpandedGroupPorts(g, g.id, gmeta.x, gmeta.y, { w: gmeta.w, h: gmeta.h });
         }
+        (data.root_groups || []).forEach(function (rid) {
+            walk(rid);
+        });
 
+        // Global edges (ported verbatim from the legacy ``drawGlobalEdges`` path):
+        // each endpoint is redirected to its outermost collapsed ancestor, the
+        // edge is dropped if both endpoints collapse onto the same box, and the
+        // start/end coordinates come from ``nodePortMap[id__out]`` /
+        // ``nodePortMap[id__in]`` (falling back to the centre port).  A redirected
+        // endpoint with no registered port is a hard error, never a silent skip.
+        const portMap = lookupNodePortMap();
+        if (!portMap) {
+            throw new Error('render_canvas.js: nodePortMap is unavailable while routing global edges');
+        }
+        const isVisible = lookupIsEdgeVisible();
+        const resolveAncestor = lookupResolveCollapsedAncestor();
         const edgeKeyFn = lookupEdgeKey();
+        if (!isVisible || !resolveAncestor || !edgeKeyFn) {
+            throw new Error('render_canvas.js: inline edge globals unavailable while routing global edges');
+        }
+        const bundleMeta = lookupEdgeBundleMeta();
         const seenEdgeKeys = new Set();
         (data.edges || []).forEach(function (e) {
-            const fromS = String(e && e.from !== undefined && e.from !== null ? e.from : '');
-            const toS   = String(e && e.to   !== undefined && e.to   !== null ? e.to   : '');
-            const fromVisible = visibleNodeSet.has(fromS) || visibleGroupSet.has(fromS);
-            const toVisible   = visibleNodeSet.has(toS)   || visibleGroupSet.has(toS);
-            if (!fromVisible || !toVisible) { return; }
-            const key = edgeKeyFn
-                ? String(edgeKeyFn(e))
-                : (fromS + '||' + toS + '||' + (e && e.type ? e.type : '') + '||' + (e && e.parent_class ? e.parent_class : ''));
+            if (!isVisible(e)) { return; }
+            const fromId = String(resolveAncestor(e.from));
+            const toId = String(resolveAncestor(e.to));
+            if (fromId === toId) { return; }
+            const fromPos = portMap[fromId + '__out'] || portMap[fromId];
+            const toPos = portMap[toId + '__in'] || portMap[toId];
+            if (!fromPos || !toPos) {
+                throw new Error('global edge endpoint missing: ' + e.from + ' -> ' + e.to);
+            }
+            const routeMeta = bundleMeta ? (bundleMeta.get(edgeKeyFn(e)) || null) : null;
+            const route = EdgeRoute.compute('direct', fromPos.cx, fromPos.cy, toPos.cx, toPos.cy, routeMeta);
+            // EdgeRoute.direct returns null for a degenerate span (|dy|<3 &&
+            // |dx|<3); such edges are not drawable and are dropped (legacy parity).
+            if (!route) { return; }
+            const key = String(edgeKeyFn(e));
             if (!key || seenEdgeKeys.has(key)) { return; }
             seenEdgeKeys.add(key);
-            // Build a real polyline from the visible endpoints' layout centres.
-            // Both endpoints are guaranteed visible by the filter above, so a
-            // missing centre means a layout/visibility mismatch — hard error.
-            const fromCenter = edgeEndpointCenter(layoutMeta, fromS);
-            const toCenter = edgeEndpointCenter(layoutMeta, toS);
-            if (!fromCenter || !toCenter) {
-                throw new Error('render_canvas.js: computeVisibleScene visible edge ' + fromS + '->' + toS +
-                    ' has an endpoint with no layout meta');
-            }
+            const type = e.type || 'dep';
+            const colorKey = colorKeyForType(type);
+            const st = EDGE_STYLE[colorKey];
             edgeKeys.push(key);
-            edgeSnapshots[key] = makeIncrEdgeSnapshot(e, { points: [fromCenter, toCenter] });
+            edgeSnapshots[key] = makeIncrEdgeSnapshot(e, {
+                points: route.points,
+                dashed: route.dashed,
+                stroke: st.color,
+                strokeWidth: st.width,
+                alpha: st.alpha,
+                arrowAlpha: st.arrowAlpha,
+                type: type,
+                colorKey: colorKey,
+                start: { cx: fromPos.cx, cy: fromPos.cy },
+                end: { cx: toPos.cx, cy: toPos.cy },
+                branch: route.branch,
+                arrow: true
+            });
         });
 
         return {
@@ -1926,6 +1870,7 @@
 
     function invokeIncrementalRender() {
         ensureEngine();
+        engine.incrementalRenderCount = (engine.incrementalRenderCount || 0) + 1;
         const prev = {
             groupIds: engine.visibleGroupIds,
             nodeIds: engine.visibleNodeIds,
@@ -1959,14 +1904,6 @@
             engine.app.canvas.style.width = '100%';
         }
         applyViewport();
-    }
-
-    function layoutAndDrawRoots(layoutInfo) {
-        applyWorldLayout(layoutInfo);
-        for (const root of (layoutInfo.rootPositions || [])) {
-            walkGroup(root.id, root.x, root.y);
-        }
-        drawIOTasks(layoutInfo.ioTasks || []);
     }
 
     // Stage 1.5: fit the freshly-laid-out world into the visible container.
@@ -2124,6 +2061,20 @@
 
     async function canvasRenderPhase1(data, renderOpts) {
         ensureEngine();
+        // Pool-first initial render needs computeVisibleScene() context. The
+        // inline runtime normally installs it via __canvasSetIncrementalContext
+        // before the first render, but headless probes call canvasRenderPhase1
+        // directly with fresh ``data`` (and mutate the inline ``collapsedState``
+        // global) without going through that hook. Establish the context here
+        // from the render's own ``data`` argument + the live collapsedState so
+        // the initial scene walk always has a valid, current reference.
+        if (data && typeof data === 'object') {
+            engine.dataRef = data;
+            const liveCollapsed = lookupCollapsedState();
+            if (liveCollapsed && typeof liveCollapsed === 'object') {
+                engine.collapsedStateRef = liveCollapsed;
+            }
+        }
         await ensureStageMounted();
         const p = progressApi();
         const computeLayout = requireInline('computeFlowchartLayout', lookupComputeFlowchartLayout());
@@ -2135,15 +2086,21 @@
         try {
             resetInlineLayoutCache();
             resetNodePortMap();
-            // TODO Phase2: migrate to diffAndPatch
-            // The phase-2 design (``design/frontend_canvas_phase2.md`` §2.4.1)
-            // restricts ``resetScene()`` to a single first-render call; later
-            // steps replace the per-render full clear with the object-pool
-            // ``diffAndPatch()`` path.  Step 1 keeps this call site so the
-            // existing draw pipeline (``layoutAndDrawRoots`` /
-            // ``drawGlobalEdges`` writing into ``engine.nodes`` etc.) still
-            // works unchanged; the migration is done in a later step.
-            resetScene();
+            // Phase 2 step 4: the initial render is now *pool-first* — there is
+            // no resetScene() / legacy walkGroup draw anymore.  The node/group/
+            // edge pools live on l3/l2/l1 (their roots are added once at create
+            // time and reused), so we must NOT removeChildren() those layers or
+            // we would orphan every pool root.  We only clear the IO layer (l5),
+            // which is redrawn from scratch by drawIOTasks below, and reset the
+            // legacy bookkeeping arrays so buildSnapshot()/auto-fit start clean.
+            engine.layers.l5.removeChildren();
+            engine.io_pills = [];
+            engine.nodes = [];
+            engine.groups = [];
+            engine.edges = [];
+            engine.labels = [];
+            engine.labelsCreated = 0;
+            engine.contentBounds = null;
             let layoutInfo = null;
             if (!await p.runChunked([{ type: 'group', taskKind: 'layout' }], async function () {
                 resetInlineLayoutCache();
@@ -2160,7 +2117,8 @@
                 return;
             }
             if (!await p.runChunked([{ type: 'group', taskKind: 'draw-scene' }], async function () {
-                layoutAndDrawRoots(layoutInfo);
+                applyWorldLayout(layoutInfo);
+                drawIOTasks(layoutInfo.ioTasks || []);
             }, {
                 batchSize: 1,
                 phaseStart: 30,
@@ -2173,7 +2131,17 @@
                 return;
             }
             if (!await p.runChunked([{ type: 'edge', taskKind: 'draw-edges' }], async function () {
-                drawGlobalEdges(data);
+                // Pool-first scene fill: diff the freshly computed visible scene
+                // against the current visible sets and patch the pools.  On the
+                // first render engine.visible* are empty Sets, so this is a full
+                // create+patch; on a re-render it recycles unchanged views.
+                const prev = {
+                    groupIds: engine.visibleGroupIds,
+                    nodeIds: engine.visibleNodeIds,
+                    edgeKeys: engine.visibleEdgeKeys
+                };
+                const next = computeVisibleScene();
+                diffAndPatch(prev, next);
             }, {
                 batchSize: 1,
                 phaseStart: 60,
@@ -2206,18 +2174,15 @@
                 await p.hideRenderProgress();
                 return;
             }
-            // Phase 2 step 4 fix: the object pool is NOT seeded here.  The
-            // initial render draws the whole scene through the legacy walkGroup /
-            // drawGlobalEdges path (correct, fitted coordinates); seeding the
-            // pool on top of it used to double-draw every glyph and — with the
-            // old (0,0) snapshot stub — stacked the entire pool in the top-left
-            // corner.  The pool now fills lazily on the first toggle:
-            // ``invokeIncrementalRender`` runs ``diffAndPatch(emptyPrev, computed)``
-            // where ``computed`` carries real, current-state coordinates from
-            // ``computeLayoutMeta``.  ``engine.dataRef`` / ``collapsedStateRef``
-            // are still installed (by the inline runtime via
-            // ``__canvasSetIncrementalContext``) so that first toggle has its
-            // context.  Subsequent toggles diff against the previous visible sets.
+            // Phase 2 step 4: the object pool is now seeded by the pool-first
+            // initial render itself (the ``draw-edges`` chunk above ran
+            // ``diffAndPatch(prev, computeVisibleScene())`` with real,
+            // current-state coordinates from ``computeLayoutMeta``).  Subsequent
+            // toggles / Expand-All / Collapse-All route through
+            // ``invokeIncrementalRender`` and diff against the previous visible
+            // sets.  ``engine.dataRef`` / ``collapsedStateRef`` are installed by
+            // the inline runtime via ``__canvasSetIncrementalContext`` before the
+            // first render, so ``computeVisibleScene`` always has its context.
             await p.hideRenderProgress();
             return buildSnapshot();
         } catch (err) {
@@ -2294,10 +2259,55 @@
         };
     }
 
+    // Pool-first reconstruction of the legacy ``engine.nodes`` / ``engine.groups``
+    // / ``engine.edges`` arrays.  The initial render no longer walks the scene and
+    // pushes into these arrays directly; instead the object pools hold the live
+    // views.  This rebuilds the legacy-shaped arrays from the currently-visible
+    // pool views so existing introspection (``buildSnapshot`` and the few tests
+    // that read ``engine.groups`` directly) keeps working.  It is idempotent —
+    // it overwrites the arrays from the pool every call.
+    function rebuildLegacyArraysFromPool() {
+        const nodes = [];
+        engine.nodePool.forEach(function (view) {
+            if (view.visible !== true || !view.snapshot) { return; }
+            const s = view.snapshot;
+            nodes.push({
+                id: s.id, x: s.x, y: s.y, w: s.w, h: s.h,
+                color: s.fill, label: s.label, sublabel: s.sublabel, visible: true
+            });
+        });
+        const groups = [];
+        engine.groupPool.forEach(function (view) {
+            if (view.visible !== true || !view.snapshot) { return; }
+            const s = view.snapshot;
+            groups.push({
+                id: s.id, collapsed: s.collapsed, x: s.x, y: s.y, w: s.w, h: s.h,
+                has_header: !s.collapsed, has_info: s.hasInfo, has_timing: s.hasTiming
+            });
+        });
+        const edges = [];
+        engine.edgePool.forEach(function (view) {
+            if (view.visible !== true || !view.snapshot) { return; }
+            const s = view.snapshot;
+            edges.push({
+                from: s.from, to: s.to, type: s.type, colorKey: s.colorKey,
+                start: { cx: s.start.cx, cy: s.start.cy },
+                end: { cx: s.end.cx, cy: s.end.cy },
+                branch: s.branch, dashed: s.dashed, arrow: s.arrow
+            });
+        });
+        engine.nodes = nodes;
+        engine.groups = groups;
+        engine.edges = edges;
+    }
+
     function buildSnapshot() {
         if (!engine) {
             throw new Error('render_canvas.js: __renderSnapshot called before the Canvas engine was initialized');
         }
+        // Rebuild the legacy arrays from the live pools so the snapshot below
+        // (and direct engine.nodes/groups/edges access) reflect the current scene.
+        rebuildLegacyArraysFromPool();
         const vp = engine.viewport;
         return {
             nodes: (engine.nodes || []).map(function (n) {
