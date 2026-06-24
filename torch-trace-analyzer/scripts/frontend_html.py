@@ -252,6 +252,10 @@ const DATA = __FLOWCHART_DATA_PLACEHOLDER__;
 const groupMap = {};
 const nodeMap = {};
 const collapsedState = {};
+// Phase 2 step 3: expose ``collapsedState`` for the canvas engine + tests.
+// ``window.__canvasOnGroupToggle`` mutates this map; ``window.__canvas_collapsed_state``
+// is the read alias used by UTs to assert toggle behaviour.
+if (typeof window !== 'undefined') { window.__canvas_collapsed_state = collapsedState; }
 let groupLayout = {};
 let nodePortMap = {};
 let edgeDomRegistry = [];
@@ -1548,6 +1552,89 @@ async function render(renderOpts) {
         return window.__canvasRenderPhase1(DATA, renderOpts);
     }
     throw new Error('Canvas render entry __canvasRenderPhase1 is missing; engine bundle or render_canvas.js not loaded');
+}
+
+// Phase 2 step 3: ``invokeIncrementalRender`` is the post-toggle render entry.
+// Step 3 lands the click / dblclick wiring and a minimal incremental path that
+// re-renders *without* auto-fitting (so the viewport stays put across toggles).
+// Step 4 will migrate Expand-All / Collapse-All away from ``invokeRender`` and
+// fully restrict ``resetScene()`` to first-render only — until then, this
+// helper simply triggers a non-auto-fit re-render so the design's
+// "no resize / no auto-fit" goal is partially honoured.
+function invokeIncrementalRender(ctx) {
+    return invokeRender({ autoFit: false });
+}
+
+// Phase 2 step 3: click / dblclick handlers on group hit boxes forward to
+// these inline-runtime globals (render_canvas.js' engine.onGroupToggle /
+// onGroupSelect read them at call time).  Missing groupMap[gid] is a hard
+// error — no silent fallback.
+if (typeof window !== 'undefined') {
+    window.__canvasOnGroupToggle = function (gid) {
+        if (!groupMap[gid]) {
+            throw new Error('__canvasOnGroupToggle: unknown group id ' + gid);
+        }
+        collapsedState[gid] = !collapsedState[gid];
+        invokeIncrementalRender({ reason: 'toggle', gid: gid });
+    };
+    window.__canvasOnGroupSelect = function (gid) {
+        const g = groupMap[gid];
+        if (!g) {
+            throw new Error('__canvasOnGroupSelect: unknown group id ' + gid);
+        }
+        const engine = (typeof window.__canvasEnginePhase1 === 'function') ? window.__canvasEnginePhase1() : null;
+        if (engine) { engine.selectedGroupId = gid; }
+        showGroupPanel(g);
+    };
+}
+
+function showGroupPanel(g) {
+    const sp = document.getElementById('side-panel');
+    const body = document.getElementById('sp-body');
+    const titleEl = document.getElementById('sp-title');
+    const subtitleEl = document.getElementById('sp-subtitle');
+    if (!sp || !body || !titleEl || !subtitleEl) {
+        throw new Error('showGroupPanel: side-panel DOM is missing');
+    }
+    titleEl.textContent = g.class_name || g.label || ('group ' + g.id);
+    subtitleEl.textContent = (g.attr_name || '') + ' \u00B7 gid=' + g.id;
+
+    const collapsed = !!collapsedState[g.id];
+    const childrenCount = ((g.children_group_ids || []).length) + ((g.children_nodes || []).length);
+    const kernelMs = Number(g && g.kernel_us != null ? g.kernel_us : (g.dur_us || 0)) / 1000.0;
+    const fwdMs = Number(g && g.fwd_kernel_us || 0) / 1000.0;
+    const bwdMs = Number(g && g.bwd_kernel_us || 0) / 1000.0;
+    const otherMs = Number(g && g.other_kernel_us || 0) / 1000.0;
+
+    let bodyHtml = '<div class="side-panel-section"><h4>Group</h4>'
+        + `<div class="evidence-meta"><b>gid:</b> ${escapeHtml(String(g.id))}</div>`
+        + `<div class="evidence-meta"><b>label:</b> ${escapeHtml(g.label || '')}</div>`
+        + `<div class="evidence-meta"><b>type:</b> ${escapeHtml(String(g.node_type || g.synthetic_type || 'module'))}</div>`
+        + `<div class="evidence-meta"><b>depth:</b> ${escapeHtml(String(g.depth))}</div>`
+        + `<div class="evidence-meta"><b>collapsed:</b> ${collapsed ? 'true' : 'false'}</div>`
+        + `<div class="evidence-meta"><b>children:</b> ${escapeHtml(String(childrenCount))}</div>`
+        + '</div>';
+
+    if (g.has_timing || g.has_phase_timing) {
+        bodyHtml += '<div class="side-panel-section"><h4>Timing</h4>'
+            + renderTimingRow('Kernel', kernelMs, 'kernel')
+            + renderTimingRow('Forward', fwdMs, 'forward')
+            + renderTimingRow('Backward', bwdMs, 'backward')
+            + renderTimingRow('Other', otherMs, 'other')
+            + '</div>';
+    }
+
+    if (g.src_file) {
+        const startLine = g.src_start_line || '';
+        const endLine = g.src_end_line || '';
+        bodyHtml += '<div class="side-panel-section"><h4>Source location</h4>'
+            + `<div class="evidence-meta"><b>file:</b> ${escapeHtml(String(g.src_file))}</div>`
+            + `<div class="evidence-meta"><b>lines:</b> ${escapeHtml(String(startLine))}\u2013${escapeHtml(String(endLine))}</div>`
+            + '</div>';
+    }
+
+    body.innerHTML = bodyHtml;
+    sp.classList.add('open');
 }
 
 function toggleGroup(gid) {
