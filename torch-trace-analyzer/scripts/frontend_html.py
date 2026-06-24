@@ -26,7 +26,6 @@ import os
 import sys
 import json as _json
 import re
-from collections import defaultdict
 from pathlib import Path
 
 # When this module is imported by ``analyze_trace.py`` the script directory is
@@ -36,6 +35,12 @@ from pathlib import Path
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _RENDER_GROUP_JS_PATH = Path(_SCRIPT_DIR) / "render_group.js"
 _RENDER_GROUP_JS_PLACEHOLDER = "__RENDER_GROUP_JS_PLACEHOLDER__"
+# Canvas Phase 1 / Stage 1.1: the runtime render path switches from the legacy
+# SVG `render_group.js` injection to a Pixi engine bundle + `render_canvas.js`.
+_ENGINE_BUNDLE_PATH = Path(_SCRIPT_DIR) / "pixi_engine_bundle.js"
+_ENGINE_BUNDLE_PLACEHOLDER = "__ENGINE_BUNDLE_PLACEHOLDER__"
+_RENDER_CANVAS_JS_PATH = Path(_SCRIPT_DIR) / "render_canvas.js"
+_RENDER_CANVAS_JS_PLACEHOLDER = "__RENDER_CANVAS_JS_PLACEHOLDER__"
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
@@ -48,6 +53,7 @@ FLOWCHART_HTML_TEMPLATE = r"""<!DOCTYPE html>
 <title>Module DAG Flowchart - Torch Trace Analyzer</title>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { overflow-anchor: none; }
 body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #1a1a2e; color: #e0e0e0; padding: 20px; min-height: 100vh; }
 .header { text-align: center; margin-bottom: 24px; }
 .header h1 { font-size: 22px; color: #ffffff; margin-bottom: 6px; }
@@ -59,26 +65,9 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 .controls button { background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.15); color: #ccc; padding: 6px 14px; border-radius: 6px; font-size: 12px; cursor: pointer; transition: all 0.2s; }
 .controls button:hover { background: rgba(255,255,255,0.15); color: #fff; }
 .controls button.active { background: rgba(100,181,246,0.2); border-color: #64b5f6; color: #64b5f6; }
-.dag-container { width: 100%; overflow: auto; position: relative; contain: layout style; }
-.dag-svg { display: block; margin: 0 auto; will-change: transform; }
-.dag-svg .group-box { fill: rgba(255,255,255,0.03); stroke: rgba(255,255,255,0.12); stroke-width: 1.5; rx: 10; cursor: pointer; transition: fill 0.2s; }
-.dag-svg .group-box:hover { fill: rgba(255,255,255,0.06); stroke: rgba(100,181,246,0.4); }
-.dag-svg .group-box.collapsed { fill: rgba(100,181,246,0.08); stroke: rgba(100,181,246,0.3); stroke-dasharray: 5,3; }
-.dag-svg .group-label { font-size: 11px; fill: #8892b0; font-weight: 600; pointer-events: none; }
-.dag-svg .group-timing { font-size: 10px; fill: #64b5f6; pointer-events: none; }
-.dag-svg .group-toggle { font-size: 10px; fill: #555; pointer-events: auto; cursor: pointer; }
-.dag-svg .group-info-hit { fill: rgba(100,181,246,0.001); stroke: rgba(100,181,246,0.45); stroke-width: 1; pointer-events: auto; cursor: pointer; }
-.dag-svg .group-info-hit:hover { fill: rgba(100,181,246,0.12); stroke: rgba(100,181,246,0.9); }
-.dag-svg .group-info-text { fill: rgba(100,181,246,0.82); font-size: 10px; font-weight: 700; pointer-events: none; text-anchor: middle; dominant-baseline: middle; }
-.dag-svg .leaf-node { rx: 6; ry: 6; stroke-width: 1.5; cursor: default; transition: stroke 0.2s, stroke-width 0.2s; }
-.dag-svg .leaf-node:hover { stroke: #ffffff; stroke-width: 2.5; }
-.dag-svg .node-label { font-size: 11px; fill: #ffffff; font-weight: 500; pointer-events: none; text-anchor: middle; }
-.dag-svg .node-sublabel { font-size: 9px; fill: rgba(255,255,255,0.7); pointer-events: none; text-anchor: middle; }
-.dag-svg .edge-path { fill: none; stroke: rgba(255,255,255,0.2); stroke-width: 1.7; opacity: 0.82; transition: stroke 0.18s ease, stroke-width 0.18s ease, opacity 0.18s ease; }
-.dag-svg .edge-path.internal { stroke: rgba(100,181,246,0.46); stroke-width: 1.35; }
-.dag-svg .edge-path.dep { stroke: rgba(46,204,113,0.62); stroke-width: 1.9; }
-.dag-svg .edge-path.flow { stroke: rgba(255,255,255,0.28); stroke-width: 1.35; stroke-dasharray: 4,3; }
-.dag-svg .port { fill: rgba(255,255,255,0.15); stroke: rgba(255,255,255,0.3); stroke-width: 1; }
+.dag-container { width: 100%; overflow-x: hidden; position: relative; }
+.dag-stage { display: block; margin: 0 auto; width: 100%; overflow: visible; overflow-anchor: none; }
+.dag-stage canvas { display: block; width: 100%; }
 .tooltip { position: fixed; background: #16213e; border: 1px solid rgba(100,181,246,0.3); border-radius: 8px; padding: 10px 14px; font-size: 11px; color: #e0e0e0; pointer-events: none; z-index: 1000; max-width: 300px; box-shadow: 0 4px 20px rgba(0,0,0,0.4); opacity: 0; transition: opacity 0.15s; }
 .tooltip.visible { opacity: 1; }
 .tooltip .tt-title { font-weight: 600; color: #64b5f6; margin-bottom: 4px; }
@@ -110,14 +99,6 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 .code-line .code-text mark.var-mark { background: rgba(255, 209, 102, 0.25); color: #fff4c2; border-radius: 3px; padding: 0 2px; box-shadow: inset 0 0 0 1px rgba(255, 209, 102, 0.35); font-weight: 600; }
 .code-line .code-text mark.var-mark.producer-mark { background: rgba(46, 204, 113, 0.30); color: #d5f5e3; box-shadow: inset 0 0 0 1px rgba(46, 204, 113, 0.40); }
 .code-line .code-text mark.var-mark.consumer-mark { background: rgba(255, 209, 102, 0.25); color: #fff4c2; box-shadow: inset 0 0 0 1px rgba(255, 209, 102, 0.35); }
-.dag-svg .group-clickable { cursor: pointer; }
-.dag-svg .edge-path { pointer-events: stroke; cursor: pointer; }
-.dag-svg .edge-path:hover { stroke-width: 3.4; opacity: 1 !important; }
-.dag-container.hover-active .edge-path:not(.edge-active) { opacity: 0.14 !important; }
-.dag-container.hover-active .edge-path.edge-active { opacity: 1 !important; }
-.dag-container.hover-active .edge-path.dep.edge-active { stroke: #7CFFB2 !important; }
-.dag-container.hover-active .edge-path.flow.edge-active { stroke: #FFD166 !important; }
-.dag-container.hover-active .edge-path.internal.edge-active { stroke: #7FD1FF !important; }
 .dag-container.hover-active .leaf-node.node-dim,
 .dag-container.hover-active .group-box.node-dim,
 .dag-container.hover-active .io-node.node-dim,
@@ -232,7 +213,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 </div>
 <div class="legend" id="legend"></div>
 <div class="dag-container" id="dag-container">
-    <svg class="dag-svg" id="dag-svg"></svg>
+    <div id="dag-stage" class="dag-stage"></div>
 </div>
 <div class="tooltip" id="tooltip"></div>
 <div class="side-panel" id="side-panel">
@@ -257,6 +238,13 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
     </div>
 </div>
 
+<script id="engine-bundle">
+__ENGINE_BUNDLE_PLACEHOLDER__
+</script>
+<script id="render-canvas-js">
+__RENDER_CANVAS_JS_PLACEHOLDER__
+</script>
+
 <script>
 const DATA = __FLOWCHART_DATA_PLACEHOLDER__;
 // __SOURCE_MAP_PLACEHOLDER__
@@ -264,6 +252,10 @@ const DATA = __FLOWCHART_DATA_PLACEHOLDER__;
 const groupMap = {};
 const nodeMap = {};
 const collapsedState = {};
+// Phase 2 step 3: expose ``collapsedState`` for the canvas engine + tests.
+// ``window.__canvasOnGroupToggle`` mutates this map; ``window.__canvas_collapsed_state``
+// is the read alias used by UTs to assert toggle behaviour.
+if (typeof window !== 'undefined') { window.__canvas_collapsed_state = collapsedState; }
 let groupLayout = {};
 let nodePortMap = {};
 let edgeDomRegistry = [];
@@ -288,8 +280,6 @@ let hoveredNodeId = null;
 let nodeDomRegistry = new Map();
 const groupDomRegistry = new Map();
 let renderGeneration = 0;
-let edgeOverlayLayer = null;
-let activeEdgeOverlayPath = null;
 const nodeAncestorGroups = new Map();
 const LONG_EDGE_MIN_SPAN = 260;
 
@@ -403,45 +393,11 @@ function setEdgeItemFocusState(item, state) {
 }
 
 function clearActiveEdgeOverlay() {
-    if (activeEdgeOverlayPath && activeEdgeOverlayPath.parentNode) {
-        const parent = activeEdgeOverlayPath.parentNode;
-        if (typeof parent.removeChild === 'function') {
-            parent.removeChild(activeEdgeOverlayPath);
-        } else if (Array.isArray(parent.children)) {
-            parent.children = parent.children.filter(child => child !== activeEdgeOverlayPath);
-        }
-        activeEdgeOverlayPath.parentNode = null;
-    }
-    activeEdgeOverlayPath = null;
+    return;
 }
 
 function syncActiveEdgeOverlay(item) {
-    if (!item || !item.path) {
-        clearActiveEdgeOverlay();
-        return;
-    }
-    if (!edgeOverlayLayer) {
-        throw new Error('edge overlay layer is not initialized');
-    }
-    const sourcePath = item.path;
-    const overlayPath = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-    overlayPath.setAttribute('d', sourcePath.getAttribute('d') || '');
-    for (const attrName of ['class', 'opacity', 'stroke-dasharray', 'stroke-dashoffset']) {
-        const attrValue = sourcePath.getAttribute(attrName);
-        if (attrValue !== null && attrValue !== undefined) {
-            overlayPath.setAttribute(attrName, attrValue);
-        }
-    }
-    for (const dataName of ['longEdge', 'fullDasharray', 'fullDashoffset', 'truncatedDasharray', 'truncatedDashoffset']) {
-        if (sourcePath.dataset && sourcePath.dataset[dataName] !== undefined) {
-            overlayPath.dataset[dataName] = sourcePath.dataset[dataName];
-        }
-    }
-    overlayPath.style.pointerEvents = 'none';
-    setEdgeItemFocusState({ path: overlayPath }, 'active');
-    clearActiveEdgeOverlay();
-    edgeOverlayLayer.appendChild(overlayPath);
-    activeEdgeOverlayPath = overlayPath;
+    return;
 }
 
 function _applyNodeFocusStyle(el, state) {
@@ -854,6 +810,15 @@ DATA.groups.forEach(g => {
 // Top-level IO groups (Input/Param/Const) default to their adapter-provided collapsed state
 (DATA.io_groups || []).forEach(g => { if (!(g.id in collapsedState)) collapsedState[g.id] = g.collapsed; });
 
+// Phase 2 step 4: hand DATA + collapsedState references to render_canvas.js so
+// it can run the incremental render path (computeVisibleScene + diffAndPatch)
+// without going back through canvasRenderPhase1 / resetScene.  The setter is
+// only present once render_canvas.js has loaded; it is invoked once here at
+// startup and never again.
+if (typeof window !== 'undefined' && typeof window.__canvasSetIncrementalContext === 'function') {
+    window.__canvasSetIncrementalContext({ data: DATA, collapsedState: collapsedState });
+}
+
 function formatDur(us) {
     if (us >= 1e6) return (us/1e6).toFixed(3) + ' s';
     if (us >= 1e3) return (us/1e3).toFixed(2) + ' ms';
@@ -1048,7 +1013,11 @@ function orderRanks(rankInfo, childSizes) {
     return layers;
 }
 
-function layoutGroup(gid) {
+function layoutGroup(gid, containerWidth) {
+    if (!containerWidth || containerWidth <= 0) {
+        throw new Error('layoutGroup: containerWidth must be a positive number');
+    }
+    const effectiveMaxRowWidth = Math.max(containerWidth - 100, 400);
     const g = groupMap[gid];
     if (!g) return { w: LAYOUT.nodeW, h: LAYOUT.nodeH };
 
@@ -1077,7 +1046,7 @@ function layoutGroup(gid) {
             const h = node && node.has_timing ? 36 : 28;
             childSizes.push({ id: item.id, type: 'node', w: LAYOUT.nodeW, h });
         } else {
-            const sz = layoutGroup(item.id);
+            const sz = layoutGroup(item.id, containerWidth);
             childSizes.push({ id: item.id, type: 'group', w: sz.w, h: sz.h });
         }
     }
@@ -1096,7 +1065,7 @@ function layoutGroup(gid) {
     const rowLayouts = []; // each: y, h, rows (each row: items, totalW)
     let cy = LAYOUT.groupPadTop;
     let maxRowW = 0;
-    const maxW = LAYOUT.maxRowWidth;
+    const maxW = effectiveMaxRowWidth;
     for (let r = 0; r <= maxRank; r++) {
         const layerIds = layers[r] || [];
         if (layerIds.length === 0) continue;
@@ -1164,6 +1133,298 @@ function layoutGroup(gid) {
     return { w: groupW, h: groupH };
 }
 
+const IO_W = 140;
+const IO_H = 40;
+const IO_GAP = 36;
+const IO_PILL_GAP = 18;
+const EXPAND_PADDING = 24;
+const EXPAND_PILL_W = 100;
+const EXPAND_COLS = 3;
+const EXPAND_FRAME_PAD = 16;
+const EXPAND_COL_GAP = 20;
+const EXPAND_OUTER_PAD = 24;
+const EXPANDED_IO_H = 28;
+const EXPANDED_IO_GAP = 16;
+const COLLAPSE_BUTTON_W = 70;
+const COLLAPSE_BUTTON_H = 22;
+const COLLAPSE_BOTTOM_PADDING = 10;
+let ACTIVE_FLOWCHART_LAYOUT_CONTEXT = null;
+
+function getIOLayoutConfig() {
+    return {
+        ioW: IO_W,
+        ioH: IO_H,
+        ioGap: IO_GAP,
+        pillGap: IO_PILL_GAP,
+        EXPAND_PADDING,
+        EXPAND_PILL_W,
+        EXPAND_COLS,
+        EXPAND_FRAME_PAD,
+        EXPAND_COL_GAP,
+        EXPAND_OUTER_PAD,
+        EXPANDED_IO_H,
+        EXPANDED_IO_GAP,
+        COLLAPSE_BUTTON_W,
+        COLLAPSE_BUTTON_H,
+        COLLAPSE_BOTTOM_PADDING,
+    };
+}
+
+function computeIOGroupExpandedLayout(memberCount, availableSvgW) {
+    const availableWInput = Number(availableSvgW);
+    if (!Number.isFinite(availableWInput)) {
+        throw new Error(`computeIOGroupExpandedLayout got invalid availableSvgW: ${availableSvgW}`);
+    }
+    if (memberCount === 0) return { cols: EXPAND_COLS, pillW: EXPAND_PILL_W, memberRows: 0, height: 0 };
+    const availableW = availableWInput - 2 * EXPAND_FRAME_PAD;
+    const cols = Math.max(EXPAND_COLS, Math.floor(availableW / (EXPAND_PILL_W + IO_PILL_GAP)));
+    const pillW = Math.floor((availableW - (cols - 1) * IO_PILL_GAP) / cols);
+    const memberRows = Math.ceil(memberCount / cols);
+    const memberAreaH = memberRows * EXPANDED_IO_H + (memberRows - 1) * EXPANDED_IO_GAP;
+    const height = memberAreaH + EXPANDED_IO_GAP + COLLAPSE_BUTTON_H + COLLAPSE_BOTTOM_PADDING;
+    return { cols, pillW, memberRows, height };
+}
+
+function calcIOGroupExpandedHeight(ioGroup, availableW) {
+    const width = Number(availableW);
+    if (!Number.isFinite(width)) {
+        throw new Error(`calcIOGroupExpandedHeight got invalid availableW: ${availableW}`);
+    }
+    const memberCount = (ioGroup.member_ids || []).length;
+    return computeIOGroupExpandedLayout(memberCount, width).height;
+}
+
+function getIOGroupCollapsedState(ioGroup) {
+    return (ioGroup.id in collapsedState) ? collapsedState[ioGroup.id] : ioGroup.collapsed;
+}
+
+function calcIORowWidth(row, availableW) {
+    const width = Number(availableW);
+    if (!Number.isFinite(width)) {
+        throw new Error(`calcIORowWidth got invalid availableW: ${availableW}`);
+    }
+    if (!row.items || row.items.length === 0) return 0;
+    let result = 0;
+    let pendingInline = 0;
+    const flushInline = () => {
+        if (pendingInline > 0) {
+            result = Math.max(result, pendingInline * IO_W + (pendingInline - 1) * IO_PILL_GAP);
+            pendingInline = 0;
+        }
+    };
+    for (const item of row.items) {
+        if (item.isIOGroup === true) {
+            const ioGroup = item.ioGroup;
+            if (!getIOGroupCollapsedState(ioGroup)) {
+                flushInline();
+                const memberCount = (ioGroup.member_ids || []).length;
+                const expandedW = memberCount > 0
+                    ? Math.min(width * 0.85, memberCount * (IO_W + IO_PILL_GAP) - IO_PILL_GAP)
+                    : 0;
+                result = Math.max(result, expandedW);
+                continue;
+            }
+        }
+        pendingInline += 1;
+    }
+    flushInline();
+    return result;
+}
+
+function calcIORowHeight(row, svgW) {
+    const width = Number(svgW);
+    if (!Number.isFinite(width)) {
+        throw new Error(`calcIORowHeight got invalid svgW: ${svgW}`);
+    }
+    if (!row.items || row.items.length === 0) return 0;
+    const expandedGroups = row.items.filter(item => item.isIOGroup === true && !getIOGroupCollapsedState(item.ioGroup));
+    const hasInlineRow = row.items.some(item => item.isIOGroup !== true || getIOGroupCollapsedState(item.ioGroup));
+    let height = hasInlineRow ? IO_H : 0;
+    if (expandedGroups.length > 0) {
+        const groupCount = expandedGroups.length;
+        const colW = (width - (groupCount - 1) * EXPAND_COL_GAP) / groupCount;
+        const expandedH = Math.max(...expandedGroups.map(item => calcIOGroupExpandedHeight(item.ioGroup, colW)));
+        height += (height > 0 ? IO_GAP : 0) + expandedH;
+    }
+    return height;
+}
+
+function collectIORenderTasks(row, startY) {
+    if (!ACTIVE_FLOWCHART_LAYOUT_CONTEXT) {
+        throw new Error('collectIORenderTasks called before computeFlowchartLayout initialized layout context');
+    }
+    const { svgW } = ACTIVE_FLOWCHART_LAYOUT_CONTEXT;
+    if (!row || !row.items || row.items.length === 0) return { tasks: [], height: 0 };
+    let y = startY;
+    const tasks = [];
+    const inlineItems = [];
+    const expandedItems = [];
+    for (const item of row.items) {
+        if (item.isIOGroup === true) {
+            const ioGroup = item.ioGroup;
+            if (!getIOGroupCollapsedState(ioGroup)) {
+                expandedItems.push(item);
+                continue;
+            }
+        }
+        inlineItems.push(item);
+    }
+
+    if (inlineItems.length > 0) {
+        const rowWidth = inlineItems.length * IO_W + (inlineItems.length - 1) * IO_PILL_GAP;
+        let left = (svgW - rowWidth) / 2;
+        const cy = y + IO_H / 2;
+        for (const item of inlineItems) {
+            if (item.isIOGroup === true) {
+                tasks.push({
+                    type: 'io',
+                    taskKind: 'io_group',
+                    ioGroup: { ...item.ioGroup, _collapsed: true },
+                    cx: left + IO_W / 2,
+                    cy,
+                    w: IO_W,
+                    h: IO_H,
+                    availableW: svgW,
+                });
+            } else {
+                const nid = item.id;
+                const node = nodeMap[nid];
+                const baseText = node ? node.class_name : item.defaultSublabel;
+                const sublabel = (node && node.has_timing)
+                    ? `${baseText} · ${node.pct.toFixed(1)}%`
+                    : baseText;
+                tasks.push({
+                    type: 'io',
+                    taskKind: 'io_pill',
+                    nid,
+                    subtype: item.subtype,
+                    cx: left + IO_W / 2,
+                    cy,
+                    w: IO_W,
+                    h: IO_H,
+                    label: item.label,
+                    sublabel,
+                    fillColor: item.fillColor,
+                });
+            }
+            left += IO_W + IO_PILL_GAP;
+        }
+        y += IO_H;
+    }
+
+    if (expandedItems.length > 0) {
+        if (y > startY) y += IO_GAP;
+        const groupCount = expandedItems.length;
+        const colW = (svgW - (groupCount - 1) * EXPAND_COL_GAP) / groupCount;
+        const expandedHeight = Math.max(...expandedItems.map(item => calcIOGroupExpandedHeight(item.ioGroup, colW)));
+        let left = 0;
+        for (const item of expandedItems) {
+            tasks.push({
+                type: 'io',
+                taskKind: 'io_group',
+                ioGroup: { ...item.ioGroup, _collapsed: false },
+                cx: left + colW / 2,
+                cy: y + EXPANDED_IO_H / 2,
+                w: IO_W,
+                h: IO_H,
+                availableW: colW,
+            });
+            left += colW + EXPAND_COL_GAP;
+        }
+        y += expandedHeight;
+    }
+    return { tasks, height: y - startY };
+}
+
+function computeFlowchartLayout(data, containerWidth) {
+    if (!containerWidth || containerWidth <= 0) {
+        throw new Error('computeFlowchartLayout: containerWidth must be a positive number');
+    }
+    const rootIds = Array.isArray(data.root_groups) ? data.root_groups : [];
+    const rootSizes = rootIds.map(rid => {
+        const sz = layoutGroup(rid, containerWidth);
+        return { id: rid, ...sz };
+    });
+    const topIOItems = (data.io_groups && data.io_groups.length > 0)
+        ? data.io_groups
+            .filter(g => g.io_subtype !== 'output')
+            .map(g => ({ isIOGroup: true, ioGroup: g }))
+        : [
+            ...(data.input_node_ids || []).map(id => ({ id, subtype: 'input', label: 'Input', defaultSublabel: 'network input', fillColor: 'rgba(46,204,113,0.55)' })),
+            ...(data.param_node_ids || []).map(id => ({ id, subtype: 'param', label: 'Param', defaultSublabel: 'model param', fillColor: 'rgba(155,89,182,0.55)' })),
+            ...(data.const_node_ids || []).map(id => ({ id, subtype: 'const', label: 'Const', defaultSublabel: 'const value', fillColor: 'rgba(241,196,15,0.55)' })),
+        ];
+    const outputIOGroup = (data.io_groups || []).find(g => g.io_subtype === 'output');
+    const bottomIOItems = outputIOGroup
+        ? [{ isIOGroup: true, ioGroup: outputIOGroup }]
+        : (data.output_node_ids || []).map(id => ({
+              id,
+              subtype: 'output',
+              label: 'Result',
+              defaultSublabel: 'result output',
+              fillColor: 'rgba(231,76,60,0.55)'
+          }));
+    const topIORows = topIOItems.length > 0 ? [{ items: topIOItems }] : [];
+    const bottomIORows = bottomIOItems.length > 0 ? [{ items: bottomIOItems }] : [];
+    const allIORows = topIORows.concat(bottomIORows);
+    const maxRootW = rootSizes.length ? Math.max(...rootSizes.map(r => r.w)) : LAYOUT.nodeW;
+    const maxRootH = rootSizes.length ? Math.max(...rootSizes.map(r => r.h)) : LAYOUT.nodeH;
+    const provisionalSvgW = Math.max(maxRootW + 80, 480);
+    const expandedGroupCount = (data.io_groups || []).filter(g => !getIOGroupCollapsedState(g)).length;
+    const minIOColW = EXPAND_COLS * EXPAND_PILL_W + (EXPAND_COLS - 1) * IO_PILL_GAP + 2 * EXPAND_FRAME_PAD;
+    const minIOTotalW = expandedGroupCount > 0
+        ? expandedGroupCount * minIOColW + (expandedGroupCount - 1) * EXPAND_COL_GAP + 2 * EXPAND_OUTER_PAD
+        : 0;
+    const maxIORowW = allIORows.length > 0 ? Math.max(...allIORows.map(row => calcIORowWidth(row, provisionalSvgW))) : 0;
+    const svgW = Math.max(provisionalSvgW, maxIORowW + 80, minIOTotalW);
+    const topIOHeight = topIORows.length > 0 ? topIORows.reduce((acc, row, idx) => acc + calcIORowHeight(row, svgW) + (idx > 0 ? IO_GAP : 0), 0) : 0;
+    const bottomIOHeight = bottomIORows.length > 0 ? bottomIORows.reduce((acc, row, idx) => acc + calcIORowHeight(row, svgW) + (idx > 0 ? IO_GAP : 0), 0) : 0;
+    const rootStartY = 30 + (topIOHeight > 0 ? topIOHeight + IO_GAP : 0);
+    const svgH = 30 + topIOHeight + (topIOHeight > 0 ? IO_GAP : 0) + maxRootH + (bottomIOHeight > 0 ? IO_GAP + bottomIOHeight : 0) + 40;
+    const rootPositions = [];
+    if (rootSizes.length > 0) {
+        const rs = rootSizes[0];
+        rootPositions.push({ id: rs.id, x: (svgW - rs.w) / 2, y: rootStartY, w: rs.w, h: rs.h });
+    }
+    ACTIVE_FLOWCHART_LAYOUT_CONTEXT = {
+        data,
+        svgW,
+        svgH,
+        provisionalSvgW,
+        rootStartY,
+        topIORows,
+        bottomIORows,
+    };
+    const ioTasks = [];
+    let topIOY = 30;
+    for (const row of topIORows) {
+        const plan = collectIORenderTasks(row, topIOY);
+        ioTasks.push(...plan.tasks);
+        topIOY += plan.height + IO_GAP;
+    }
+    const rootEntry = rootPositions[0];
+    let bottomIOY = rootEntry ? (rootEntry.y + rootEntry.h + IO_GAP) : (rootStartY + maxRootH + IO_GAP);
+    for (const row of bottomIORows) {
+        const plan = collectIORenderTasks(row, bottomIOY);
+        ioTasks.push(...plan.tasks);
+        bottomIOY += plan.height + IO_GAP;
+    }
+    return {
+        svgW,
+        svgH,
+        provisionalSvgW,
+        rootStartY,
+        rootSizes,
+        rootPositions,
+        rootEntry,
+        ioTasks,
+        topIORows,
+        bottomIORows,
+        topIOHeight,
+        bottomIOHeight,
+    };
+}
+
 function nextFrame() {
     return new Promise((resolve) => requestAnimationFrame(() => resolve()));
 }
@@ -1202,24 +1463,44 @@ function showRenderProgress(stageText) {
 async function hideRenderProgress() {
     const { overlay } = getRenderProgressElements();
     const ownerGeneration = overlay.dataset.renderGeneration || '';
+    if (ownerGeneration !== String(renderGeneration)) {
+        overlay.classList.add('closing');
+        overlay.classList.remove('visible');
+        overlay.setAttribute('aria-hidden', 'true');
+        return;
+    }
     setRenderProgress(100, '渲染完成');
     await nextFrame();
     if (ownerGeneration !== String(renderGeneration)) {
-        throw new Error(`hideRenderProgress aborted by newer render generation: ${ownerGeneration} -> ${renderGeneration}`);
+        overlay.classList.add('closing');
+        overlay.classList.remove('visible');
+        overlay.setAttribute('aria-hidden', 'true');
+        return;
     }
     overlay.classList.add('closing');
     overlay.classList.remove('visible');
     await new Promise((resolve) => setTimeout(resolve, 180));
     if (ownerGeneration !== String(renderGeneration)) {
-        throw new Error(`hideRenderProgress completion overtaken by render generation: ${ownerGeneration} -> ${renderGeneration}`);
+        overlay.setAttribute('aria-hidden', 'true');
+        return;
     }
     overlay.setAttribute('aria-hidden', 'true');
 }
 
 function assertActiveRenderGeneration(generation, stageText) {
-    if (generation !== renderGeneration) {
-        throw new Error(`render generation ${generation} expired during ${stageText}`);
+    if (typeof generation !== 'number' || !Number.isFinite(generation)) {
+        throw new Error(`invalid render generation ${generation} during ${stageText}`);
     }
+    if (typeof renderGeneration === 'undefined') {
+        throw new Error('renderGeneration is unavailable');
+    }
+    if (generation !== renderGeneration) {
+        return false;
+    }
+    return true;
+}
+if (typeof window !== 'undefined') {
+    window.__canvasAssertGeneration = assertActiveRenderGeneration;
 }
 
 async function runChunked(items, handler, options) {
@@ -1233,17 +1514,20 @@ async function runChunked(items, handler, options) {
         ? opts.allowedTypes
         : ['group', 'node', 'io', 'edge'];
     const allowedTypeSet = new Set(allowedTypes);
-    assertActiveRenderGeneration(generation, stageText);
+    if (!assertActiveRenderGeneration(generation, stageText)) {
+        return false;
+    }
     const total = items.length;
     if (total === 0) {
         setRenderProgress(phaseEnd, stageText);
         await nextFrame();
-        assertActiveRenderGeneration(generation, stageText);
-        return;
+        return assertActiveRenderGeneration(generation, stageText);
     }
     let processed = 0;
     while (processed < total) {
-        assertActiveRenderGeneration(generation, stageText);
+        if (!assertActiveRenderGeneration(generation, stageText)) {
+            return false;
+        }
         const upperBound = Math.min(processed + batchSize, total);
         for (let idx = processed; idx < upperBound; idx++) {
             const item = items[idx];
@@ -1251,7 +1535,9 @@ async function runChunked(items, handler, options) {
                 const actualType = item && typeof item.type === 'string' ? item.type : '<missing>';
                 throw new Error(`runChunked got unknown task type: ${actualType}`);
             }
-            assertActiveRenderGeneration(generation, stageText);
+            if (!assertActiveRenderGeneration(generation, stageText)) {
+                return false;
+            }
             await handler(item, idx);
         }
         processed = upperBound;
@@ -1259,1002 +1545,121 @@ async function runChunked(items, handler, options) {
         setRenderProgress(progress, stageText);
         await nextFrame();
     }
-    assertActiveRenderGeneration(generation, stageText);
+    return assertActiveRenderGeneration(generation, stageText);
 }
 
-function invokeRender() {
-    const promise = render();
+function invokeRender(renderOpts) {
+    const promise = render(renderOpts);
     promise.catch((err) => {
         setTimeout(() => { throw err; }, 0);
     });
     return promise;
 }
 
-async function render() {
-    const generation = ++renderGeneration;
-    showRenderProgress('正在准备渲染状态…');
-    const { overlay } = getRenderProgressElements();
-    overlay.dataset.renderGeneration = String(generation);
-    await nextFrame();
-    try {
-        groupLayout = {};
-        nodePortMap = {};
-        edgeDomRegistry = [];
-        edgeByNodeId.clear();
-        edgeByGroupId.clear();
-        edgeDomByKey.clear();
-        prevActiveItems = [];
-        prevActiveNodeIds = new Set();
-        prevActiveEdgeKeys = new Set();
-        prevActiveGroupNodeIds = new Set();
-        prevActiveGroupIds = new Set();
-        prevDimEdgeKeys = new Set();
-        prevDimGroupNodeIds = new Set();
-        prevDimGroupIds = new Set();
-        lastHoveredGid = null;
-        nodeDomRegistry = new Map();
-        groupDomRegistry.clear();
-        focusedEdgePath = null;
-        hoveredEdgeKey = null;
-        hoveredEdges = [];
-        hoveredEdgeIdx = 0;
-        hoveredGroupId = null;
-        hoveredNodeId = null;
-        edgeOverlayLayer = null;
-        clearActiveEdgeOverlay();
-        hideOverlapBadge();
-        assertActiveRenderGeneration(generation, '准备阶段');
-        setRenderProgress(5, '正在准备渲染状态…');
-        await nextFrame();
-
-        const rootSizes = DATA.root_groups.map(rid => {
-            const sz = layoutGroup(rid);
-            return { id: rid, ...sz };
-        });
-
-        const ioW = 140, ioH = 40;
-        const ioGap = 36;
-        const pillGap = 18;
-        const topIOItems = (DATA.io_groups && DATA.io_groups.length > 0)
-            ? DATA.io_groups
-                .filter(g => g.io_subtype !== 'output')
-                .map(g => ({ isIOGroup: true, ioGroup: g }))
-            : [
-                ...(DATA.input_node_ids || []).map(id => ({ id, label: 'Input', defaultSublabel: 'network input', fillColor: 'rgba(46,204,113,0.55)' })),
-                ...(DATA.param_node_ids || []).map(id => ({ id, label: 'Param', defaultSublabel: 'model param', fillColor: 'rgba(155,89,182,0.55)' })),
-                ...(DATA.const_node_ids || []).map(id => ({ id, label: 'Const', defaultSublabel: 'const value', fillColor: 'rgba(241,196,15,0.55)' })),
-            ];
-        const outputIOGroup = (DATA.io_groups || []).find(g => g.io_subtype === 'output');
-        const bottomIOItems = outputIOGroup
-            ? [{ isIOGroup: true, ioGroup: outputIOGroup }]
-            : (DATA.output_node_ids || []).map(id => ({
-                  id, label: 'Result', defaultSublabel: 'result output',
-                  fillColor: 'rgba(231,76,60,0.55)'
-              }));
-        const topIORows = topIOItems.length > 0 ? [{ items: topIOItems }] : [];
-        const bottomIORows = bottomIOItems.length > 0 ? [{ items: bottomIOItems }] : [];
-        const allIORows = topIORows.concat(bottomIORows);
-        const maxRootW = rootSizes.length ? Math.max(...rootSizes.map(r => r.w)) : LAYOUT.nodeW;
-        const maxRootH = rootSizes.length ? Math.max(...rootSizes.map(r => r.h)) : LAYOUT.nodeH;
-        const provisionalSvgW = Math.max(maxRootW + 80, 480);
-        const EXPAND_PADDING = 24;
-        const EXPAND_PILL_W = 100;
-        const EXPAND_COLS = 3;
-        const EXPAND_FRAME_PAD = 16;
-        const EXPAND_COL_GAP = 20;
-        const EXPAND_OUTER_PAD = 24;
-        const EXPANDED_IO_H = 28;
-        const EXPANDED_IO_GAP = 16;
-        const COLLAPSE_BUTTON_W = 70;
-        const COLLAPSE_BUTTON_H = 22;
-        const COLLAPSE_BOTTOM_PADDING = 10;
-        const expandedGroupCount = (DATA.io_groups || []).filter(g =>
-            !((g.id in collapsedState) ? collapsedState[g.id] : g.collapsed)
-        ).length;
-        const minIOColW = EXPAND_COLS * EXPAND_PILL_W + (EXPAND_COLS - 1) * pillGap + 2 * EXPAND_FRAME_PAD;
-        const minIOTotalW = expandedGroupCount > 0
-            ? expandedGroupCount * minIOColW + (expandedGroupCount - 1) * EXPAND_COL_GAP + 2 * EXPAND_OUTER_PAD
-            : 0;
-        const computeIOGroupExpandedLayout = (memberCount, availableSvgW = provisionalSvgW) => {
-            if (memberCount === 0) return { cols: EXPAND_COLS, pillW: EXPAND_PILL_W, memberRows: 0, height: 0 };
-            const availableW = availableSvgW - 2 * EXPAND_FRAME_PAD;
-            const cols = Math.max(EXPAND_COLS, Math.floor(availableW / (EXPAND_PILL_W + pillGap)));
-            const pillW = Math.floor((availableW - (cols - 1) * pillGap) / cols);
-            const memberRows = Math.ceil(memberCount / cols);
-            const memberAreaH = memberRows * EXPANDED_IO_H + (memberRows - 1) * EXPANDED_IO_GAP;
-            const height = memberAreaH + EXPANDED_IO_GAP + COLLAPSE_BUTTON_H + COLLAPSE_BOTTOM_PADDING;
-            return { cols, pillW, memberRows, height };
-        };
-        const calcIOGroupExpandedHeight = (ioGroup, availableW = provisionalSvgW) => {
-            const memberCount = (ioGroup.member_ids || []).length;
-            return computeIOGroupExpandedLayout(memberCount, availableW).height;
-        };
-        const calcIORowWidth = (row, availableW = provisionalSvgW) => {
-            if (!row.items || row.items.length === 0) return 0;
-            let width = 0;
-            let pendingInline = 0;
-            const flushInline = () => {
-                if (pendingInline > 0) {
-                    width = Math.max(width, pendingInline * ioW + (pendingInline - 1) * pillGap);
-                    pendingInline = 0;
-                }
-            };
-            for (const item of row.items) {
-                if (item.isIOGroup === true) {
-                    const ioGroup = item.ioGroup;
-                    const isCollapsed = (ioGroup.id in collapsedState) ? collapsedState[ioGroup.id] : ioGroup.collapsed;
-                    if (!isCollapsed) {
-                        flushInline();
-                        const memberCount = (ioGroup.member_ids || []).length;
-                        const expandedW = memberCount > 0
-                            ? Math.min(availableW * 0.85, memberCount * (ioW + pillGap) - pillGap)
-                            : 0;
-                        width = Math.max(width, expandedW);
-                        continue;
-                    }
-                }
-                pendingInline += 1;
-            }
-            flushInline();
-            return width;
-        };
-        const maxIORowW = allIORows.length > 0 ? Math.max(...allIORows.map(row => calcIORowWidth(row))) : 0;
-        const svgW = Math.max(provisionalSvgW, maxIORowW + 80, minIOTotalW);
-        const calcIORowHeight = (row) => {
-            if (!row.items || row.items.length === 0) return 0;
-            const expandedGroups = row.items.filter(item => {
-                if (item.isIOGroup !== true) return false;
-                const ioGroup = item.ioGroup;
-                const isCollapsed = (ioGroup.id in collapsedState) ? collapsedState[ioGroup.id] : ioGroup.collapsed;
-                return !isCollapsed;
-            });
-            const hasInlineRow = row.items.some(item => {
-                if (item.isIOGroup !== true) return true;
-                const ioGroup = item.ioGroup;
-                const isCollapsed = (ioGroup.id in collapsedState) ? collapsedState[ioGroup.id] : ioGroup.collapsed;
-                return isCollapsed;
-            });
-            let height = hasInlineRow ? ioH : 0;
-            if (expandedGroups.length > 0) {
-                const groupCount = expandedGroups.length;
-                const colW = (svgW - (groupCount - 1) * EXPAND_COL_GAP) / groupCount;
-                const expandedH = Math.max(...expandedGroups.map(item => calcIOGroupExpandedHeight(item.ioGroup, colW)));
-                height += (height > 0 ? ioGap : 0) + expandedH;
-            }
-            return height;
-        };
-        const topIOHeight = topIORows.length > 0 ? topIORows.reduce((acc, row, idx) => acc + calcIORowHeight(row) + (idx > 0 ? ioGap : 0), 0) : 0;
-        const bottomIOHeight = bottomIORows.length > 0 ? bottomIORows.reduce((acc, row, idx) => acc + calcIORowHeight(row) + (idx > 0 ? ioGap : 0), 0) : 0;
-        const rootStartY = 30 + (topIOHeight > 0 ? topIOHeight + ioGap : 0);
-        const svgH = 30 + topIOHeight + (topIOHeight > 0 ? ioGap : 0) + maxRootH + (bottomIOHeight > 0 ? ioGap + bottomIOHeight : 0) + 40;
-        assertActiveRenderGeneration(generation, '布局阶段');
-        setRenderProgress(25, '正在计算 DAG 布局…');
-        await nextFrame();
-
-        const svg = document.getElementById('dag-svg');
-        svg.onclick = () => clearEdgeFocus();
-        svg.setAttribute('width', svgW);
-        svg.setAttribute('height', svgH);
-        svg.innerHTML = `<defs>
-            <marker id="arrowhead" markerWidth="7" markerHeight="7" refX="7" refY="3.5" orient="auto">
-                <polygon points="0 0, 7 3.5, 0 7" fill="rgba(255,255,255,0.3)"/>
-            </marker>
-            <marker id="arrowhead-blue" markerWidth="7" markerHeight="7" refX="7" refY="3.5" orient="auto">
-                <polygon points="0 0, 7 3.5, 0 7" fill="rgba(100,181,246,0.5)"/>
-            </marker>
-            <marker id="arrowhead-dep" markerWidth="7" markerHeight="7" refX="7" refY="3.5" orient="auto">
-                <polygon points="0 0, 7 3.5, 0 7" fill="rgba(46,204,113,0.6)"/>
-            </marker>
-        </defs>
-        <g id="edge-overlay-layer"></g>`;
-        edgeOverlayLayer = document.getElementById('edge-overlay-layer');
-        if (!edgeOverlayLayer || edgeOverlayLayer.tagName !== 'g') {
-            edgeOverlayLayer = document.createElementNS('http://www.w3.org/2000/svg', 'g');
-            edgeOverlayLayer.setAttribute('id', 'edge-overlay-layer');
-            svg.appendChild(edgeOverlayLayer);
-        }
-        clearActiveEdgeOverlay();
-        assertActiveRenderGeneration(generation, 'SVG 初始化阶段');
-        setRenderProgress(30, '正在初始化画布…');
-        await nextFrame();
-
-        const rootPositions = [];
-        if (rootSizes.length > 0) {
-            const rs = rootSizes[0];
-            const rx = (svgW - rs.w) / 2;
-            const ry = rootStartY;
-            rootPositions.push({ id: rs.id, x: rx, y: ry, w: rs.w, h: rs.h });
-        }
-
-        function appendGroupInfoButton(g, cx, cy, titleText = '') {
-            if (!g || !g.src_file) return;
-            const hit = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
-            hit.setAttribute('cx', cx);
-            hit.setAttribute('cy', cy - 1);
-            hit.setAttribute('r', 9);
-            hit.setAttribute('class', 'group-info-hit');
-            hit.addEventListener('click', (e) => {
-                e.stopPropagation();
-                showSourcePanel(g);
-            });
-            svg.appendChild(hit);
-
-            const info = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-            info.setAttribute('x', cx);
-            info.setAttribute('y', cy - 1);
-            info.setAttribute('class', 'group-toggle group-info-text');
-            info.textContent = 'i';
-            if (titleText) {
-                const titleEl = document.createElementNS('http://www.w3.org/2000/svg', 'title');
-                titleEl.textContent = titleText;
-                info.appendChild(titleEl);
-            }
-            svg.appendChild(info);
-        }
-
-        __RENDER_GROUP_JS_PLACEHOLDER__
-
-        function renderNodeAt(nid, nx, ny, w, h) {
-            const n = nodeMap[nid];
-            if (!n) return;
-            const color = getNodeColor(n);
-
-            const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-            rect.setAttribute('x', nx); rect.setAttribute('y', ny);
-            rect.setAttribute('width', w); rect.setAttribute('height', h);
-            rect.setAttribute('class', 'leaf-node');
-            rect.setAttribute('fill', color);
-            rect.setAttribute('stroke', 'rgba(255,255,255,0.15)');
-            rect.style.cursor = 'pointer';
-            rect.dataset.nid = nid;
-            rect.addEventListener('mouseenter', (e) => showTooltip(e, n));
-            rect.addEventListener('mouseleave', hideTooltip);
-            rect.addEventListener('click', (e) => { e.stopPropagation(); showSourcePanel(n); });
-            svg.appendChild(rect);
-            registerNodeDom(nid, rect);
-
-            const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-            label.setAttribute('x', nx + w/2); label.setAttribute('y', ny + h/2);
-            label.setAttribute('class', 'node-label');
-            label.style.pointerEvents = 'none';
-            label.textContent = n.class_name;
-            svg.appendChild(label);
-
-            let subText = '';
-            if (n.has_timing) subText = `${n.pct.toFixed(1)}%`;
-            if (subText) {
-                const sub = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-                sub.setAttribute('x', nx + w/2); sub.setAttribute('y', ny + h/2 + 11);
-                sub.setAttribute('class', 'node-sublabel');
-                sub.style.pointerEvents = 'none';
-                sub.textContent = subText;
-                svg.appendChild(sub);
-            }
-
-            nodePortMap[nid] = { cx: nx + w/2, cy: ny + h/2 };
-            nodePortMap[nid + '__in'] = { cx: nx + w/2, cy: ny };
-            nodePortMap[nid + '__out'] = { cx: nx + w/2, cy: ny + h };
-        }
-
-        function configureLongEdgeDisplay(path) {
-            if (!path) return;
-            let total = NaN;
-            try {
-                total = path.getTotalLength();
-            } catch (err) {
-                total = NaN;
-            }
-            if (!Number.isFinite(total) || total < LONG_EDGE_MIN_SPAN) return;
-            const originalDasharray = path.getAttribute('stroke-dasharray') || '';
-            const originalDashoffset = path.getAttribute('stroke-dashoffset') || '';
-            const stubLen = Math.max(40, Math.min(72, total * 0.12));
-            const gapLen = Math.max(80, total - stubLen * 2);
-            path.dataset.longEdge = '1';
-            path.dataset.fullDasharray = originalDasharray;
-            path.dataset.fullDashoffset = originalDashoffset;
-            path.dataset.truncatedDasharray = `${stubLen} ${gapLen} ${stubLen}`;
-            if (originalDashoffset) {
-                path.dataset.truncatedDashoffset = originalDashoffset;
-            }
-            path.classList.add('long-edge');
-            path.setAttribute('stroke-dasharray', path.dataset.truncatedDasharray);
-        }
-
-        function buildDirectEdgePath(x1, y1, x2, y2, routeMeta) {
-            const dy = y2 - y1;
-            const dx = x2 - x1;
-            if (Math.abs(dy) < 3 && Math.abs(dx) < 3) return null;
-            const meta = routeMeta || {};
-            const offset = meta.bundleOffset || 0;
-            const sourceFanout = meta.sourceFanout || 1;
-            const targetFanin = meta.targetFanin || 1;
-            const sideBias = offset === 0 ? (dx >= 0 ? 1 : -1) : (offset > 0 ? 1 : -1);
-            let d;
-            if (dy > 8) {
-                const cp = Math.max(24, Math.min(Math.abs(dy) * 0.34 + Math.abs(offset) * 0.7, 96));
-                const c1x = x1 + offset;
-                const c2x = x2 + offset;
-                d = `M${x1},${y1} C${c1x},${y1+cp} ${c2x},${y2-cp} ${x2},${y2}`;
-            } else if (dy < -8) {
-                const horizontal = sideBias * Math.max(52, Math.abs(dx) * 0.42 + 34 + Math.abs(offset));
-                const rise = Math.max(18, Math.min(72, Math.abs(offset) + 24));
-                d = `M${x1},${y1} C${x1+horizontal},${y1-rise} ${x2+horizontal},${y2+rise} ${x2},${y2}`;
-            } else {
-                const midX = (x1 + x2) / 2 + offset;
-                const midY = (y1 + y2) / 2 + 14 + Math.abs(offset) * 0.28;
-                d = `M${x1},${y1} Q${midX},${midY} ${x2},${y2}`;
-            }
-            return { d };
-        }
-
-        function buildIntraGroupEdgePath(fr, to, routeCtx, edgeData) {
-            const { groupLeft, groupRight, childLeftEdge, childRightEdge, skipLaneCounter } = routeCtx;
-            const x1 = fr.x + fr.w / 2, y1 = fr.y + fr.h;
-            const x2 = to.x + to.w / 2, y2 = to.y;
-            const fromRank = fr.rank, toRank = to.rank;
-            const routeMeta = EDGE_BUNDLE_META.get(edgeKey(edgeData)) || null;
-            if (toRank < 0) {
-                return buildDirectEdgePath(x1, y1, x2, y2, routeMeta);
-            }
-            const span = Math.abs(toRank - fromRank);
-
-            if (span <= 1 && y2 > y1) {
-                return buildDirectEdgePath(x1, y1, x2, y2, routeMeta);
-            }
-            if (span === 0) {
-                return {
-                    d: `M${x1},${y1} C${x1},${y1+14} ${x2},${y2+14} ${x2},${y2}`,
-                };
-            }
-
-            const groupMidX = (childLeftEdge + childRightEdge) / 2;
-            const avgX = (x1 + x2) / 2;
-            const preferRight = avgX >= groupMidX;
-            let laneIndex;
-            if (preferRight) {
-                laneIndex = skipLaneCounter.right++;
-            } else {
-                laneIndex = skipLaneCounter.left++;
-            }
-            const laneStep = 9;
-            const laneX = preferRight
-                ? Math.min(groupRight - 4, childRightEdge + 14 + (laneIndex % 4) * laneStep)
-                : Math.max(groupLeft + 4, childLeftEdge - 14 - (laneIndex % 4) * laneStep);
-
-            const verticalApproach = 18;
-            const d = [
-                `M${x1},${y1}`,
-                `C${x1},${y1 + verticalApproach} ${laneX},${y1 + verticalApproach} ${laneX},${y1 + verticalApproach + 10}`,
-                `L${laneX},${y2 - verticalApproach - 10}`,
-                `C${laneX},${y2 - verticalApproach} ${x2},${y2 - verticalApproach} ${x2},${y2}`
-            ].join(' ');
-            return { d, opacity: '0.7' };
-        }
-
-        function createEdgePathElement(d) {
-            const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-            path.setAttribute('d', d);
-            return path;
-        }
-
-        function createEdgeHitboxElement(d, key) {
-            const hitbox = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-            hitbox.setAttribute('d', d);
-            hitbox.setAttribute('stroke', 'transparent');
-            hitbox.setAttribute('stroke-width', '20');
-            hitbox.setAttribute('fill', 'none');
-            hitbox.setAttribute('pointer-events', 'stroke');
-            hitbox.setAttribute('opacity', '0');
-            hitbox.setAttribute('data-edge-key', key);
-            return hitbox;
-        }
-
-        function finalizeEdgeRendering(path, hitbox) {
-            svg.appendChild(path);
-            if (hitbox) svg.appendChild(hitbox);
-            configureLongEdgeDisplay(path);
-        }
-
-        function renderEdge(edgeSpec) {
-            let pathSpec = null;
-            if (edgeSpec.routingMode === 'direct') {
-                pathSpec = buildDirectEdgePath(edgeSpec.x1, edgeSpec.y1, edgeSpec.x2, edgeSpec.y2, edgeSpec.routeMeta);
-            } else if (edgeSpec.routingMode === 'intra_group') {
-                pathSpec = buildIntraGroupEdgePath(edgeSpec.fr, edgeSpec.to, edgeSpec.routeCtx, edgeSpec.edgeData);
-            } else {
-                throw new Error(`Unknown edge routing mode: ${edgeSpec.routingMode}`);
-            }
-            if (!pathSpec) return;
-            const key = edgeKey(edgeSpec.edgeData);
-            const path = createEdgePathElement(pathSpec.d);
-            const hitbox = createEdgeHitboxElement(pathSpec.d, key);
-            applyEdgePresentation(path, edgeSpec.type, pathSpec.opacity ?? null);
-            bindEdgeInteractions(path, hitbox, edgeSpec.edgeData);
-            finalizeEdgeRendering(path, hitbox);
-        }
-
-        function registerEdgeDom(path, edgeData) {
-            if (!path || !edgeData) return;
-            const item = { path, edge: edgeData, key: edgeKey(edgeData) };
-            edgeDomRegistry.push(item);
-            edgeDomByKey.set(item.key, item);
-            for (const nid of [edgeData.from, edgeData.to]) { if (nid == null) continue; if (!edgeByNodeId.has(nid)) edgeByNodeId.set(nid, []); edgeByNodeId.get(nid).push(item); }
-            for (const nid of [edgeData.from, edgeData.to]) {
-                if (nid == null) continue;
-                const relatedGroupIds = new Set(nodeAncestorGroups.get(nid) ?? []);
-                if (groupMap[nid]) relatedGroupIds.add(nid);
-                for (const gid of relatedGroupIds) {
-                    if (!edgeByGroupId.has(gid)) edgeByGroupId.set(gid, []);
-                    edgeByGroupId.get(gid).push(item);
-                }
-            }
-        }
-
-        function applyEdgePresentation(path, type, opacity=null) {
-            path.setAttribute('class', `edge-path ${type || ''}`);
-            path.setAttribute('style', 'pointer-events: none');
-            if (type === 'dep') {
-                path.setAttribute('marker-end', 'url(#arrowhead-dep)');
-            } else if (type === 'internal') {
-                path.setAttribute('marker-end', 'url(#arrowhead-blue)');
-            } else {
-                path.setAttribute('marker-end', 'url(#arrowhead)');
-            }
-            if (opacity !== null) {
-                path.setAttribute('opacity', opacity);
-            }
-        }
-
-        function showOverlapBadge(e, idx, total) {
-            let badge = document.getElementById('overlap-badge');
-            if (!badge) {
-                badge = document.createElement('div');
-                badge.id = 'overlap-badge';
-                badge.style.cssText = 'position:fixed;background:rgba(30,30,40,0.92);color:#e0e0e0;'
-                    + 'font-size:12px;padding:3px 8px;border-radius:4px;pointer-events:none;'
-                    + 'z-index:9999;white-space:nowrap;border:1px solid rgba(255,255,255,0.15);';
-                document.body.appendChild(badge);
-            }
-            badge.textContent = `${idx + 1}/${total}  ·  scroll to switch`;
-            badge.style.left = (e.clientX + 14) + 'px';
-            badge.style.top  = (e.clientY - 10) + 'px';
-            badge.style.display = 'block';
-        }
-        function hideOverlapBadge() {
-            const badge = document.getElementById('overlap-badge');
-            if (badge) badge.style.display = 'none';
-        }
-        function updateOverlapBadge() {
-            const badge = document.getElementById('overlap-badge');
-            if (!badge || hoveredEdges.length <= 1) return;
-            badge.textContent = `${hoveredEdgeIdx + 1}/${hoveredEdges.length}  ·  scroll to switch`;
-        }
-
-        function getHoveredEdgesFromEvent(e) {
-            const hitEls = document.elementsFromPoint(e.clientX, e.clientY);
-            const seen = new Set();
-            return hitEls
-                .filter(el => el && typeof el.hasAttribute === 'function' && el.hasAttribute('data-edge-key'))
-                .map(el => el.getAttribute('data-edge-key'))
-                .filter(key => {
-                    if (!key || seen.has(key)) return false;
-                    seen.add(key);
-                    return true;
-                })
-                .map(key => edgeDomByKey.get(key))
-                .filter(Boolean);
-        }
-
-        function bindEdgeInteractions(path, hitbox, edgeData) {
-            if (!path || !edgeData || !hitbox) return;
-            const key = edgeKey(edgeData);
-            const hoverTargets = [path, hitbox];
-            path._hitbox = hitbox;
-
-            const handleMouseEnter = (e) => {
-                hoveredEdges = getHoveredEdgesFromEvent(e);
-                hoveredEdgeIdx = hoveredEdges.findIndex(item => item.key === key);
-                if (hoveredEdgeIdx < 0) hoveredEdgeIdx = 0;
-                hoveredEdgeKey = hoveredEdges.length > 0 ? hoveredEdges[hoveredEdgeIdx].key : key;
-                applyEdgeFocusState();
-                if (hoveredEdges.length > 1) showOverlapBadge(e, hoveredEdgeIdx, hoveredEdges.length);
-                const handleMouseMove = (ev) => {
-                    const badge = document.getElementById('overlap-badge');
-                    if (badge && badge.style.display !== 'none') {
-                        badge.style.left = (ev.clientX + 14) + 'px';
-                        badge.style.top  = (ev.clientY - 10) + 'px';
-                    }
-                };
-                for (const target of hoverTargets) {
-                    target._overlapMoveHandler = handleMouseMove;
-                    target.addEventListener('mousemove', handleMouseMove);
-                }
-            };
-
-            const handleMouseLeave = () => {
-                for (const target of hoverTargets) {
-                    if (target._overlapMoveHandler) {
-                        target.removeEventListener('mousemove', target._overlapMoveHandler);
-                        target._overlapMoveHandler = null;
-                    }
-                }
-                hoveredEdges = [];
-                hoveredEdgeIdx = 0;
-                hoveredEdgeKey = null;
-                hideOverlapBadge();
-                applyEdgeFocusState();
-            };
-
-            const handleWheel = (e) => {
-                if (hoveredEdges.length <= 1) return;
-                e.preventDefault();
-                hoveredEdgeIdx = (hoveredEdgeIdx + (e.deltaY > 0 ? 1 : -1) + hoveredEdges.length) % hoveredEdges.length;
-                hoveredEdgeKey = hoveredEdges[hoveredEdgeIdx].key;
-                applyEdgeFocusState();
-                updateOverlapBadge();
-                showEdgePanel(hoveredEdges[hoveredEdgeIdx].edge);
-            };
-
-            const handleClick = (e) => {
-                e.stopPropagation();
-                const alreadyActive = focusedEdgePath === key;
-                if (alreadyActive) {
-                    focusedEdgePath = null;
-                    applyEdgeFocusState();
-                } else {
-                    setEdgeFocus(key);
-                }
-                showEdgePanel(edgeData);
-            };
-
-            for (const target of hoverTargets) {
-                target.addEventListener('mouseenter', handleMouseEnter);
-                target.addEventListener('mouseleave', handleMouseLeave);
-                target.addEventListener('wheel', handleWheel, { passive: false });
-                target.addEventListener('click', handleClick);
-            }
-            registerEdgeDom(path, edgeData);
-        }
-
-        function renderGroupTask(task) {
-            if (task.type === 'node') {
-                renderNodeAt(task.nid, task.x, task.y, task.w, task.h);
-                return;
-            }
-            if (task.type !== 'group') {
-                throw new Error(`renderGroupTask got unsupported task type: ${task.type}`);
-            }
-            const ctx = task.ctx;
-            if (!ctx || !ctx.g || !ctx.pos) {
-                throw new Error(`renderGroupTask got invalid context for task: ${task.taskKind || '<missing>'}`);
-            }
-            if (task.taskKind === 'collapsed_group') {
-                RENDER_GROUP_EXPORTS.renderCollapsedGroupBox(ctx);
-                RENDER_GROUP_EXPORTS.renderCollapsedGroupLabel(ctx);
-                RENDER_GROUP_EXPORTS.renderCollapsedGroupTiming(ctx);
-                RENDER_GROUP_EXPORTS.renderCollapsedGroupInfoButton(ctx);
-                RENDER_GROUP_EXPORTS.registerCollapsedGroupPorts(ctx);
-                return;
-            }
-            if (task.taskKind === 'expanded_group_shell') {
-                RENDER_GROUP_EXPORTS.renderExpandedGroupBox(ctx);
-                const { headerText } = RENDER_GROUP_EXPORTS.renderExpandedGroupHeaderLabel(ctx);
-                RENDER_GROUP_EXPORTS.renderExpandedGroupInfoButton(ctx, headerText);
-                RENDER_GROUP_EXPORTS.renderExpandedGroupTiming(ctx);
-                return;
-            }
-            if (task.taskKind === 'expanded_group_ports') {
-                RENDER_GROUP_EXPORTS.registerExpandedGroupPorts(ctx);
-                return;
-            }
-            throw new Error(`renderGroupTask got unknown taskKind: ${task.taskKind}`);
-        }
-
-        function collectGroupRenderTasks(items) {
-            const tasks = [];
-            function visitGroup(gid, ox, oy) {
-                const ctx = RENDER_GROUP_EXPORTS.getGroupRenderContext(gid, ox, oy);
-                if (!ctx || !ctx.pos) {
-                    throw new Error(`collectGroupRenderTasks missing layout for group: ${gid}`);
-                }
-                if (ctx.pos.collapsed) {
-                    tasks.push({ type: 'group', taskKind: 'collapsed_group', ctx });
-                    return;
-                }
-                tasks.push({ type: 'group', taskKind: 'expanded_group_shell', ctx });
-                for (const child of (ctx.pos.childPositions || [])) {
-                    if (child.type === 'node') {
-                        tasks.push({
-                            type: 'node',
-                            taskKind: 'node',
-                            nid: child.id,
-                            x: ctx.ox + child.x,
-                            y: ctx.oy + child.y,
-                            w: child.w,
-                            h: child.h,
-                        });
-                    } else if (child.type === 'group') {
-                        visitGroup(child.id, ctx.ox + child.x, ctx.oy + child.y);
-                    } else {
-                        throw new Error(`collectGroupRenderTasks got unknown child type: ${child.type}`);
-                    }
-                }
-                tasks.push({ type: 'group', taskKind: 'expanded_group_ports', ctx });
-            }
-            for (const item of items) {
-                visitGroup(item.id, item.x, item.y);
-            }
-            return tasks;
-        }
-
-        function collectGlobalEdgeTasks() {
-            const tasks = [];
-            for (const edge of (DATA.edges || [])) {
-                if (!isEdgeVisible(edge)) {
-                    continue;
-                }
-                tasks.push({ type: 'edge', taskKind: 'global_edge', edgeData: edge });
-            }
-            return tasks;
-        }
-
-        function renderIOPill(nid, cx, cy, w, h, label, sublabel, fillColor) {
-            const n = nodeMap[nid];
-            const x = cx - w/2;
-            const y = cy - h/2;
-            const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-            rect.setAttribute('x', x); rect.setAttribute('y', y);
-            rect.setAttribute('width', w); rect.setAttribute('height', h);
-            rect.setAttribute('rx', h / 2); rect.setAttribute('ry', h / 2);
-            rect.setAttribute('class', 'io-node');
-            rect.setAttribute('fill', fillColor);
-            rect.setAttribute('stroke', 'rgba(255,255,255,0.35)');
-            rect.setAttribute('stroke-width', '1.5');
-            if (n) {
-                rect.dataset.nid = nid;
-                rect.addEventListener('mouseenter', (e) => showTooltip(e, n));
-                rect.addEventListener('mouseleave', hideTooltip);
-                bindIONodeHover(rect, nid);
-            }
-            svg.appendChild(rect);
-            registerNodeDom(nid, rect);
-
-            const lab = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-            lab.setAttribute('x', cx); lab.setAttribute('y', sublabel ? cy - 2 : cy + 4);
-            lab.setAttribute('class', 'node-label');
-            lab.setAttribute('font-weight', '700');
-            lab.textContent = label;
-            svg.appendChild(lab);
-
-            if (sublabel) {
-                const sub = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-                sub.setAttribute('x', cx); sub.setAttribute('y', cy + 11);
-                sub.setAttribute('class', 'node-sublabel');
-                sub.textContent = sublabel;
-                svg.appendChild(sub);
-            }
-
-            nodePortMap[nid] = { cx, cy };
-            nodePortMap[nid + '__in'] = { cx, cy: y };
-            nodePortMap[nid + '__out'] = { cx, cy: y + h };
-        }
-
-        const IO_GROUP_FILL = {
-            input: 'rgba(46,204,113,0.55)',
-            param: 'rgba(155,89,182,0.55)',
-            const: 'rgba(241,196,15,0.55)',
-            output: 'rgba(231,76,60,0.55)',
-        };
-        const IO_GROUP_MEMBER_LABEL = { input: 'Input', param: 'Param', const: 'Const', output: 'Result' };
-
-        function renderIOGroupPill(ioGroup, cx, cy, w, h, availableW = svgW) {
-            const fillColor = IO_GROUP_FILL[ioGroup.io_subtype] || 'rgba(127,140,141,0.55)';
-            const memberLabel = IO_GROUP_MEMBER_LABEL[ioGroup.io_subtype] || ioGroup.io_subtype;
-            const isCollapsed = (ioGroup.id in collapsedState) ? collapsedState[ioGroup.id] : ioGroup.collapsed;
-            const renderCollapseButton = (bcx, bcy) => {
-                const bx = bcx - COLLAPSE_BUTTON_W / 2;
-                const by = bcy - COLLAPSE_BUTTON_H / 2;
-                const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-                rect.setAttribute('x', bx); rect.setAttribute('y', by);
-                rect.setAttribute('width', COLLAPSE_BUTTON_W); rect.setAttribute('height', COLLAPSE_BUTTON_H);
-                rect.setAttribute('rx', COLLAPSE_BUTTON_H / 2); rect.setAttribute('ry', COLLAPSE_BUTTON_H / 2);
-                rect.setAttribute('class', 'io-node io-group');
-                rect.setAttribute('fill', 'transparent');
-                rect.setAttribute('stroke', 'rgba(255,255,255,0.45)');
-                rect.setAttribute('stroke-width', '1.5');
-                rect.style.cursor = 'pointer';
-                rect.dataset.ioGroupId = ioGroup.id;
-                rect.addEventListener('dblclick', (e) => {
-                    e.stopPropagation();
-                    collapsedState[ioGroup.id] = true;
-                    invokeRender();
-                });
-                svg.appendChild(rect);
-
-                const lab = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-                lab.setAttribute('x', bcx); lab.setAttribute('y', bcy + 4);
-                lab.setAttribute('class', 'node-label');
-                lab.setAttribute('font-weight', '700');
-                lab.textContent = '▲ 收起';
-                lab.style.pointerEvents = 'none';
-                svg.appendChild(lab);
-            };
-            if (!isCollapsed) {
-                const members = ioGroup.member_ids || [];
-                if (members.length === 0) return 0;
-                const { cols, pillW, memberRows, height: expandedHeight } = computeIOGroupExpandedLayout(members.length, availableW);
-                const startY = cy - EXPANDED_IO_H / 2;
-                const frameX = cx - availableW / 2 + EXPAND_FRAME_PAD - 8;
-                const frameY = startY - 8;
-                const frameW = availableW - 2 * (EXPAND_FRAME_PAD - 8);
-                const frameH = expandedHeight + 8;
-                const frame = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-                frame.setAttribute('x', frameX); frame.setAttribute('y', frameY);
-                frame.setAttribute('width', frameW); frame.setAttribute('height', frameH);
-                frame.setAttribute('rx', 10); frame.setAttribute('ry', 10);
-                frame.setAttribute('fill', 'rgba(255,255,255,0.03)');
-                frame.setAttribute('stroke', fillColor);
-                frame.setAttribute('stroke-width', '1.5');
-                frame.setAttribute('stroke-dasharray', '5,4');
-                svg.appendChild(frame);
-
-                const truncateSublabel = (text) => {
-                    const limit = Math.max(1, Math.floor(pillW / 6.5));
-                    return text.length > limit ? `${text.slice(0, Math.max(0, limit - 1))}…` : text;
-                };
-                for (let rowIdx = 0; rowIdx < memberRows; rowIdx++) {
-                    const first = rowIdx * cols;
-                    const rowMemberCount = Math.max(0, Math.min(cols, members.length - first));
-                    const rowWidth = rowMemberCount * pillW + (rowMemberCount - 1) * pillGap;
-                    let left = cx - rowWidth / 2;
-                    const rowCy = startY + rowIdx * (EXPANDED_IO_H + EXPANDED_IO_GAP) + EXPANDED_IO_H / 2;
-                    for (let idx = 0; idx < rowMemberCount; idx++) {
-                        const memberId = members[first + idx];
-                        const node = nodeMap[memberId];
-                        const baseText = node ? node.class_name : memberLabel;
-                        const sublabel = (node && node.has_timing)
-                            ? `${baseText} · ${node.pct.toFixed(1)}%`
-                            : baseText;
-                        renderIOPill(memberId, left + pillW / 2, rowCy, pillW, EXPANDED_IO_H, memberLabel, truncateSublabel(sublabel), fillColor);
-                        left += pillW + pillGap;
-                    }
-                }
-                const collapseRowCy = frameY + frameH - COLLAPSE_BOTTOM_PADDING - COLLAPSE_BUTTON_H / 2;
-                renderCollapseButton(cx, collapseRowCy);
-                return expandedHeight;
-            }
-            const x = cx - w / 2;
-            const y = cy - h / 2;
-            const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-            rect.setAttribute('x', x); rect.setAttribute('y', y);
-            rect.setAttribute('width', w); rect.setAttribute('height', h);
-            rect.setAttribute('rx', h / 2); rect.setAttribute('ry', h / 2);
-            rect.setAttribute('class', 'io-node io-group');
-            rect.setAttribute('fill', fillColor);
-            rect.setAttribute('stroke', 'rgba(255,255,255,0.35)');
-            rect.setAttribute('stroke-width', '1.5');
-            rect.style.cursor = 'pointer';
-            rect.dataset.ioGroupId = ioGroup.id;
-            rect.addEventListener('dblclick', (e) => {
-                e.stopPropagation();
-                collapsedState[ioGroup.id] = false;
-                invokeRender();
-            });
-            svg.appendChild(rect);
-
-            const lab = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-            lab.setAttribute('x', cx); lab.setAttribute('y', cy + 4);
-            lab.setAttribute('class', 'node-label');
-            lab.setAttribute('font-weight', '700');
-            lab.textContent = `▶ ${ioGroup.label}`;
-            lab.style.pointerEvents = 'none';
-            svg.appendChild(lab);
-
-            nodePortMap[ioGroup.id] = { cx, cy };
-            nodePortMap[ioGroup.id + '__in'] = { cx, cy: y };
-            nodePortMap[ioGroup.id + '__out'] = { cx, cy: y + h };
-            return h;
-        }
-
-        function collectIORenderTasks(row, startY) {
-            if (!row || !row.items || row.items.length === 0) return { tasks: [], height: 0 };
-            let y = startY;
-            const tasks = [];
-            const inlineItems = [];
-            const expandedItems = [];
-            for (const item of row.items) {
-                if (item.isIOGroup === true) {
-                    const ioGroup = item.ioGroup;
-                    const isCollapsed = (ioGroup.id in collapsedState) ? collapsedState[ioGroup.id] : ioGroup.collapsed;
-                    if (!isCollapsed) {
-                        expandedItems.push(item);
-                        continue;
-                    }
-                }
-                inlineItems.push(item);
-            }
-
-            if (inlineItems.length > 0) {
-                const rowWidth = inlineItems.length * ioW + (inlineItems.length - 1) * pillGap;
-                let left = (svgW - rowWidth) / 2;
-                const cy = y + ioH / 2;
-                for (const item of inlineItems) {
-                    if (item.isIOGroup === true) {
-                        tasks.push({ type: 'io', taskKind: 'io_group', ioGroup: item.ioGroup, cx: left + ioW / 2, cy, w: ioW, h: ioH, availableW: svgW });
-                    } else {
-                        const nid = item.id;
-                        const node = nodeMap[nid];
-                        const baseText = node ? node.class_name : item.defaultSublabel;
-                        const sublabel = (node && node.has_timing)
-                            ? `${baseText} · ${node.pct.toFixed(1)}%`
-                            : baseText;
-                        tasks.push({ type: 'io', taskKind: 'io_pill', nid, cx: left + ioW / 2, cy, w: ioW, h: ioH, label: item.label, sublabel, fillColor: item.fillColor });
-                    }
-                    left += ioW + pillGap;
-                }
-                y += ioH;
-            }
-
-            if (expandedItems.length > 0) {
-                if (y > startY) y += ioGap;
-                const groupCount = expandedItems.length;
-                const colW = (svgW - (groupCount - 1) * EXPAND_COL_GAP) / groupCount;
-                const expandedHeight = Math.max(...expandedItems.map(item => calcIOGroupExpandedHeight(item.ioGroup, colW)));
-                let left = 0;
-                for (const item of expandedItems) {
-                    tasks.push({ type: 'io', taskKind: 'io_group', ioGroup: item.ioGroup, cx: left + colW / 2, cy: y + EXPANDED_IO_H / 2, w: ioW, h: ioH, availableW: colW });
-                    left += colW + EXPAND_COL_GAP;
-                }
-                y += expandedHeight;
-            }
-            return { tasks, height: y - startY };
-        }
-
-        function renderIOTask(task) {
-            if (task.type !== 'io') {
-                throw new Error(`renderIOTask got unsupported task type: ${task.type}`);
-            }
-            if (task.taskKind === 'io_group') {
-                renderIOGroupPill(task.ioGroup, task.cx, task.cy, task.w, task.h, task.availableW);
-                return;
-            }
-            if (task.taskKind === 'io_pill') {
-                renderIOPill(task.nid, task.cx, task.cy, task.w, task.h, task.label, task.sublabel, task.fillColor);
-                return;
-            }
-            throw new Error(`renderIOTask got unknown taskKind: ${task.taskKind}`);
-        }
-
-        const groupTasks = collectGroupRenderTasks(rootPositions);
-        const ioTasks = [];
-        let topIOY = 30;
-        for (const row of topIORows) {
-            const plan = collectIORenderTasks(row, topIOY);
-            ioTasks.push(...plan.tasks);
-            topIOY += plan.height + ioGap;
-        }
-        const rootEntry = rootPositions[0];
-        let bottomIOY = rootEntry ? (rootEntry.y + rootEntry.h + ioGap) : (rootStartY + maxRootH + ioGap);
-        for (const row of bottomIORows) {
-            const plan = collectIORenderTasks(row, bottomIOY);
-            ioTasks.push(...plan.tasks);
-            bottomIOY += plan.height + ioGap;
-        }
-
-        await runChunked(groupTasks.concat(ioTasks), async (task) => {
-            if (task.type === 'io') {
-                renderIOTask(task);
-                return;
-            }
-            renderGroupTask(task);
-        }, {
-            batchSize: 80,
-            phaseStart: 30,
-            phaseEnd: 60,
-            stageText: '正在渲染模块节点…',
-            generation,
-            allowedTypes: ['group', 'node', 'io'],
-        });
-
-        const globalEdgeTasks = collectGlobalEdgeTasks();
-
-        await runChunked(globalEdgeTasks, async (task) => {
-            if (task.type !== 'edge') {
-                throw new Error(`edge renderer got unsupported task type: ${task.type}`);
-            }
-            if (task.taskKind === 'global_edge') {
-                const fromId = resolveCollapsedAncestor(task.edgeData.from);
-                const toId = resolveCollapsedAncestor(task.edgeData.to);
-                if (fromId === toId) {
-                    return;
-                }
-                const fromPos = nodePortMap[fromId + '__out'] || nodePortMap[fromId];
-                const toPos = nodePortMap[toId + '__in'] || nodePortMap[toId];
-                if (!fromPos || !toPos) {
-                    throw new Error(`global edge endpoint missing: ${task.edgeData.from} -> ${task.edgeData.to}`);
-                }
-                renderEdge({
-                    routingMode: 'direct',
-                    x1: fromPos.cx, y1: fromPos.cy,
-                    x2: toPos.cx, y2: toPos.cy,
-                    type: task.edgeData.type || 'dep',
-                    edgeData: task.edgeData,
-                    routeMeta: EDGE_BUNDLE_META.get(edgeKey(task.edgeData)) || null,
-                });
-                return;
-            }
-            throw new Error(`edge renderer got unknown taskKind: ${task.taskKind}`);
-        }, {
-            batchSize: 180,
-            phaseStart: 60,
-            phaseEnd: 90,
-            stageText: '正在渲染依赖边…',
-            generation,
-            allowedTypes: ['edge'],
-        });
-        if (!edgeOverlayLayer) {
-            throw new Error('edge overlay layer missing after edge render');
-        }
-        svg.appendChild(edgeOverlayLayer);
-
-        setRenderProgress(90, '正在更新图例和摘要…');
-        await nextFrame();
-        const meta = DATA.meta;
-        if (DATA.has_timing) {
-            document.getElementById('mode-badge').innerHTML = '<span class="mode-badge mode-timing">📊 Structure + Timing</span>';
-            document.getElementById('meta-info').textContent = `Device: ${meta.device} | Step: ${meta.step_dur_str} | Modules: ${meta.num_modules}`;
-        } else {
-            document.getElementById('mode-badge').innerHTML = '<span class="mode-badge mode-structure">🏗️ Static Structure (source code)</span>';
-            document.getElementById('meta-info').textContent = `Modules: ${meta.num_modules} | Root: ${meta.roots ? meta.roots.join(", ") : "N/A"}`;
-        }
-
-        const legendDiv = document.getElementById('legend');
-        if (DATA.has_timing) {
-            legendDiv.innerHTML = `
-                <div class="legend-item"><div class="legend-dot" style="background:#2980b9"></div>&gt;20%</div>
-                <div class="legend-item"><div class="legend-dot" style="background:#27ae60"></div>10-20%</div>
-                <div class="legend-item"><div class="legend-dot" style="background:#8e44ad"></div>5-10%</div>
-                <div class="legend-item"><div class="legend-dot" style="background:#5a6c7d"></div>&lt;5%</div>
-                <div class="legend-item"><div class="legend-dot" style="background:#e74c3c"></div>Worker &gt;20%</div>
-                <div class="legend-item"><div class="legend-dot" style="background:#e67e22"></div>Worker 10-20%</div>`;
-        } else {
-            legendDiv.innerHTML = `
-                <div class="legend-item"><div class="legend-dot" style="background:#4a6fa5"></div>Depth 0</div>
-                <div class="legend-item"><div class="legend-dot" style="background:#5b8c5a"></div>Depth 1</div>
-                <div class="legend-item"><div class="legend-dot" style="background:#8e6fad"></div>Depth 2</div>
-                <div class="legend-item"><div class="legend-dot" style="background:#c77a3c"></div>Depth 3+</div>
-                <div class="legend-item" style="margin-left: 12px;"><span style="color:#64b5f6">▶</span> Click to expand</div>
-                <div class="legend-item" style="margin-left: 12px;"><span style="color:rgba(46,204,113,0.8)">━━▶</span> Data dependency</div>
-                <div class="legend-item"><span style="color:rgba(255,255,255,0.3)">╌╌▶</span> Sequential (fallback)</div>`;
-        }
-
-        const summaryDiv = document.getElementById('summary');
-        const allNodes = DATA.nodes;
-        const allGroups = DATA.groups;
-        if (DATA.has_timing) {
-            const topN = [...allNodes, ...allGroups].filter(x => x.has_timing).sort((a,b) => b.pct - a.pct).slice(0,5);
-            summaryDiv.innerHTML = `<h3>📊 Top Modules by Time</h3><p>${
-                topN.map(x => `<b>${x.label || x.class_name}</b> ${x.pct.toFixed(1)}%`).join(' → ')
-            }</p>`;
-        } else {
-            summaryDiv.innerHTML = `<h3>🏗️ Architecture Summary</h3><p>Module count: ${allNodes.length + allGroups.length} | Expandable containers: ${allGroups.length} | Leaf nodes: ${allNodes.length}<br><i>Click ▶ collapsed containers to expand. Provide --trace-file for timing overlay.</i></p>`;
-        }
-        assertActiveRenderGeneration(generation, '收尾阶段');
-        setRenderProgress(98, '正在更新图例和摘要…');
-        await nextFrame();
-        assertActiveRenderGeneration(generation, '完成阶段');
-        await hideRenderProgress();
-    } catch (err) {
-        if (renderGeneration === generation) {
-            const progressEls = getRenderProgressElements();
-            progressEls.overlay.classList.remove('closing');
-            progressEls.overlay.classList.add('visible', 'failed');
-            progressEls.overlay.setAttribute('aria-hidden', 'false');
-            const lastProgress = Number(progressEls.overlay.dataset.progress || 0);
-            setRenderProgress(Number.isFinite(lastProgress) ? Math.min(99, lastProgress) : 0, '渲染失败，请查看 Console 错误');
-        }
-        throw err;
+async function render(renderOpts) {
+    if (typeof window !== 'undefined' && typeof window.__canvasRenderPhase1 === 'function') {
+        return window.__canvasRenderPhase1(DATA, renderOpts);
     }
+    throw new Error('Canvas render entry __canvasRenderPhase1 is missing; engine bundle or render_canvas.js not loaded');
+}
+
+// Phase 2 step 4: ``invokeIncrementalRender`` is the post-toggle render entry.
+// Step 4 routes it through ``__canvasInvokeIncrementalRender`` which captures
+// the current ``engine.visible*`` sets, computes the next visible scene from
+// ``DATA + collapsedState``, and drives ``diffAndPatch`` only.  This path
+// MUST NOT touch ``resetScene()``, ``renderer.resize()`` or trigger an
+// auto-fit; those remain reserved for the initial ``invokeRender()`` path.
+function invokeIncrementalRender(ctx) {
+    if (typeof window === 'undefined' || typeof window.__canvasInvokeIncrementalRender !== 'function') {
+        throw new Error('Canvas incremental render entry __canvasInvokeIncrementalRender is missing; render_canvas.js must be loaded before the inline runtime');
+    }
+    window.__canvasInvokeIncrementalRender(ctx);
+}
+
+// Phase 2 step 4: ``expandAll`` / ``collapseAll`` mutate ``collapsedState`` in
+// place and dispatch the incremental render path.  They never touch the
+// ``invokeRender`` (full pipeline) path, which is reserved for the very first
+// page load and explicit user-driven re-fits.
+function expandAll() {
+    DATA.groups.forEach(g => collapsedState[g.id] = false);
+    invokeIncrementalRender({ reason: 'expand-all' });
+}
+
+function collapseAll() {
+    DATA.groups.forEach(g => { if (g.depth >= 1) collapsedState[g.id] = true; });
+    invokeIncrementalRender({ reason: 'collapse-all' });
+}
+
+// Phase 2 step 3: click / dblclick handlers on group hit boxes forward to
+// these inline-runtime globals (render_canvas.js' engine.onGroupToggle /
+// onGroupSelect read them at call time).  Missing groupMap[gid] is a hard
+// error — no silent fallback.
+if (typeof window !== 'undefined') {
+    window.__canvasOnGroupToggle = function (gid) {
+        if (!groupMap[gid]) {
+            throw new Error('__canvasOnGroupToggle: unknown group id ' + gid);
+        }
+        collapsedState[gid] = !collapsedState[gid];
+        invokeIncrementalRender({ reason: 'toggle', gid: gid });
+    };
+    window.__canvasOnGroupSelect = function (gid) {
+        const g = groupMap[gid];
+        if (!g) {
+            throw new Error('__canvasOnGroupSelect: unknown group id ' + gid);
+        }
+        const engine = (typeof window.__canvasEnginePhase1 === 'function') ? window.__canvasEnginePhase1() : null;
+        if (engine) { engine.selectedGroupId = gid; }
+        showGroupPanel(g);
+    };
+}
+
+function showGroupPanel(g) {
+    const sp = document.getElementById('side-panel');
+    const body = document.getElementById('sp-body');
+    const titleEl = document.getElementById('sp-title');
+    const subtitleEl = document.getElementById('sp-subtitle');
+    if (!sp || !body || !titleEl || !subtitleEl) {
+        throw new Error('showGroupPanel: side-panel DOM is missing');
+    }
+    titleEl.textContent = g.class_name || g.label || ('group ' + g.id);
+    subtitleEl.textContent = (g.attr_name || '') + ' \u00B7 gid=' + g.id;
+
+    const collapsed = !!collapsedState[g.id];
+    const childrenCount = ((g.children_group_ids || []).length) + ((g.children_nodes || []).length);
+    const kernelMs = Number(g && g.kernel_us != null ? g.kernel_us : (g.dur_us || 0)) / 1000.0;
+    const fwdMs = Number(g && g.fwd_kernel_us || 0) / 1000.0;
+    const bwdMs = Number(g && g.bwd_kernel_us || 0) / 1000.0;
+    const otherMs = Number(g && g.other_kernel_us || 0) / 1000.0;
+
+    let bodyHtml = '<div class="side-panel-section"><h4>Group</h4>'
+        + `<div class="evidence-meta"><b>gid:</b> ${escapeHtml(String(g.id))}</div>`
+        + `<div class="evidence-meta"><b>label:</b> ${escapeHtml(g.label || '')}</div>`
+        + `<div class="evidence-meta"><b>type:</b> ${escapeHtml(String(g.node_type || g.synthetic_type || 'module'))}</div>`
+        + `<div class="evidence-meta"><b>depth:</b> ${escapeHtml(String(g.depth))}</div>`
+        + `<div class="evidence-meta"><b>collapsed:</b> ${collapsed ? 'true' : 'false'}</div>`
+        + `<div class="evidence-meta"><b>children:</b> ${escapeHtml(String(childrenCount))}</div>`
+        + '</div>';
+
+    if (g.has_timing || g.has_phase_timing) {
+        bodyHtml += '<div class="side-panel-section"><h4>Timing</h4>'
+            + renderTimingRow('Kernel', kernelMs, 'kernel')
+            + renderTimingRow('Forward', fwdMs, 'forward')
+            + renderTimingRow('Backward', bwdMs, 'backward')
+            + renderTimingRow('Other', otherMs, 'other')
+            + '</div>';
+    }
+
+    if (g.src_file) {
+        const startLine = g.src_start_line || '';
+        const endLine = g.src_end_line || '';
+        bodyHtml += '<div class="side-panel-section"><h4>Source location</h4>'
+            + `<div class="evidence-meta"><b>file:</b> ${escapeHtml(String(g.src_file))}</div>`
+            + `<div class="evidence-meta"><b>lines:</b> ${escapeHtml(String(startLine))}\u2013${escapeHtml(String(endLine))}</div>`
+            + '</div>';
+    }
+
+    body.innerHTML = bodyHtml;
+    sp.classList.add('open');
 }
 
 function toggleGroup(gid) {
@@ -2526,24 +1931,26 @@ document.addEventListener('keydown', (e) => {
 });
 
 document.getElementById('btn-expand-all').addEventListener('click', () => {
-    DATA.groups.forEach(g => collapsedState[g.id] = false);
-    invokeRender();
+    expandAll();
 });
 document.getElementById('btn-collapse-all').addEventListener('click', () => {
-    DATA.groups.forEach(g => { if (g.depth >= 1) collapsedState[g.id] = true; });
-    invokeRender();
+    collapseAll();
 });
 document.getElementById('btn-fit').addEventListener('click', () => {
-    const container = document.getElementById('dag-container');
-    const svgEl = document.getElementById('dag-svg');
-    const sw = parseInt(svgEl.getAttribute('width'));
-    const cw = container.clientWidth;
-    if (sw > cw) {
-        svgEl.style.transform = `scale(${(cw / sw).toFixed(3)})`;
-        svgEl.style.transformOrigin = 'top left';
-    } else {
-        svgEl.style.transform = '';
+    if (typeof window.__canvasEnginePhase1 !== 'function') {
+        throw new Error('Canvas engine accessor __canvasEnginePhase1 is missing');
     }
+    const engine = window.__canvasEnginePhase1();
+    if (!engine || !engine.viewportController || typeof engine.viewportController.fitToView !== 'function') {
+        throw new Error('Canvas viewport controller is unavailable');
+    }
+    if (!engine.contentBounds) {
+        throw new Error('Canvas content bounds are unavailable');
+    }
+    const container = document.getElementById('dag-container');
+    const containerWidth = container && Number(container.clientWidth);
+    const containerHeight = container && Number(container.clientHeight);
+    engine.viewportController.fitToView(engine.contentBounds, containerWidth, containerHeight);
 });
 
 invokeRender();
@@ -2622,12 +2029,29 @@ def _build_source_map(file_paths: set[str]) -> dict[str, str]:
     return source_map
 
 
+def _inject_source_map(html_content: str, source_files: set[str]) -> str:
+    source_map = _build_source_map(source_files)
+    source_map_js = "const SOURCE_MAP = " + _json.dumps(source_map, ensure_ascii=True).replace("</", "<\\/") + ";"
+    return html_content.replace("// __SOURCE_MAP_PLACEHOLDER__", source_map_js)
+
+
+def _replace_data_preamble(base_html: str, preamble: str, *, context: str) -> str:
+    replaced_html, replace_count = re.subn(
+        r"const DATA = .*?(?=\nconst groupMap = \{\};)",
+        lambda _match: preamble,
+        base_html,
+        count=1,
+        flags=re.DOTALL,
+    )
+    if replace_count != 1:
+        raise RuntimeError(f"failed to replace DATA preamble for {context}")
+    return replaced_html
+
+
 def render_flowchart_to_file(flowchart_data, output_path):
     html_content = _generate_flowchart_html(flowchart_data)
     source_files = _collect_source_files(flowchart_data)
-    source_map = _build_source_map(source_files)
-    source_map_js = "const SOURCE_MAP = " + _json.dumps(source_map, ensure_ascii=True).replace("</", "<\\/") + ";"
-    html_content = html_content.replace("// __SOURCE_MAP_PLACEHOLDER__", source_map_js)
+    html_content = _inject_source_map(html_content, source_files)
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(html_content.encode("utf-8", "replace").decode("utf-8"))
     return output_path
@@ -2655,19 +2079,14 @@ def render_multi_tab_flowchart_to_file(
         for item in items:
             if "data" in item:
                 source_files.update(_collect_source_files(item["data"]))
-    
-    source_map = _build_source_map(source_files)
-    source_map_js = "const SOURCE_MAP = " + _json.dumps(source_map, ensure_ascii=True).replace("</", "<\\/") + ";"
-    html_content = html_content.replace("// __SOURCE_MAP_PLACEHOLDER__", source_map_js)
+
+    html_content = _inject_source_map(html_content, source_files)
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(html_content.encode("utf-8", "replace").decode("utf-8"))
     return output_path
 
 
 def _generate_flowchart_html_multi(tabs: dict[str, list[dict]]) -> str:
-    import json as _json
-    import re as _re
-
     if not tabs:
         raise ValueError("tabs must not be empty")
     first_mode = list(tabs.keys())[0]
@@ -2708,15 +2127,11 @@ def _generate_flowchart_html_multi(tabs: dict[str, list[dict]]) -> str:
         "let DATA = (ALL_TAB_DATA[ACTIVE_L1][ACTIVE_L2[ACTIVE_L1]].data || ALL_TAB_DATA[ACTIVE_L1][ACTIVE_L2[ACTIVE_L1]]);\n"
         "// __SOURCE_MAP_PLACEHOLDER__\n"
     )
-    base_html, n_sub = _re.subn(
-        r"const DATA = .*?(?=\nconst groupMap = \{\};)",
-        lambda _m: data_preamble,
+    base_html = _replace_data_preamble(
         base_html,
-        count=1,
-        flags=_re.DOTALL,
+        data_preamble,
+        context="multi-tab flowchart html",
     )
-    if n_sub != 1:
-        raise RuntimeError("failed to replace DATA preamble for multi-tab flowchart html")
 
     tab_styles = (
         "<style>\n"
@@ -2778,7 +2193,7 @@ def _generate_flowchart_html_multi(tabs: dict[str, list[dict]]) -> str:
         '<div class="multi-tabs-l1">' + "".join(l1_buttons) + "</div>\n"
         '<div class="multi-tabs-l2-container">' + "".join(l2_panels) + "</div>\n"
     )
-    base_html, body_sub = _re.subn(r"(<body[^>]*>)", r"\1\n" + tab_html, base_html, count=1)
+    base_html, body_sub = re.subn(r"(<body[^>]*>)", r"\1\n" + tab_html, base_html, count=1)
     if body_sub != 1:
         raise RuntimeError("failed to inject multi-tab bar into flowchart html body")
 
@@ -2796,8 +2211,8 @@ def _generate_flowchart_html_multi(tabs: dict[str, list[dict]]) -> str:
         "function _ensureDagShell() {\n"
         "    var dagContainer = document.getElementById(\"dag-container\");\n"
         "    if (!dagContainer) return;\n"
-        "    if (!document.getElementById(\"dag-svg\")) {\n"
-        "        dagContainer.innerHTML = '<svg class=\"dag-svg\" id=\"dag-svg\"></svg>';\n"
+        "    if (!document.getElementById(\"dag-stage\")) {\n"
+        "        dagContainer.innerHTML = '<div class=\"dag-stage\" id=\"dag-stage\"></div>';\n"
         "    }\n"
         "}\n"
         "function _showErrorPanel(errMsg, warnings) {\n"
@@ -2842,7 +2257,19 @@ def _generate_flowchart_html_multi(tabs: dict[str, list[dict]]) -> str:
         "    if (typeof indexGroupAncestors === \"function\" && DATA.root_groups) {\n"
         "        indexGroupAncestors(DATA.root_groups.map(rid => groupMap[rid]).filter(Boolean));\n"
         "    }\n"
+        # Re-seed io_group member -> io_group ancestor mapping that
+        # _resetSharedState() cleared.  Mirrors the initial-load setup in
+        # _generate_flowchart_html.  Without this, nodes living as members of
+        # a collapsed io_group lose their ancestor mapping after a tab switch,
+        # so resolveCollapsedAncestor() falls through to the raw node id
+        # (never registered in nodePortMap for collapsed io_groups) and
+        # drawGlobalEdges throws "global edge endpoint missing".
+        "    (DATA.io_groups || []).forEach(g => {\n"
+        "        (g.member_ids || []).forEach(nid => nodeAncestorGroups.set(nid, [g.id]));\n"
+        "    });\n"
         "    DATA.groups.forEach(g => { collapsedState[g.id] = g.depth >= 2 || g.is_native === true || g.synthetic_type === 'function_group' || g.synthetic_type === 'callloc_group'; });\n"
+        # Re-seed io_group collapsedState defaults that _resetSharedState() cleared.
+        "    (DATA.io_groups || []).forEach(g => { if (!(g.id in collapsedState)) collapsedState[g.id] = g.collapsed; });\n"
         "}\n"
         "function activateL1(mode) {\n"
         "    ACTIVE_L1 = mode;\n"
@@ -2906,8 +2333,6 @@ def _generate_flowchart_html_dual(data_train, data_infer):
     DOM, no cross-tab leakage (each switch fully resets ``groupMap`` /
     ``nodeMap`` / ``collapsedState`` / ``nodeAncestorGroups``).
     """
-    import json as _json
-    import re as _re
 
     # Use the train dataset to render the base template; the JSON payload will
     # be replaced with a dual-data preamble below.
@@ -2925,19 +2350,17 @@ def _generate_flowchart_html_dual(data_train, data_infer):
         "const DATA_TRAIN = " + train_json + ";\n"
         "const DATA_INFER = " + infer_json + ";\n"
     )
-    new_html, n_sub = _re.subn(
-        r'const DATA = .*?(?=\nconst groupMap = \{\};)',
-        lambda m: dual_preamble,
-        base_html,
-        count=1,
-        flags=_re.DOTALL,
-    )
-    if n_sub != 1:
+    try:
+        base_html = _replace_data_preamble(
+            base_html,
+            dual_preamble,
+            context="dual-tab flowchart html",
+        )
+    except RuntimeError:
         # Fall back to legacy iframe shell (extremely defensive — should never
         # trigger because _generate_flowchart_html always emits the marker).
         print("  ⚠️ 双 Tab: 未在内嵌模板中找到 DATA 注入锚点，回退为单 Tab(train) 输出")
         return base_html
-    base_html = new_html
 
     # ---- 2. inject the tab bar UI right after <body> ------------------------
     summary = lambda d: {
@@ -2990,7 +2413,7 @@ def _generate_flowchart_html_dual(data_train, data_infer):
         base_html = base_html.replace('</head>', tab_styles + '</head>', 1)
     else:
         base_html = tab_styles + base_html
-    base_html = _re.sub(r'(<body[^>]*>)', r'\1\n' + tab_html, base_html, count=1)
+    base_html = re.sub(r'(<body[^>]*>)', r'\1\n' + tab_html, base_html, count=1)
 
     # ---- 3. inject tab-switching JS at the very end (after final render()) --
     switch_js = (
@@ -3027,7 +2450,15 @@ def _generate_flowchart_html_dual(data_train, data_infer):
         '    if (typeof indexGroupAncestors === "function" && DATA.root_groups){\n'
         '      indexGroupAncestors(DATA.root_groups.map(rid => groupMap[rid]).filter(Boolean));\n'
         '    }\n'
+        # Re-seed io_group member -> io_group ancestor mapping that
+        # _resetSharedState() cleared (see _generate_flowchart_html_multi for
+        # the full root-cause comment).
+        '    (DATA.io_groups || []).forEach(g => {\n'
+        '      (g.member_ids || []).forEach(nid => nodeAncestorGroups.set(nid, [g.id]));\n'
+        '    });\n'
         '    DATA.groups.forEach(g => { collapsedState[g.id] = g.depth >= 2 || g.is_native === true; });\n'
+        # Re-seed io_group collapsedState defaults that _resetSharedState() cleared.
+        '    (DATA.io_groups || []).forEach(g => { if (!(g.id in collapsedState)) collapsedState[g.id] = g.collapsed; });\n'
         '  }\n'
         '  function activateTab(mode){\n'
         '    var btns = document.querySelectorAll(".iter14-tab");\n'
@@ -3040,6 +2471,7 @@ def _generate_flowchart_html_dual(data_train, data_infer):
         '    if (DATA === nextData) return;\n'
         '    _resetSharedState();\n'
         '    DATA = nextData;\n'
+        '    _ensureDagShell();\n'
         '    _rebuildIndices();\n'
         '    if (typeof invokeRender === "function") invokeRender();\n'
         '  }\n'
@@ -3065,16 +2497,25 @@ def _generate_flowchart_html(data):
     # ensure_ascii=True is safer for character handling
     data_json = _json.dumps(data, ensure_ascii=True)
     html_template = FLOWCHART_HTML_TEMPLATE
-    render_group_js = _RENDER_GROUP_JS_PATH.read_text(encoding="utf-8")
-    if _RENDER_GROUP_JS_PLACEHOLDER not in html_template:
-        raise RuntimeError("render_group.js placeholder is missing from FLOWCHART_HTML_TEMPLATE")
-    html_template = html_template.replace(_RENDER_GROUP_JS_PLACEHOLDER, render_group_js, 1)
-    # NOTE: The legacy "Total X% · Y" → totalUs reflow patch that previously
-    # lived here is gone.  After the kernel-field migration the in-template
-    # SVG label already reads `Kernel ${g.pct.toFixed(1)}% · ${formatDur(g.dur_us)}`
-    # directly (g.dur_us mirrors kernel_us), so no post-hoc replace is
-    # needed.
 
+    # Canvas Phase 1 / Stage 1.1: inject the Pixi engine bundle and
+    # render_canvas.js.  These two placeholders are the only runtime render
+    # injection path now; a missing placeholder is a hard error (no fallback).
+    engine_bundle_js = _ENGINE_BUNDLE_PATH.read_text(encoding="utf-8")
+    if _ENGINE_BUNDLE_PLACEHOLDER not in html_template:
+        raise RuntimeError("engine bundle placeholder is missing from FLOWCHART_HTML_TEMPLATE")
+    html_template = html_template.replace(_ENGINE_BUNDLE_PLACEHOLDER, engine_bundle_js, 1)
+
+    render_canvas_js = _RENDER_CANVAS_JS_PATH.read_text(encoding="utf-8")
+    if _RENDER_CANVAS_JS_PLACEHOLDER not in html_template:
+        raise RuntimeError("render_canvas.js placeholder is missing from FLOWCHART_HTML_TEMPLATE")
+    html_template = html_template.replace(_RENDER_CANVAS_JS_PLACEHOLDER, render_canvas_js, 1)
+
+    # The legacy render_group.js slot is intentionally NOT fed any runtime code.
+    # Stage 1.1 stops injecting the SVG group renderer entirely; if the template
+    # still carries the placeholder it can only collapse to an empty string.
+    if _RENDER_GROUP_JS_PLACEHOLDER in html_template:
+        html_template = html_template.replace(_RENDER_GROUP_JS_PLACEHOLDER, "", 1)
 
     # Replace the embedded DATA payload using the stable script markers rather
     # than a naive non-greedy `{...};` regex: the serialized JSON contains many
@@ -3085,7 +2526,7 @@ def _generate_flowchart_html(data):
         'const DATA = ' + data_json + ';',
         1
     )
-    
+
     return html_template
 
 
