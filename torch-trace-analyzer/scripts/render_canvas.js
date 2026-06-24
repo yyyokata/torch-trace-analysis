@@ -383,17 +383,13 @@
     }
 
     function resolveContainerSize(context) {
-        // Width is the canvas-usable width.  Two failure modes must be guarded:
-        //   1. The #dag-stage reserves a vertical-scrollbar gutter (scrollbar-gutter:
-        //      stable), so its clientWidth is the real drawable width MINUS the
-        //      scrollbar (~15px on Windows classic scrollbars).  Laying out against
-        //      the wider parent (#dag-container, no scrollbar) over-sizes the world
-        //      and clips its right edge under the scrollbar.
-        //   2. PixiJS autoDensity transiently writes canvas.style.width = physicalPx,
-        //      which can INFLATE #dag-stage.clientWidth before reflow settles.
-        // Taking the min of the stage and its parent satisfies both: normally the
-        // stage (scrollbar-excluded) is the smaller, correct value; if the stage is
-        // momentarily inflated, the parent's stable layout width wins instead.
+        // Width tracks the actual visible stage width (or its stable parent when the
+        // stage is transiently inflated by autoDensity).  Height is different after
+        // the CSS switch to page-level scrolling: #dag-stage no longer has a fixed
+        // viewport height, so clientHeight may be 0 while the browser viewport is
+        // still perfectly valid for width-only auto-fit. In that case we must
+        // explicitly use window.innerHeight; if neither source yields a positive
+        // height we still hard-fail.
         const stageW = getContainerWidth(engine.container);
         const parentW = (engine.container && engine.container.parentElement)
             ? getContainerWidth(engine.container.parentElement)
@@ -407,6 +403,9 @@
             cw = stageW;
         }
         let ch = getContainerHeight(engine.container);
+        if (ch === null || ch <= 0) {
+            ch = numericOrNull(global.innerHeight);
+        }
         if (cw !== null && cw > 0 && ch !== null && ch > 0) {
             engine.lastKnownContainerW = cw;
             engine.lastKnownContainerH = ch;
