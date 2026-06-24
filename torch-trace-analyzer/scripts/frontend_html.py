@@ -2333,6 +2333,7 @@ def _generate_flowchart_html_dual(data_train, data_infer):
         '    if (DATA === nextData) return;\n'
         '    _resetSharedState();\n'
         '    DATA = nextData;\n'
+        '    _ensureDagShell();\n'
         '    _rebuildIndices();\n'
         '    if (typeof invokeRender === "function") invokeRender();\n'
         '  }\n'
