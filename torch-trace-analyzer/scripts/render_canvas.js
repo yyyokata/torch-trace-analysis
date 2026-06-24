@@ -579,6 +579,9 @@
         if (!engine.cullingEnabled) {
             return true;
         }
+        if (!engine.hasRenderedOnce) {
+            return true;
+        }
         return engine.cullManager.isVisible(rect, engine.viewportController.currentBounds());
     }
 
