@@ -1812,10 +1812,13 @@ document.getElementById('btn-fit').addEventListener('click', () => {
     if (!engine || !engine.viewportController || typeof engine.viewportController.fitToView !== 'function') {
         throw new Error('Canvas viewport controller is unavailable');
     }
+    if (!engine.contentBounds) {
+        throw new Error('Canvas content bounds are unavailable');
+    }
     const container = document.getElementById('dag-container');
     const containerWidth = container && Number(container.clientWidth);
     const containerHeight = container && Number(container.clientHeight);
-    engine.viewportController.fitToView(engine.worldBounds, containerWidth, containerHeight);
+    engine.viewportController.fitToView(engine.contentBounds, containerWidth, containerHeight);
 });
 
 invokeRender();
