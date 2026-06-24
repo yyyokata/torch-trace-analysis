@@ -249,7 +249,20 @@
             // register their box here.  ``selectedGroupId`` tracks the
             // currently focused group for panel display.
             groupBoxes: new Map(),
-            selectedGroupId: null
+            selectedGroupId: null,
+            // Phase 2 step 4: ``dataRef`` / ``collapsedStateRef`` are the inline
+            // runtime references the incremental render path needs in order to
+            // (re)compute the visible scene without going back through the full
+            // ``canvasRenderPhase1`` pipeline.  The inline runtime installs them
+            // exactly once via ``__canvasSetIncrementalContext`` — never mutated
+            // afterwards.  ``resetSceneCallCount`` / ``rendererResizeCallCount``
+            // are diagnostic counters used by the phase-2 step-4 regression
+            // tests (T9 / T10) to confirm the toggle / Expand-All / Collapse-All
+            // path no longer falls back to ``resetScene()`` or ``renderer.resize()``.
+            dataRef: null,
+            collapsedStateRef: null,
+            resetSceneCallCount: 0,
+            rendererResizeCallCount: 0
         };
         // Phase 2 step 3: ``engine.onGroupToggle`` / ``engine.onGroupSelect``
         // are the *engine-side* interaction hooks fired by ``bindGroupBox()``.
@@ -1348,6 +1361,13 @@
 
     // ── scene reset + layout orchestration ─────────────────────────────────
     function resetScene() {
+        // Phase 2 step 4: bump the diagnostic counter *before* the actual reset
+        // so the T9 / T10 regression tests can assert the count.  ``resetScene``
+        // remains permitted on the initial render path (full draw via
+        // ``walkGroup`` / ``drawGlobalEdges``); the toggle / Expand-All /
+        // Collapse-All path goes through ``invokeIncrementalRender`` instead
+        // and must NOT increment this counter.
+        engine.resetSceneCallCount = (engine.resetSceneCallCount || 0) + 1;
         LAYER_KEYS.forEach(function (key) {
             const layer = engine.layers[key];
             if (layer && typeof layer.removeChildren === 'function') {
@@ -1648,6 +1668,196 @@
         engine.visibleEdgeKeys = new Set((nextVisible.edgeKeys || []).map(String));
     }
 
+    // ── Phase 2 step 4: incremental render path ────────────────────────────
+    //
+    // ``setIncrementalContext`` is the *one-time* hand-off the inline runtime
+    // performs at startup so render_canvas.js holds live references to ``DATA``
+    // (the deserialised flowchart payload) and ``collapsedState`` (the inline
+    // mutable map keyed by group id).  The references are read-only from the
+    // engine's perspective; only the inline runtime mutates ``collapsedState``
+    // (via ``__canvasOnGroupToggle``, ``expandAll`` and ``collapseAll``), and
+    // ``DATA`` itself is immutable for the lifetime of the page.
+    //
+    // ``computeVisibleScene`` walks ``data.root_groups`` top-down and returns a
+    // ``VisibilityFrame`` (``{ groupIds, nodeIds, edgeKeys, *Snapshots }``) that
+    // ``diffAndPatch()`` can consume directly.  It deliberately does NOT run
+    // ``computeFlowchartLayout`` again — Step 4 is scoped to "stop tearing the
+    // scene down on toggle" and produces minimal valid snapshots so the diff
+    // machinery has the fields it needs (T9 / T10 only inspect the visible-set
+    // contents, not pixel positions).  Layout reuse is a follow-up step.
+    //
+    // ``invokeIncrementalRender`` is the engine-side hook: it captures the
+    // current visible sets as ``prev``, computes the next frame from
+    // ``DATA + collapsedState``, and patches the pool.  It MUST NOT call
+    // ``resetScene()``, ``renderer.resize()`` or trigger an auto-fit — those
+    // are reserved for the initial render path.
+    function setIncrementalContext(ctx) {
+        ensureEngine();
+        if (!ctx || typeof ctx !== 'object') {
+            throw new Error('render_canvas.js: __canvasSetIncrementalContext requires an object');
+        }
+        if (!ctx.data || typeof ctx.data !== 'object') {
+            throw new Error('render_canvas.js: __canvasSetIncrementalContext: ctx.data is required');
+        }
+        if (!ctx.collapsedState || typeof ctx.collapsedState !== 'object') {
+            throw new Error('render_canvas.js: __canvasSetIncrementalContext: ctx.collapsedState is required');
+        }
+        engine.dataRef = ctx.data;
+        engine.collapsedStateRef = ctx.collapsedState;
+    }
+
+    function makeIncrGroupSnapshot(g, collapsed) {
+        return {
+            x: 0, y: 0, w: 200, h: 80,
+            label: String((g.label !== undefined && g.label !== null) ? g.label : (g.attr_name !== undefined && g.attr_name !== null ? g.attr_name : g.id)),
+            type: String(g.node_type || 'module'),
+            collapsed: collapsed[g.id] === true,
+            alpha: 1.0,
+            childCount: ((g.children_nodes || []).length) + ((g.children_group_ids || []).length),
+            metaVersion: 1
+        };
+    }
+
+    function makeIncrNodeSnapshot(n) {
+        return {
+            x: 0, y: 0, w: 100, h: 40,
+            label: String((n.label !== undefined && n.label !== null) ? n.label : (n.attr_name !== undefined && n.attr_name !== null ? n.attr_name : n.id)),
+            sublabel: String(n.class_name || ''),
+            fill: 0x4a6fa5,
+            stroke: 0xffffff,
+            alpha: 1.0
+        };
+    }
+
+    function makeIncrEdgeSnapshot(/* e */) {
+        return {
+            points: [{ x: 0, y: 0 }, { x: 10, y: 10 }],
+            stroke: 0xaaaaaa,
+            strokeWidth: 1.0,
+            alpha: 1.0,
+            dashed: false
+        };
+    }
+
+    function computeVisibleScene() {
+        ensureEngine();
+        const data = engine.dataRef;
+        if (!data) {
+            throw new Error('render_canvas.js: computeVisibleScene called before __canvasSetIncrementalContext');
+        }
+        const collapsed = engine.collapsedStateRef;
+        if (!collapsed) {
+            throw new Error('render_canvas.js: computeVisibleScene requires collapsedStateRef to be wired');
+        }
+        const groupById = new Map();
+        (data.groups || []).forEach(function (g) { groupById.set(String(g.id), g); });
+        const nodeById = new Map();
+        (data.nodes || []).forEach(function (n) { nodeById.set(String(n.id), n); });
+
+        const groupIds = [];
+        const nodeIds = [];
+        const edgeKeys = [];
+        const groupSnapshots = {};
+        const nodeSnapshots = {};
+        const edgeSnapshots = {};
+        const visibleGroupSet = new Set();
+        const visibleNodeSet = new Set();
+
+        const queue = [];
+        const enqueued = new Set();
+        (data.root_groups || []).forEach(function (rid) {
+            const key = String(rid);
+            if (!enqueued.has(key)) { queue.push(key); enqueued.add(key); }
+        });
+        while (queue.length) {
+            const gid = queue.shift();
+            if (visibleGroupSet.has(gid)) { continue; }
+            const g = groupById.get(gid);
+            if (!g) {
+                throw new Error('render_canvas.js: computeVisibleScene found root_groups entry with no matching group: ' + gid);
+            }
+            visibleGroupSet.add(gid);
+            groupIds.push(gid);
+            groupSnapshots[gid] = makeIncrGroupSnapshot(g, collapsed);
+            if (collapsed[g.id] === true) { continue; }
+            (g.children_group_ids || []).forEach(function (cgid) {
+                const sgid = String(cgid);
+                if (!enqueued.has(sgid)) { queue.push(sgid); enqueued.add(sgid); }
+            });
+            (g.children_nodes || []).forEach(function (cnid) {
+                const snid = String(cnid);
+                if (!visibleNodeSet.has(snid)) {
+                    visibleNodeSet.add(snid);
+                    nodeIds.push(snid);
+                    const node = nodeById.get(snid);
+                    if (!node) {
+                        throw new Error('render_canvas.js: computeVisibleScene found children_nodes entry with no matching node: ' + snid);
+                    }
+                    nodeSnapshots[snid] = makeIncrNodeSnapshot(node);
+                }
+            });
+        }
+
+        const edgeKeyFn = lookupEdgeKey();
+        const seenEdgeKeys = new Set();
+        (data.edges || []).forEach(function (e) {
+            const fromS = String(e && e.from !== undefined && e.from !== null ? e.from : '');
+            const toS   = String(e && e.to   !== undefined && e.to   !== null ? e.to   : '');
+            const fromVisible = visibleNodeSet.has(fromS) || visibleGroupSet.has(fromS);
+            const toVisible   = visibleNodeSet.has(toS)   || visibleGroupSet.has(toS);
+            if (!fromVisible || !toVisible) { return; }
+            const key = edgeKeyFn
+                ? String(edgeKeyFn(e))
+                : (fromS + '||' + toS + '||' + (e && e.type ? e.type : '') + '||' + (e && e.parent_class ? e.parent_class : ''));
+            if (!key || seenEdgeKeys.has(key)) { return; }
+            seenEdgeKeys.add(key);
+            edgeKeys.push(key);
+            edgeSnapshots[key] = makeIncrEdgeSnapshot(e);
+        });
+
+        return {
+            groupIds: groupIds,
+            nodeIds: nodeIds,
+            edgeKeys: edgeKeys,
+            groupSnapshots: groupSnapshots,
+            nodeSnapshots: nodeSnapshots,
+            edgeSnapshots: edgeSnapshots
+        };
+    }
+
+    function populateIncrementalScene() {
+        // After the legacy initial render finishes, seed the pool + ``visible*``
+        // sets so the very first ``invokeIncrementalRender`` (e.g. user's first
+        // toggle / Expand-All click) has a valid ``prev`` snapshot to diff
+        // against.  Without this seed, a subsequent Collapse-All would run
+        // ``patchGroups`` with a stale empty prev and the recycle path would
+        // throw "missing groupView in pool".
+        ensureEngine();
+        if (!engine.dataRef || !engine.collapsedStateRef) {
+            // Inline runtime is responsible for installing the context; if it
+            // hasn't, leave the visible sets empty so the next toggle path
+            // raises a hard error instead of silently no-op'ing.
+            return;
+        }
+        const next = computeVisibleScene();
+        const prev = { groupIds: [], nodeIds: [], edgeKeys: [] };
+        diffAndPatch(prev, next);
+    }
+
+    function invokeIncrementalRender() {
+        ensureEngine();
+        const prev = {
+            groupIds: engine.visibleGroupIds,
+            nodeIds: engine.visibleNodeIds,
+            edgeKeys: engine.visibleEdgeKeys
+        };
+        const next = computeVisibleScene();
+        diffAndPatch(prev, next);
+        // Phase 2 step 4 invariant: this path MUST NOT call resetScene(),
+        // renderer.resize() or performAutoFit().  If you find yourself adding
+        // any of those here, stop — that work belongs in the initial render.
+    }
+
     function applyWorldLayout(layoutInfo) {
         if (!layoutInfo || !Number.isFinite(layoutInfo.svgW) || !Number.isFinite(layoutInfo.svgH)) {
             throw new Error('render_canvas.js: computeFlowchartLayout returned invalid world bounds');
@@ -1662,6 +1872,7 @@
         // everything off-screen, which defeats the first-screen auto-fit.
         const containerSize = resolveContainerSize('applyWorldLayout');
         if (engine.app && engine.app.renderer && typeof engine.app.renderer.resize === 'function') {
+            engine.rendererResizeCallCount = (engine.rendererResizeCallCount || 0) + 1;
             engine.app.renderer.resize(Math.ceil(containerSize.w), Math.ceil(containerSize.h));
         }
         if (engine.app && engine.app.canvas) {
@@ -1698,6 +1909,7 @@
         const contentHeight = Math.ceil(fitBounds.h * vp.scale + 2 * FIT_PADDING);
         const canvasHeight = Math.max(Math.ceil(ch), contentHeight);
         if (engine.app && engine.app.renderer && typeof engine.app.renderer.resize === 'function') {
+            engine.rendererResizeCallCount = (engine.rendererResizeCallCount || 0) + 1;
             engine.app.renderer.resize(Math.ceil(cw), canvasHeight);
         }
         if (engine.app && engine.app.canvas) {
@@ -1914,6 +2126,16 @@
                 await p.hideRenderProgress();
                 return;
             }
+            // Phase 2 step 4: seed the object pool + ``visible*`` sets so the
+            // first toggle / Expand-All / Collapse-All click has a valid prev
+            // basis to diff against.  This runs after the legacy walkGroup /
+            // drawGlobalEdges path has already drawn the scene, so visually we
+            // briefly carry both sets of display objects; that's an accepted
+            // tradeoff while the full migration to a pool-only init path is
+            // out of scope for Step 4 (see design/frontend_canvas_phase2.md
+            // §2.4.1 — "init via diffAndPatch(empty, firstVisible)" is the
+            // future-state target).
+            populateIncrementalScene();
             await p.hideRenderProgress();
             return buildSnapshot();
         } catch (err) {
@@ -2050,6 +2272,21 @@
     global.__canvasDiffAndPatch = function (prevVisible, nextVisible) {
         ensureEngine();
         diffAndPatch(prevVisible, nextVisible);
+    };
+    // Phase 2 step 4: incremental render entry points.  ``setIncrementalContext``
+    // is called once by the inline runtime at startup; the inline ``invokeIncrementalRender``
+    // / ``expandAll`` / ``collapseAll`` helpers route through ``invokeIncrementalRender``
+    // here, which never touches ``resetScene()`` / ``renderer.resize()``.
+    global.__canvasSetIncrementalContext = function (ctx) {
+        setIncrementalContext(ctx);
+    };
+    global.__canvasComputeVisibleScene = function () {
+        ensureEngine();
+        return computeVisibleScene();
+    };
+    global.__canvasInvokeIncrementalRender = function () {
+        ensureEngine();
+        invokeIncrementalRender();
     };
     // Phase 2 step 3: ``__canvasGetGroupBox`` returns the live group hit box
     // (Graphics) for a given gid, regardless of whether the legacy walkGroup
