@@ -65,9 +65,9 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 .controls button { background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.15); color: #ccc; padding: 6px 14px; border-radius: 6px; font-size: 12px; cursor: pointer; transition: all 0.2s; }
 .controls button:hover { background: rgba(255,255,255,0.15); color: #fff; }
 .controls button.active { background: rgba(100,181,246,0.2); border-color: #64b5f6; color: #64b5f6; }
-.dag-container { width: 100%; overflow: hidden; position: relative; }
-.dag-stage { display: block; margin: 0 auto; width: 100%; height: calc(100vh - 260px); min-height: 460px; overflow-x: hidden; overflow-y: auto; overflow-anchor: none; scrollbar-gutter: stable; }
-.dag-stage canvas { display: block; width: 100%; max-width: 100%; }
+.dag-container { width: 100%; overflow-x: hidden; position: relative; }
+.dag-stage { display: block; margin: 0 auto; width: 100%; overflow: visible; }
+.dag-stage canvas { display: block; width: 100%; }
 .tooltip { position: fixed; background: #16213e; border: 1px solid rgba(100,181,246,0.3); border-radius: 8px; padding: 10px 14px; font-size: 11px; color: #e0e0e0; pointer-events: none; z-index: 1000; max-width: 300px; box-shadow: 0 4px 20px rgba(0,0,0,0.4); opacity: 0; transition: opacity 0.15s; }
 .tooltip.visible { opacity: 1; }
 .tooltip .tt-title { font-weight: 600; color: #64b5f6; margin-bottom: 4px; }
