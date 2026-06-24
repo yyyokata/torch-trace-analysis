@@ -308,6 +308,14 @@
         groupLayout = {};
     }
 
+    function resetNodePortMap() {
+        const map = lookupNodePortMap();
+        if (!map) {
+            throw new Error('render_canvas.js: nodePortMap is unavailable while resetting node ports');
+        }
+        Object.keys(map).forEach(function (k) { delete map[k]; });
+    }
+
     // ── pixi glyph factories ───────────────────────────────────────────────
     function makeGraphics(name) {
         const g = new engine.pixi.Graphics();
@@ -1179,10 +1187,7 @@
         engine.labelsCreated = 0;
         engine.labels = [];
         engine.contentBounds = null;
-        const map = lookupNodePortMap();
-        if (map) {
-            Object.keys(map).forEach(function (k) { delete map[k]; });
-        }
+        resetNodePortMap();
     }
 
     function applyWorldLayout(layoutInfo) {
@@ -1379,6 +1384,7 @@
         await p.nextFrame();
         try {
             resetInlineLayoutCache();
+            resetNodePortMap();
             resetScene();
             let layoutInfo = null;
             await p.runChunked([{ type: 'group', taskKind: 'layout' }], async function () {
