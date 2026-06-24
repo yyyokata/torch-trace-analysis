@@ -792,18 +792,18 @@
     }
 
     // ── GroupView ──────────────────────────────────────────────────────────
-    // Phase 2 step 3: bind click / dblclick / right-click / pointerdown
-    // handlers to a group hit box.  Idempotent — the second call on the same
-    // box is a no-op.  Click handlers are wired to ``engine.onGroupSelect``
-    // (single click, show panel) and ``engine.onGroupToggle`` (double click,
-    // collapse/expand) which forward to the inline-runtime hooks.
+    // Phase 2 step 3: bind click / right-click / pointerdown handlers to a
+    // group hit box.  Idempotent — the second call on the same box is a no-op.
+    // Click handlers are wired to ``engine.onGroupSelect`` (single click, show
+    // panel) and ``engine.onGroupToggle`` (double click, collapse/expand)
+    // which forward to the inline-runtime hooks.
     //
-    // click / dblclick disambiguation: a single click schedules a 200ms timer
-    // that fires ``onGroupSelect``; a dblclick received within that window
-    // cancels the timer and fires ``onGroupToggle`` instead, so a double click
-    // never opens the panel.  Each new click also cancels the prior pending
-    // timer, so click + click + dblclick (browser's native dblclick sequence)
-    // also cancels cleanly.
+    // PixiJS v8 does not reliably dispatch ``dblclick`` for Graphics hit boxes,
+    // so we simulate a double click by watching two ``click`` events arrive
+    // within a 200ms window.  The first click arms the delayed
+    // ``onGroupSelect`` timer; the second click clears that timer, resets the
+    // timer slot, toggles the group immediately, and returns so a double click
+    // never opens the panel.
     //
     // pointerdown with button===2 is the right-mouse path: two within 250ms
     // is reserved as the Semantic Zoom entry (Step 5).  Step 3 only defines
@@ -819,9 +819,20 @@
         box.eventMode = 'static';
         const clickDelayMs = 200;
         const rightDblIntervalMs = 250;
-        const state = { clickTimer: null, rightLastDown: 0 };
+        const state = { clickTimer: null, lastClickTime: 0, rightLastDown: 0 };
         box.on('click', function (e) {
             if (e && typeof e.stopPropagation === 'function') { e.stopPropagation(); }
+            const now = (typeof Date !== 'undefined' && typeof Date.now === 'function') ? Date.now() : 0;
+            const isDoubleClick = state.lastClickTime > 0 && (now - state.lastClickTime) <= clickDelayMs;
+            state.lastClickTime = now;
+            if (isDoubleClick) {
+                if (state.clickTimer !== null) {
+                    clearTimeout(state.clickTimer);
+                    state.clickTimer = null;
+                }
+                engine.onGroupToggle(gid);
+                return;
+            }
             if (state.clickTimer !== null) {
                 clearTimeout(state.clickTimer);
                 state.clickTimer = null;
@@ -830,14 +841,6 @@
                 state.clickTimer = null;
                 engine.onGroupSelect(gid);
             }, clickDelayMs);
-        });
-        box.on('dblclick', function (e) {
-            if (e && typeof e.stopPropagation === 'function') { e.stopPropagation(); }
-            if (state.clickTimer !== null) {
-                clearTimeout(state.clickTimer);
-                state.clickTimer = null;
-            }
-            engine.onGroupToggle(gid);
         });
         box.on('rightclick', function (e) {
             if (e && typeof e.preventDefault === 'function') { e.preventDefault(); }
@@ -1571,17 +1574,16 @@
     //
     // ``computeVisibleScene`` walks ``data.root_groups`` top-down and returns a
     // ``VisibilityFrame`` (``{ groupIds, nodeIds, edgeKeys, *Snapshots }``) that
-    // ``diffAndPatch()`` can consume directly.  It deliberately does NOT run
-    // ``computeFlowchartLayout`` again — Step 4 is scoped to "stop tearing the
-    // scene down on toggle" and produces minimal valid snapshots so the diff
-    // machinery has the fields it needs (T9 / T10 only inspect the visible-set
-    // contents, not pixel positions).  Layout reuse is a follow-up step.
+    // ``diffAndPatch()`` can consume directly.  Callers may pass a precomputed
+    // layout bundle from ``computeLayoutMeta`` so the incremental render path can
+    // re-use the exact reflow it already applied to world bounds and canvas size.
     //
     // ``invokeIncrementalRender`` is the engine-side hook: it captures the
-    // current visible sets as ``prev``, computes the next frame from
-    // ``DATA + collapsedState``, and patches the pool.  It MUST NOT call
-    // ``resetScene()``, ``renderer.resize()`` or trigger an auto-fit — those
-    // are reserved for the initial render path.
+    // current visible sets as ``prev``, recomputes layout metadata + world
+    // bounds from ``DATA + collapsedState``, applies the resized viewport world,
+    // computes the next frame, patches the pool, and then auto-fits the new
+    // content.  Incremental render is therefore allowed to call
+    // ``renderer.resize()`` when the re-layout changes the canvas dimensions.
     function setIncrementalContext(ctx) {
         ensureEngine();
         if (!ctx || typeof ctx !== 'object') {
@@ -1721,10 +1723,10 @@
         (layoutInfo.rootPositions || []).forEach(function (root) {
             walk(root.id, root.x, root.y);
         });
-        return { nodeMeta: nodeMeta, groupMeta: groupMeta };
+        return { layoutInfo: layoutInfo, nodeMeta: nodeMeta, groupMeta: groupMeta };
     }
 
-    function computeVisibleScene() {
+    function computeVisibleScene(layoutMeta) {
         ensureEngine();
         const data = engine.dataRef;
         if (!data) {
@@ -1741,9 +1743,9 @@
 
         // Real, current-state coordinates for every node/group the visible walk
         // can possibly reach (see computeLayoutMeta's rationale).
-        const layoutMeta = computeLayoutMeta(data);
-        const nodeMetaById = layoutMeta.nodeMeta;
-        const groupMetaById = layoutMeta.groupMeta;
+        const metaBundle = layoutMeta || computeLayoutMeta(data);
+        const nodeMetaById = metaBundle.nodeMeta;
+        const groupMetaById = metaBundle.groupMeta;
 
         const groupIds = [];
         const nodeIds = [];
@@ -1876,11 +1878,14 @@
             nodeIds: engine.visibleNodeIds,
             edgeKeys: engine.visibleEdgeKeys
         };
-        const next = computeVisibleScene();
+        const layoutMeta = computeLayoutMeta(engine.dataRef);
+        applyWorldLayout(layoutMeta.layoutInfo);
+        const next = computeVisibleScene(layoutMeta);
         diffAndPatch(prev, next);
-        // Phase 2 step 4 invariant: this path MUST NOT call resetScene(),
-        // renderer.resize() or performAutoFit().  If you find yourself adding
-        // any of those here, stop — that work belongs in the initial render.
+        performAutoFit();
+        // Phase 2 step 4 invariant: this path still stays pool-first — it
+        // reflows layout, refreshes canvas size, patches visible objects in
+        // place, and then re-applies auto-fit without ever resetting the scene.
     }
 
     function applyWorldLayout(layoutInfo) {
