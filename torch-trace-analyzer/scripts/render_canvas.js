@@ -2017,10 +2017,11 @@
         const canvasHeight = Math.max(Math.ceil(ch), contentHeight);
         if (engine.app && engine.app.renderer && typeof engine.app.renderer.resize === 'function') {
             engine.rendererResizeCallCount = (engine.rendererResizeCallCount || 0) + 1;
-            engine.app.renderer.resize(Math.ceil(cw), canvasHeight);
+            engine.app.renderer.resize(Math.ceil(cw), Math.ceil(ch));
         }
         if (engine.app && engine.app.canvas) {
             engine.app.canvas.style.width = '100%';
+            engine.app.canvas.style.height = canvasHeight + 'px';
         }
         // Apply the computed viewport transform to the world container.
         // renderer.resize() may reset internal transforms; applyViewport() must
