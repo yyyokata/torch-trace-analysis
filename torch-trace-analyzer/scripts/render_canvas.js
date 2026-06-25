@@ -145,9 +145,13 @@
             this.screen = { x: 0, y: 0, width: opts.width || 0, height: opts.height || 0 };
             this.canvas = null;
             this.renderer = {
+                _lastResizeW: null,
+                _lastResizeH: null,
                 resize: function (w, h) {
                     this.width = w;
                     this.height = h;
+                    this._lastResizeW = w;
+                    this._lastResizeH = h;
                 }
             };
         }
@@ -215,9 +219,6 @@
             hasRenderedOnce: false,
             lastKnownContainerW: null,
             lastKnownContainerH: null,
-            viewportHeight: (global.innerHeight && global.innerHeight > 0)
-                ? global.innerHeight
-                : null,
             nodes: [],
             groups: [],
             edges: [],
@@ -549,9 +550,6 @@
             cw = stageW;
         }
         let ch = getContainerHeight(engine.container);
-        if (engine.viewportHeight && engine.viewportHeight > 0 && ch !== null && ch > engine.viewportHeight) {
-            ch = engine.viewportHeight;
-        }
         if (ch === null || ch <= 0) {
             ch = numericOrNull(global.innerHeight);
         }
@@ -2023,7 +2021,7 @@
         const canvasHeight = Math.max(Math.ceil(ch), contentHeight);
         if (engine.app && engine.app.renderer && typeof engine.app.renderer.resize === 'function') {
             engine.rendererResizeCallCount = (engine.rendererResizeCallCount || 0) + 1;
-            engine.app.renderer.resize(Math.ceil(cw), Math.ceil(ch));
+            engine.app.renderer.resize(Math.ceil(cw), Math.ceil(canvasHeight));
         }
         if (engine.app && engine.app.canvas) {
             engine.app.canvas.style.width = '100%';
