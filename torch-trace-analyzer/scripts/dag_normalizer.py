@@ -12,6 +12,10 @@ def normalize_containers_recursive(
     attr_to_node_ids = _build_attr_to_node_ids(registry)
     next_node_id = max(registry.keys()) + 1 if registry else 0
     _ensure_missing_container_nodes(container_attr_map, registry, attr_to_node_ids, next_node_id)
+    # 模式 1 收缩法需要每个游离节点的全部真实数据流边（包括连到 scope 外节点，
+    # 如 result/head 的边）。各 inner_dag.edges 只含自身节点内部边，不足以判定，
+    # 因此在任何分组/重写发生前快照顶层全局边集合，向下层层传递。
+    global_edges = list(dag.edges)
     _normalize_containers_recursive(
         dag,
         registry,
@@ -21,6 +25,7 @@ def normalize_containers_recursive(
         scope_frames_prefix=("forward",),
         allow_function_grouping=True,
         allow_callloc_grouping=True,
+        global_edges=global_edges,
     )
 
 
@@ -33,6 +38,7 @@ def _normalize_containers_recursive(
     scope_frames_prefix: tuple[str, ...],
     allow_function_grouping: bool,
     allow_callloc_grouping: bool,
+    global_edges: list[DataFlowEdge],
 ) -> None:
     dag_object_id = id(dag)
     if dag_object_id in visited_dag_ids:
@@ -46,6 +52,7 @@ def _normalize_containers_recursive(
         scope_frames_prefix=scope_frames_prefix,
         allow_function_grouping=allow_function_grouping,
         allow_callloc_grouping=allow_callloc_grouping,
+        global_edges=global_edges,
     )
     _rebuild_adjacency(dag)
     for node_id in list(dag.nodes):
@@ -69,6 +76,7 @@ def _normalize_containers_recursive(
             scope_frames_prefix=child_scope_frames_prefix,
             allow_function_grouping=child_allow_function_grouping,
             allow_callloc_grouping=child_allow_callloc_grouping,
+            global_edges=global_edges,
         )
 
 
@@ -80,6 +88,7 @@ def _normalize_single_dag(
     scope_frames_prefix: tuple[str, ...],
     allow_function_grouping: bool,
     allow_callloc_grouping: bool,
+    global_edges: list[DataFlowEdge],
 ) -> None:
     container_node_ids = _collect_relevant_container_node_ids(
         dag=dag,
@@ -113,15 +122,20 @@ def _normalize_single_dag(
             continue
 
         if container_node.is_native:
-            member_id_set = set(member_ids)
-            inner_dag.nodes = sorted(member_ids)
-            inner_dag.direct_nodes = sorted(member_ids)
+            # 模式 1 容器扩展归入的游离节点持久化在 metadata 中，
+            # 原生容器每次被访问都会从 attr.items 重建 inner_dag，
+            # 因此必须把 absorbed 节点并回成员集合，否则会被重建逻辑抹掉。
+            absorbed_ids = list(container_node.metadata.get("mode1_absorbed", []))
+            effective_member_ids = sorted(set(member_ids) | set(absorbed_ids))
+            member_id_set = set(effective_member_ids)
+            inner_dag.nodes = list(effective_member_ids)
+            inner_dag.direct_nodes = list(effective_member_ids)
             inner_dag.edges = [
                 edge for edge in dag.edges if edge.src_id in member_id_set and edge.dst_id in member_id_set
             ]
             _rebuild_adjacency(inner_dag)
             if owner_node_id != container_node_id:
-                for member_id in member_ids:
+                for member_id in effective_member_ids:
                     if member_id in dag.direct_nodes:
                         dag.direct_nodes.remove(member_id)
             continue
@@ -132,10 +146,219 @@ def _normalize_single_dag(
             if owner_node_id != container_node_id and member_id in dag.direct_nodes:
                 dag.direct_nodes.remove(member_id)
 
+    # 模式 1 容器扩展：必须在 callloc_group（B-group）形成之前执行，
+    # 否则游离 op 会先被 B-group 吃掉，无法再归入容器。
+    apply_container_expansion_mode1(
+        dag, registry, owner_node_id=owner_node_id, global_edges=global_edges
+    )
+
     if allow_function_grouping:
         _apply_function_grouping_a(dag, registry, scope_frames_prefix=scope_frames_prefix)
     if allow_callloc_grouping:
         _apply_function_grouping_b(dag, registry, parent_func=scope_frames_prefix[-1])
+
+
+def _is_container_node(node: DagNode) -> bool:
+    return (
+        isinstance(node, ModuleNode)
+        and node.inner_dag is not None
+        and (bool(node.metadata.get("is_container")) or isinstance(node.attr, ContainerAttr))
+    )
+
+
+def apply_container_expansion_mode1(
+    dag: DAG,
+    registry: dict[int, DagNode],
+    owner_node_id: int | None,
+    global_edges: list[DataFlowEdge],
+) -> None:
+    """模式 1 容器扩展（收缩法）。
+
+    把游离在容器外、但前后向仅连接容器子孙（或同批一起归入的游离节点）的 op，
+    整体归入对应容器。算法见 design/grouping_mode1_container_expansion.md。
+
+    - 多容器竞争（游离节点的边跨越互不嵌套的两个容器）：不归入任何容器（不做 LCA）。
+    - 嵌套容器：归入最内层（descendant 最少的）满足条件的容器。
+    - 模式 1 必须在 callloc_group 形成之前调用。
+    - 必须使用全局边集合 ``global_edges``，因为各 scope 的 ``inner_dag.edges``
+      不含连到 scope 外节点（如 result/head）的边，会导致收缩法误判。
+    """
+    container_ids: list[int] = []
+    for node_id in dag.nodes:
+        node = registry.get(node_id)
+        if node is None:
+            raise RuntimeError(f"mode1: dag node {node_id} missing from registry")
+        if node_id == owner_node_id:
+            continue
+        if _is_container_node(node):
+            container_ids.append(node_id)
+    if not container_ids:
+        return
+
+    # desc[C] = C 的全部子孙节点（递归展开 inner_dag），用于成员判定。
+    desc: dict[int, set[int]] = {}
+
+    def _descendants(container_id: int) -> set[int]:
+        cached = desc.get(container_id)
+        if cached is not None:
+            return cached
+        container_node = registry[container_id]
+        if container_node.inner_dag is None:
+            raise RuntimeError(f"mode1: container {container_id} has no inner_dag")
+        acc: set[int] = set()
+        for member_id in container_node.inner_dag.nodes:
+            acc.add(member_id)
+            member_node = registry.get(member_id)
+            if member_node is not None and _is_container_node(member_node):
+                acc |= _descendants(member_id)
+        desc[container_id] = acc
+        return acc
+
+    for container_id in container_ids:
+        _descendants(container_id)
+
+    def _min_container(node_id: int) -> int | None:
+        """返回包含 node_id 的最内层容器（descendant 最少者）；不在任何容器内则 None。"""
+        candidates = [cid for cid in container_ids if node_id in desc[cid]]
+        if not candidates:
+            return None
+        return min(candidates, key=lambda cid: len(desc[cid]))
+
+    container_id_set = set(container_ids)
+    floating: set[int] = set()
+    for node_id in dag.direct_nodes:
+        if node_id == owner_node_id:
+            continue
+        node = registry.get(node_id)
+        if node is None:
+            raise RuntimeError(f"mode1: direct node {node_id} missing from registry")
+        if node_id in container_id_set:
+            continue
+        if isinstance(node, ModuleNode) and node.metadata.get("is_synthetic"):
+            # 模式 1 在分组之前运行，正常不应出现 synthetic group；出现即属异常。
+            raise RuntimeError(
+                f"mode1: unexpected synthetic node {node_id} present before grouping"
+            )
+        floating.add(node_id)
+    if not floating:
+        return
+
+    in_neighbors: dict[int, list[int]] = {node_id: [] for node_id in floating}
+    out_neighbors: dict[int, list[int]] = {node_id: [] for node_id in floating}
+    for edge in global_edges:
+        if edge.dst_id in floating:
+            in_neighbors[edge.dst_id].append(edge.src_id)
+        if edge.src_id in floating:
+            out_neighbors[edge.src_id].append(edge.dst_id)
+
+    # 收缩法（不动点）：若某游离节点存在一条边连到「既不在候选集合 T、又不属于任何容器」
+    # 的外部节点，则该节点不可能整体归入容器，从 T 中删除；重复直到稳定。
+    survivors = set(floating)
+    changed = True
+    while changed:
+        changed = False
+        for node_id in list(survivors):
+            neighbors = in_neighbors[node_id] + out_neighbors[node_id]
+            for neighbor_id in neighbors:
+                if neighbor_id in survivors:
+                    continue
+                if _min_container(neighbor_id) is None:
+                    survivors.discard(node_id)
+                    changed = True
+                    break
+    if not survivors:
+        return
+
+    # 把 survivors 按内部边（T-T 边）划分为连通分量，整组归入同一容器。
+    undirected: dict[int, set[int]] = {node_id: set() for node_id in survivors}
+    for edge in global_edges:
+        if edge.src_id in survivors and edge.dst_id in survivors:
+            undirected[edge.src_id].add(edge.dst_id)
+            undirected[edge.dst_id].add(edge.src_id)
+
+    visited: set[int] = set()
+    for seed in survivors:
+        if seed in visited:
+            continue
+        component: set[int] = set()
+        stack = [seed]
+        while stack:
+            cur = stack.pop()
+            if cur in visited:
+                continue
+            visited.add(cur)
+            component.add(cur)
+            for nxt in undirected[cur]:
+                if nxt not in visited:
+                    stack.append(nxt)
+
+        external_neighbors: set[int] = set()
+        for node_id in component:
+            for neighbor_id in in_neighbors[node_id] + out_neighbors[node_id]:
+                if neighbor_id not in component:
+                    external_neighbors.add(neighbor_id)
+        if not external_neighbors:
+            # 完全孤立的游离节点，没有归属目标，保持游离。
+            continue
+
+        targets = {_min_container(neighbor_id) for neighbor_id in external_neighbors}
+        if None in targets:
+            # 收缩法应已剔除此类节点；若仍出现说明状态不一致。
+            raise RuntimeError(
+                f"mode1: component {sorted(component)} has external neighbor outside any container"
+            )
+        if len(targets) != 1:
+            # 多容器竞争：边跨越互不嵌套的容器，不归入任何容器。
+            continue
+        target_id = targets.pop()
+        _absorb_into_container(
+            dag=dag,
+            registry=registry,
+            component=component,
+            target_id=target_id,
+            target_descendants=desc[target_id],
+            global_edges=global_edges,
+        )
+
+
+def _absorb_into_container(
+    dag: DAG,
+    registry: dict[int, DagNode],
+    component: set[int],
+    target_id: int,
+    target_descendants: set[int],
+    global_edges: list[DataFlowEdge],
+) -> None:
+    target_node = registry[target_id]
+    inner_dag = target_node.inner_dag
+    if inner_dag is None:
+        raise RuntimeError(f"mode1: target container {target_id} has no inner_dag")
+
+    for node_id in sorted(component):
+        if node_id not in dag.direct_nodes:
+            raise RuntimeError(
+                f"mode1: absorbed node {node_id} not present in scope direct_nodes"
+            )
+        dag.direct_nodes.remove(node_id)
+        if node_id not in inner_dag.nodes:
+            inner_dag.nodes.append(node_id)
+        if node_id not in inner_dag.direct_nodes:
+            inner_dag.direct_nodes.append(node_id)
+
+    # 记录到容器 metadata，使原生容器重建逻辑（_normalize_single_dag）保留这些节点。
+    absorbed = target_node.metadata.setdefault("mode1_absorbed", [])
+    for node_id in sorted(component):
+        if node_id not in absorbed:
+            absorbed.append(node_id)
+
+    member_set = set(target_descendants) | set(component)
+    existing_edges = {(edge.src_id, edge.dst_id) for edge in inner_dag.edges}
+    for edge in global_edges:
+        if edge.src_id in member_set and edge.dst_id in member_set:
+            if (edge.src_id, edge.dst_id) not in existing_edges:
+                inner_dag.edges.append(edge)
+                existing_edges.add((edge.src_id, edge.dst_id))
+    _rebuild_adjacency(inner_dag)
 
 
 def _apply_function_grouping_a(
@@ -524,4 +747,4 @@ def _rebuild_adjacency(dag: DAG) -> None:
     dag.out_edges = out_edges
 
 
-__all__ = ["normalize_containers_recursive"]
+__all__ = ["normalize_containers_recursive", "apply_container_expansion_mode1"]

@@ -138,12 +138,15 @@ def _serialize_module_node(node: ModuleNode, dag: DAG, registry: dict[int, DagNo
             if attr_name
             else class_name
         )
-        attr_id_to_node_id = {id(n.attr): nid for nid, n in registry.items()}
-        children_nodes = [
-            attr_id_to_node_id[id(child_attr)]
-            for child_attr in node.attr.items.values()
-            if id(child_attr) in attr_id_to_node_id
-        ]
+        if node.inner_dag is None:
+            raise RuntimeError(
+                f"container node {node.node_id} has no inner_dag; "
+                "container membership must come from the runtime inner_dag"
+            )
+        # children_nodes 取运行期 inner_dag.direct_nodes（动态执行成员，含被模式 1
+        # 归入的游离 functional 节点），不再用静态 attr.items（仅含 __init__ 注册的子模块，
+        # 会漏掉 functional 算子）。
+        children_nodes = list(node.inner_dag.direct_nodes)
         return {
             "node_id": node.node_id,
             "label": label,
@@ -154,11 +157,7 @@ def _serialize_module_node(node: ModuleNode, dag: DAG, registry: dict[int, DagNo
             "container_kind": node.attr.container_kind,
             "attr_type": "container",
             "children_nodes": children_nodes,
-            "inner_dag": (
-                serialize_dag(node.inner_dag, registry)
-                if node.inner_dag is not None
-                else None
-            ),
+            "inner_dag": serialize_dag(node.inner_dag, registry),
         }
 
     if isinstance(node.attr, ModuleAttr):
