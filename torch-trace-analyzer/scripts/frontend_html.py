@@ -257,7 +257,6 @@ const collapsedState = {};
 // is the read alias used by UTs to assert toggle behaviour.
 if (typeof window !== 'undefined') { window.__canvas_collapsed_state = collapsedState; }
 let groupLayout = {};
-let nodePortMap = {};
 let edgeDomRegistry = [];
 const edgeByNodeId = new Map();
 const edgeByGroupId = new Map();
@@ -2249,7 +2248,6 @@ def _generate_flowchart_html_multi(tabs: dict[str, list[dict]]) -> str:
         "    try { if (typeof edgeByGroupId !== \"undefined\" && edgeByGroupId && edgeByGroupId.clear) edgeByGroupId.clear(); } catch (e) {}\n"
         "    try { if (typeof edgeDomByKey !== \"undefined\" && edgeDomByKey && edgeDomByKey.clear) edgeDomByKey.clear(); } catch (e) {}\n"
         "    try { if (typeof groupLayout !== \"undefined\") { Object.keys(groupLayout).forEach(k => delete groupLayout[k]); } } catch (e) {}\n"
-        "    try { if (typeof nodePortMap !== \"undefined\") { Object.keys(nodePortMap).forEach(k => delete nodePortMap[k]); } } catch (e) {}\n"
         "    try { hoveredEdgeKey = null; hoveredEdges = []; hoveredEdgeIdx = 0; hoveredNodeId = null; hoveredGroupId = null; focusedEdgePath = null; prevActiveItems = []; prevActiveNodeIds = new Set(); prevActiveEdgeKeys = new Set(); prevActiveGroupNodeIds = new Set(); prevActiveGroupIds = new Set(); prevDimEdgeKeys = new Set(); prevDimGroupNodeIds = new Set(); prevDimGroupIds = new Set(); lastHoveredGid = null; } catch (e) {}\n"
         "    try { var sp = document.getElementById(\"side-panel\"); if (sp) sp.classList.remove(\"open\"); } catch (e) {}\n"
         "}\n"
@@ -2441,7 +2439,6 @@ def _generate_flowchart_html_dual(data_train, data_infer):
         '    try { if (typeof edgeByGroupId !== "undefined" && edgeByGroupId && edgeByGroupId.clear) edgeByGroupId.clear(); } catch(e){}\n'
         '    try { if (typeof edgeDomByKey !== "undefined" && edgeDomByKey && edgeDomByKey.clear) edgeDomByKey.clear(); } catch(e){}\n'
         '    try { if (typeof groupLayout !== "undefined") { Object.keys(groupLayout).forEach(k => delete groupLayout[k]); } } catch(e){}\n'
-        '    try { if (typeof nodePortMap !== "undefined") { Object.keys(nodePortMap).forEach(k => delete nodePortMap[k]); } } catch(e){}\n'
         '    try { hoveredEdgeKey = null; hoveredEdges = []; hoveredEdgeIdx = 0; hoveredNodeId = null; hoveredGroupId = null; focusedEdgePath = null; prevActiveItems = []; prevActiveNodeIds = new Set(); prevActiveEdgeKeys = new Set(); prevActiveGroupNodeIds = new Set(); prevActiveGroupIds = new Set(); prevDimEdgeKeys = new Set(); prevDimGroupNodeIds = new Set(); prevDimGroupIds = new Set(); lastHoveredGid = null; } catch(e){}\n'
         '    // Close any open side panel from the previous tab.\n'
         '    try { var sp = document.getElementById("side-panel"); if (sp) sp.classList.remove("open"); } catch(e){}\n'

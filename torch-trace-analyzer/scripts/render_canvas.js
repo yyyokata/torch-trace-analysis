@@ -13,7 +13,7 @@
  *   - snapshot shape is identical in browser and headless probe paths
  */
 /* global layoutGroup, groupMap, nodeMap, groupLayout, LAYOUT,
-   getNodeColor, formatDur, nodePortMap,
+   getNodeColor, formatDur,
    isEdgeVisible, resolveCollapsedAncestor, edgeKey, EDGE_BUNDLE_META,
    computeFlowchartLayout, computeIOGroupExpandedLayout, getIOLayoutConfig,
    showRenderProgress, hideRenderProgress, setRenderProgress, getRenderProgressElements,
@@ -219,6 +219,12 @@
             groups: [],
             edges: [],
             io_pills: [],
+            // Live io pill geometry index keyed by io node/group id.  This is the
+            // io half of the coordinate truth source: ``drawIOTasks`` populates it
+            // (top-left box form) while drawing l5 so edge routing can derive io
+            // endpoints from the same live geometry as the pill draw.  Cleared
+            // wherever ``io_pills`` is reset.
+            ioPillById: new Map(),
             // Phase 2 step 1: object pools persist across renders so toggle /
             // expand-all / focus paths can patch existing views instead of
             // running resetScene() and rebuilding every Pixi DisplayObject.
@@ -386,7 +392,6 @@
     function lookupNodeMap() { return (typeof nodeMap !== 'undefined') ? nodeMap : null; }
     function lookupGroupLayout() { return (typeof groupLayout !== 'undefined') ? groupLayout : null; }
     function lookupLayout() { return (typeof LAYOUT !== 'undefined') ? LAYOUT : null; }
-    function lookupNodePortMap() { return (typeof nodePortMap !== 'undefined') ? nodePortMap : null; }
     function nodeColorOf(n) { return (typeof getNodeColor === 'function') ? getNodeColor(n) : '#4a6fa5'; }
     function formatDurOf(us) { return (typeof formatDur === 'function') ? formatDur(us) : String(us); }
     function lookupIsEdgeVisible() { return (typeof isEdgeVisible === 'function') ? isEdgeVisible : null; }
@@ -432,14 +437,6 @@
             throw new Error('render_canvas.js: groupLayout is unavailable');
         }
         groupLayout = {};
-    }
-
-    function resetNodePortMap() {
-        const map = lookupNodePortMap();
-        if (!map) {
-            throw new Error('render_canvas.js: nodePortMap is unavailable while resetting node ports');
-        }
-        Object.keys(map).forEach(function (k) { delete map[k]; });
     }
 
     // ── pixi glyph factories ───────────────────────────────────────────────
@@ -746,51 +743,6 @@
         return engine.cullManager.isVisible(rect, engine.viewportController.currentBounds());
     }
 
-    // ── PortRenderer ───────────────────────────────────────────────────────
-    function registerNodePorts(nid, x, y, w, h) {
-        const map = lookupNodePortMap();
-        if (!map) {
-            throw new Error('render_canvas.js: nodePortMap is unavailable while registering node ports');
-        }
-        map[nid] = { cx: x + w / 2, cy: y + h / 2 };
-        map[nid + '__in'] = { cx: x + w / 2, cy: y };
-        map[nid + '__out'] = { cx: x + w / 2, cy: y + h };
-    }
-
-    // Collapsed-group port registration (ported verbatim from the legacy
-    // walkGroup/drawCollapsedGroup path).  A collapsed group redirects its
-    // boundary in/out port node_ids onto the single collapsed box so global
-    // edges aimed at hidden inner nodes land on the visible box edge.
-    function registerCollapsedGroupPorts(g, gid, ox, oy, pos) {
-        const map = lookupNodePortMap();
-        if (!map) {
-            throw new Error('render_canvas.js: nodePortMap is unavailable while registering collapsed group ports');
-        }
-        const inPoint = { cx: ox + pos.w / 2, cy: oy };
-        const outPoint = { cx: ox + pos.w / 2, cy: oy + pos.h };
-        map[gid + '__in'] = inPoint;
-        map[gid + '__out'] = outPoint;
-        map[gid + '__center'] = { cx: ox + pos.w / 2, cy: oy + pos.h / 2 };
-        for (const port of (g.in_ports || [])) { map[port.node_id] = inPoint; }
-        for (const port of (g.out_ports || [])) { map[port.node_id] = outPoint; }
-    }
-
-    // Expanded-group port registration (ported verbatim from the legacy
-    // walkGroup post-walk step).  Must run AFTER the group's child leaf ports so
-    // the group's in/out override wins over the individual leaf ports.
-    function registerExpandedGroupPorts(g, gid, ox, oy, pos) {
-        const map = lookupNodePortMap();
-        if (!map) {
-            throw new Error('render_canvas.js: nodePortMap is unavailable while registering expanded group ports');
-        }
-        const inPoint = { cx: ox + pos.w / 2, cy: oy };
-        const outPoint = { cx: ox + pos.w / 2, cy: oy + pos.h };
-        map[gid + '__in'] = inPoint;
-        map[gid + '__out'] = outPoint;
-        for (const port of (g.in_ports || [])) { map[port.node_id] = inPoint; }
-        for (const port of (g.out_ports || [])) { map[port.node_id] = outPoint; }
-    }
-
     // ── GroupView ──────────────────────────────────────────────────────────
     // Phase 2 step 3: bind click / right-click / pointerdown handlers to a
     // group hit box.  Idempotent — the second call on the same box is a no-op.
@@ -959,6 +911,87 @@
         }
     };
 
+    // ── port derivation (coordinate truth source) ──────────────────────────
+    // Edge endpoints are derived on demand from the LIVE box of whatever drew
+    // the endpoint (a pool node/group view, or an io pill).  These formulas are
+    // byte-identical to the deleted nodePortMap registration:
+    //   * out-port  = bottom-edge mid-point  (was ``id__out``)
+    //   * in-port   = top-edge mid-point     (was ``id__in``)
+    //   * center    = box centre             (was ``id__center`` / bare ``id``)
+    function outPortOf(box) { return { cx: box.x + box.w / 2, cy: box.y + box.h }; }
+    function inPortOf(box) { return { cx: box.x + box.w / 2, cy: box.y }; }
+    function centerPortOf(box) { return { cx: box.x + box.w / 2, cy: box.y + box.h / 2 }; }
+
+    // Resolve an id to its LIVE {x,y,w,h} box from the object pools (visible
+    // views only) or the io pill index.  Returns null when no live box owns the
+    // id; callers are responsible for turning that into a hard error so a
+    // missing endpoint never silently degrades.
+    function boxForId(id) {
+        const sid = String(id);
+        const nv = engine.nodePool.get(sid);
+        if (nv && nv.visible === true) { return { x: nv.x, y: nv.y, w: nv.w, h: nv.h }; }
+        const gv = engine.groupPool.get(sid);
+        if (gv && gv.visible === true) { return { x: gv.x, y: gv.y, w: gv.w, h: gv.h }; }
+        const pill = engine.ioPillById.get(sid);
+        if (pill) { return { x: pill.x, y: pill.y, w: pill.w, h: pill.h }; }
+        return null;
+    }
+
+    // Boundary-port index: a group's ``in_ports`` / ``out_ports`` declare
+    // *boundary node ids* that are never drawn as standalone nodes (they have no
+    // box of their own).  The deleted nodePortMap redirected every such id onto
+    // the owning group's in/out port; we rebuild that mapping (id -> {groupId,
+    // kind}) from DATA once per dataRef so endpoint resolution can do the same
+    // redirect against the LIVE group box.  This is the exact set the legacy
+    // ``registerCollapsedGroupPorts`` / ``registerExpandedGroupPorts`` walked.
+    function ensurePortNodeIndex() {
+        if (engine.portNodeIndex && engine.portNodeIndexData === engine.dataRef) {
+            return engine.portNodeIndex;
+        }
+        const idx = new Map();
+        const data = engine.dataRef;
+        if (data) {
+            (data.groups || []).forEach(function (g) {
+                (g.in_ports || []).forEach(function (p) {
+                    if (p && p.node_id !== null && p.node_id !== undefined) {
+                        idx.set(String(p.node_id), { groupId: String(g.id), kind: 'in' });
+                    }
+                });
+                (g.out_ports || []).forEach(function (p) {
+                    if (p && p.node_id !== null && p.node_id !== undefined) {
+                        idx.set(String(p.node_id), { groupId: String(g.id), kind: 'out' });
+                    }
+                });
+            });
+        }
+        engine.portNodeIndex = idx;
+        engine.portNodeIndexData = engine.dataRef;
+        return idx;
+    }
+
+    // Resolve a (already collapsed-ancestor-redirected) endpoint id to its draw
+    // port {cx,cy} using ``boxResolver`` for the LIVE/fresh box lookup.
+    //   * a boundary port node id  -> its owning group's in/out port (the legacy
+    //     bare ``nodePortMap[port.node_id]`` redirect; kind decides in vs out,
+    //     independent of the edge's src/dst role);
+    //   * any other id (node / group / collapsed box / io pill) -> the box's
+    //     out-port when it is the edge source, in-port when it is the dest (the
+    //     legacy ``id__out`` / ``id__in`` keys).
+    // Returns null when no live box backs the id so callers raise a hard error.
+    function portPointForEndpoint(resolvedId, role, boxResolver) {
+        const sid = String(resolvedId);
+        const portInfo = ensurePortNodeIndex().get(sid);
+        if (portInfo) {
+            const gbox = boxResolver(portInfo.groupId);
+            if (!gbox) { return null; }
+            return portInfo.kind === 'in' ? inPortOf(gbox) : outPortOf(gbox);
+        }
+        const box = boxResolver(sid);
+        if (!box) { return null; }
+        return role === 'src' ? outPortOf(box) : inPortOf(box);
+    }
+
+
     function strokePolyline(g, points, style) {
         if (!points || points.length < 2) { return; }
         g.moveTo(points[0].x, points[0].y);
@@ -1017,7 +1050,9 @@
             addLabel(this.layer, spec.sublabel, 'io-sublabel:' + spec.id,
                 spec.cx, spec.cy + 7, TEXT_STYLE.ioSub, { ax: 0.5, ay: 0.5 });
         }
-        registerNodePorts(spec.id, spec.cx - spec.w / 2, spec.cy - spec.h / 2, spec.w, spec.h);
+        engine.ioPillById.set(String(spec.id), {
+            x: spec.cx - spec.w / 2, y: spec.cy - spec.h / 2, w: spec.w, h: spec.h
+        });
         engine.io_pills.push({
             id: spec.id,
             subtype: spec.subtype,
@@ -1054,6 +1089,10 @@
                 stroke: fillColor, strokeAlpha: 0.7, strokeWidth: 1.2
             });
             this.layer.addChild(frame);
+            engine.ioPillById.set(String(ioGroup.id), {
+                x: geom.cx - availableW / 2, y: geom.cy - expanded.height / 2,
+                w: availableW, h: expanded.height
+            });
             engine.io_pills.push({
                 id: ioGroup.id,
                 subtype: ioGroup.io_subtype,
@@ -1112,7 +1151,9 @@
         this.layer.addChild(groupPill);
         addLabel(this.layer, '\u25B6 ' + ioGroup.label, 'io-group-label:' + ioGroup.id,
             geom.cx, geom.cy, TEXT_STYLE.ioTitle, { ax: 0.5, ay: 0.5 });
-        registerNodePorts(ioGroup.id, geom.cx - geom.w / 2, geom.cy - geom.h / 2, geom.w, geom.h);
+        engine.ioPillById.set(String(ioGroup.id), {
+            x: geom.cx - geom.w / 2, y: geom.cy - geom.h / 2, w: geom.w, h: geom.h
+        });
         engine.io_pills.push({
             id: ioGroup.id,
             subtype: ioGroup.io_subtype,
@@ -1190,7 +1231,7 @@
     // any field is missing (no silent default fill, no fallback).
     const NODE_SNAPSHOT_FIELDS  = ['x', 'y', 'w', 'h', 'label', 'sublabel', 'fill', 'stroke', 'alpha'];
     const GROUP_SNAPSHOT_FIELDS = ['x', 'y', 'w', 'h', 'label', 'collapsed', 'fill', 'alpha', 'hasInfo', 'hasTiming', 'timingText'];
-    const EDGE_SNAPSHOT_FIELDS  = ['points', 'stroke', 'strokeWidth', 'alpha', 'dashed', 'arrowAlpha'];
+    const EDGE_SNAPSHOT_FIELDS  = ['srcId', 'dstId', 'stroke', 'strokeWidth', 'alpha', 'dashed', 'arrowAlpha'];
 
     function requireSnapshotFields(kind, id, snapshot, fields) {
         if (!snapshot || typeof snapshot !== 'object') {
@@ -1272,6 +1313,12 @@
         requireSnapshotFields('node', view.id, snapshot, NODE_SNAPSHOT_FIELDS);
         view.root.x = snapshot.x;
         view.root.y = snapshot.y;
+        // Mirror the absolute layout box onto the view so edge routing can derive
+        // this node's live ports (out/in/center) without a global port dictionary.
+        view.x = snapshot.x;
+        view.y = snapshot.y;
+        view.w = snapshot.w;
+        view.h = snapshot.h;
         view.root.alpha = snapshot.alpha;
         view.box.clear();
         fillStrokeBox(view.box, 0, 0, snapshot.w, snapshot.h, {
@@ -1324,6 +1371,13 @@
         requireSnapshotFields('group', view.id, snapshot, GROUP_SNAPSHOT_FIELDS);
         view.root.x = snapshot.x;
         view.root.y = snapshot.y;
+        // Mirror the absolute layout box (collapsed OR expanded — snapshot.x/y/w/h
+        // is already the current-state real box) so edge routing can derive this
+        // group's live ports without a global port dictionary.
+        view.x = snapshot.x;
+        view.y = snapshot.y;
+        view.w = snapshot.w;
+        view.h = snapshot.h;
         view.root.alpha = snapshot.alpha;
         view.box.clear();
         const gc = snapshot.fill;
@@ -1424,15 +1478,34 @@
         requireSnapshotFields('edge', view.key, snapshot, EDGE_SNAPSHOT_FIELDS);
         view.root.alpha = snapshot.alpha;
         view.path.clear();
-        const style = {
-            color: snapshot.stroke,
-            width: snapshot.strokeWidth,
-            alpha: snapshot.alpha,
-            arrowAlpha: snapshot.arrowAlpha,
-            dashed: snapshot.dashed
-        };
-        strokePolyline(view.path, snapshot.points, style);
-        drawArrowHead(view.path, snapshot.points, style);
+        // Derive both endpoints from the LIVE boxes of whatever drew them.  By the
+        // time patchEdges runs, patchGroups + patchNodes (and drawIOTasks before
+        // that) have already populated the pool views / io pill index for this
+        // frame, so a missing box is a hard error — never a silent skip.  A
+        // boundary port-node endpoint is redirected onto its owning group's
+        // in/out port (see portPointForEndpoint).
+        const fromPort = portPointForEndpoint(snapshot.srcId, 'src', boxForId);
+        if (!fromPort) {
+            throw new Error('patchEdgeView: src view missing from pools/io: ' + snapshot.srcId);
+        }
+        const toPort = portPointForEndpoint(snapshot.dstId, 'dst', boxForId);
+        if (!toPort) {
+            throw new Error('patchEdgeView: dst view missing from pools/io: ' + snapshot.dstId);
+        }
+        const route = EdgeRoute.compute('direct', fromPort.cx, fromPort.cy, toPort.cx, toPort.cy, snapshot.routeMeta || null);
+        // route is null only for a degenerate span; computeVisibleScene already
+        // drops such edges, so this is defensive: clear-only, never draw garbage.
+        if (route) {
+            const style = {
+                color: snapshot.stroke,
+                width: snapshot.strokeWidth,
+                alpha: snapshot.alpha,
+                arrowAlpha: snapshot.arrowAlpha,
+                dashed: snapshot.dashed
+            };
+            strokePolyline(view.path, route.points, style);
+            drawArrowHead(view.path, route.points, style);
+        }
         view.snapshot = snapshot;
     }
 
@@ -1647,31 +1720,33 @@
     }
 
     function makeIncrEdgeSnapshot(e, edgeMeta) {
-        // edgeMeta.points is the real polyline derived from the visible
-        // endpoints' layout centres (computed against the same fresh layout as
-        // the node/group snapshots), routed through EdgeRoute and styled via
-        // EDGE_STYLE.  All draw fields are carried truthfully — no fallback.
-        if (!edgeMeta || !Array.isArray(edgeMeta.points) || edgeMeta.points.length < 2) {
+        // The edge snapshot no longer carries pre-baked geometry (points/start/
+        // end).  It persists only the resolved endpoint *ids* (``srcId`` /
+        // ``dstId``) plus the routing offset (``routeMeta``) and style fields;
+        // patchEdgeView re-derives the polyline from the LIVE endpoint boxes at
+        // patch time.  All draw fields are carried truthfully — no fallback.
+        if (edgeMeta.srcId === undefined || edgeMeta.srcId === null ||
+            edgeMeta.dstId === undefined || edgeMeta.dstId === null) {
             throw new Error('computeVisibleScene: edge ' +
                 (e && e.from !== undefined ? e.from : '?') + '->' + (e && e.to !== undefined ? e.to : '?') +
-                ' has no polyline meta from layout');
+                ' has no resolved src/dst id');
         }
         return {
-            points: edgeMeta.points,
+            srcId: edgeMeta.srcId,
+            dstId: edgeMeta.dstId,
+            routeMeta: edgeMeta.routeMeta || null,
             stroke: edgeMeta.stroke,
             strokeWidth: edgeMeta.strokeWidth,
             alpha: edgeMeta.alpha,
             dashed: edgeMeta.dashed,
             arrowAlpha: edgeMeta.arrowAlpha,
-            // Legacy edge-record fields consumed by buildSnapshot()'s snap.edges
-            // reconstruction (from/to are the *original* endpoint ids; start/end
-            // are the *redirected* port positions).
+            // Legacy edge-record fields consumed by rebuildLegacyArraysFromPool
+            // (from/to are the *original* endpoint ids; start/end are recomputed
+            // there from the live boxes addressed by srcId/dstId).
             from: e.from,
             to: e.to,
             type: edgeMeta.type,
             colorKey: edgeMeta.colorKey,
-            start: edgeMeta.start,
-            end: edgeMeta.end,
             branch: edgeMeta.branch,
             arrow: edgeMeta.arrow
         };
@@ -1756,15 +1831,14 @@
         const visibleGroupSet = new Set();
         const visibleNodeSet = new Set();
 
-        // Recursive top-down walk that mirrors the legacy ``walkGroup`` order so
-        // the ``nodePortMap`` it populates is byte-identical to the deleted draw
-        // path.  Port registration ordering matters:
-        //   * each visible leaf registers its node ports as it is visited;
-        //   * a collapsed group registers its in/out/center ports (and redirects
-        //     its boundary port node_ids onto the collapsed box) instead of
-        //     recursing into its now-hidden children;
-        //   * an expanded group registers its boundary ports AFTER its subtree so
-        //     the group-level in/out override wins over the child leaf ports.
+        // Recursive top-down walk that mirrors the legacy ``walkGroup`` order and
+        // records the visible group/node set plus their incremental snapshots.
+        // It no longer registers any ports: edge endpoints are derived on demand
+        // from the LIVE boxes (pool views + io pills) at patch time, so the walk
+        // only needs to decide which groups/nodes are visible and stamp their
+        // fresh-layout geometry into the snapshots.  A collapsed group stops the
+        // recursion (its children are hidden); an expanded group recurses into
+        // its child nodes and groups.
         function walk(gidRaw) {
             const gid = String(gidRaw);
             if (visibleGroupSet.has(gid)) { return; }
@@ -1778,7 +1852,6 @@
             groupIds.push(gid);
             groupSnapshots[gid] = makeIncrGroupSnapshot(g, collapsed, gmeta);
             if (collapsed[g.id] === true) {
-                registerCollapsedGroupPorts(g, g.id, gmeta.x, gmeta.y, { w: gmeta.w, h: gmeta.h });
                 return;
             }
             (g.children_nodes || []).forEach(function (cnid) {
@@ -1793,26 +1866,40 @@
                 visibleNodeSet.add(snid);
                 nodeIds.push(snid);
                 nodeSnapshots[snid] = makeIncrNodeSnapshot(node, nmeta);
-                registerNodePorts(node.id, nmeta.x, nmeta.y, nmeta.w, nmeta.h);
             });
             (g.children_group_ids || []).forEach(function (cgid) {
                 walk(cgid);
             });
-            registerExpandedGroupPorts(g, g.id, gmeta.x, gmeta.y, { w: gmeta.w, h: gmeta.h });
         }
         (data.root_groups || []).forEach(function (rid) {
             walk(rid);
         });
 
-        // Global edges (ported verbatim from the legacy ``drawGlobalEdges`` path):
-        // each endpoint is redirected to its outermost collapsed ancestor, the
-        // edge is dropped if both endpoints collapse onto the same box, and the
-        // start/end coordinates come from ``nodePortMap[id__out]`` /
-        // ``nodePortMap[id__in]`` (falling back to the centre port).  A redirected
-        // endpoint with no registered port is a hard error, never a silent skip.
-        const portMap = lookupNodePortMap();
-        if (!portMap) {
-            throw new Error('render_canvas.js: nodePortMap is unavailable while routing global edges');
+        // Global edges (ported from the legacy ``drawGlobalEdges`` path): each
+        // endpoint is redirected to its outermost collapsed ancestor, and the
+        // edge is dropped if both endpoints collapse onto the same box.  The
+        // endpoint *ids* (``srcId`` / ``dstId``) are persisted on the snapshot;
+        // the polyline is re-derived from the LIVE endpoint boxes in
+        // patchEdgeView (and again in rebuildLegacyArraysFromPool), so there is
+        // no ``nodePortMap`` dead-coord dictionary any more.
+        //
+        // The degenerate-span drop and the bundle routing offset still have to be
+        // decided here (they govern which edges enter the visible set).  Both are
+        // computed against the *fresh* per-id geometry: nodes/groups from the
+        // freshly-recomputed layout metas, io pills from the already-live
+        // ``engine.ioPillById`` index (drawIOTasks runs before computeVisibleScene
+        // in invokeIncrementalRender).  This fresh geometry is byte-identical to
+        // what the pool views hold after diffAndPatch, so the drop decision here
+        // and the polyline drawn in patchEdgeView never disagree.
+        function metaBoxForId(id) {
+            const sid = String(id);
+            const nm = nodeMetaById.get(sid);
+            if (nm) { return nm; }
+            const gm = groupMetaById.get(sid);
+            if (gm) { return gm; }
+            const pill = engine.ioPillById.get(sid);
+            if (pill) { return { x: pill.x, y: pill.y, w: pill.w, h: pill.h }; }
+            return null;
         }
         const isVisible = lookupIsEdgeVisible();
         const resolveAncestor = lookupResolveCollapsedAncestor();
@@ -1827,13 +1914,13 @@
             const fromId = String(resolveAncestor(e.from));
             const toId = String(resolveAncestor(e.to));
             if (fromId === toId) { return; }
-            const fromPos = portMap[fromId + '__out'] || portMap[fromId];
-            const toPos = portMap[toId + '__in'] || portMap[toId];
-            if (!fromPos || !toPos) {
+            const fromPort = portPointForEndpoint(fromId, 'src', metaBoxForId);
+            const toPort = portPointForEndpoint(toId, 'dst', metaBoxForId);
+            if (!fromPort || !toPort) {
                 throw new Error('global edge endpoint missing: ' + e.from + ' -> ' + e.to);
             }
             const routeMeta = bundleMeta ? (bundleMeta.get(edgeKeyFn(e)) || null) : null;
-            const route = EdgeRoute.compute('direct', fromPos.cx, fromPos.cy, toPos.cx, toPos.cy, routeMeta);
+            const route = EdgeRoute.compute('direct', fromPort.cx, fromPort.cy, toPort.cx, toPort.cy, routeMeta);
             // EdgeRoute.direct returns null for a degenerate span (|dy|<3 &&
             // |dx|<3); such edges are not drawable and are dropped (legacy parity).
             if (!route) { return; }
@@ -1845,7 +1932,9 @@
             const st = EDGE_STYLE[colorKey];
             edgeKeys.push(key);
             edgeSnapshots[key] = makeIncrEdgeSnapshot(e, {
-                points: route.points,
+                srcId: fromId,
+                dstId: toId,
+                routeMeta: routeMeta,
                 dashed: route.dashed,
                 stroke: st.color,
                 strokeWidth: st.width,
@@ -1853,8 +1942,6 @@
                 arrowAlpha: st.arrowAlpha,
                 type: type,
                 colorKey: colorKey,
-                start: { cx: fromPos.cx, cy: fromPos.cy },
-                end: { cx: toPos.cx, cy: toPos.cy },
                 branch: route.branch,
                 arrow: true
             });
@@ -1880,12 +1967,17 @@
         };
         const layoutMeta = computeLayoutMeta(engine.dataRef);
         applyWorldLayout(layoutMeta.layoutInfo);
-        const next = computeVisibleScene(layoutMeta);
-        diffAndPatch(prev, next);
+        // Draw the IO pills BEFORE computeVisibleScene/diffAndPatch so the
+        // ``engine.ioPillById`` index is live when edge routing (both the
+        // degenerate-span drop in computeVisibleScene and patchEdgeView's polyline
+        // derivation) resolves io-anchored endpoints from it.  io_pills /
+        // ioPillById are rebuilt from scratch each frame.
         engine.layers.l5.removeChildren();
         engine.io_pills = [];
-        resetNodePortMap();
+        engine.ioPillById.clear();
         drawIOTasks(layoutMeta.layoutInfo.ioTasks || []);
+        const next = computeVisibleScene(layoutMeta);
+        diffAndPatch(prev, next);
         performAutoFit();
         // Phase 2 step 4 invariant: this path still stays pool-first — it
         // reflows layout, refreshes canvas size, patches visible objects in
@@ -2087,7 +2179,6 @@
         await p.nextFrame();
         try {
             resetInlineLayoutCache();
-            resetNodePortMap();
             // Phase 2 step 4: the initial render is now *pool-first* — there is
             // no resetScene() / legacy walkGroup draw anymore.  The node/group/
             // edge pools live on l3/l2/l1 (their roots are added once at create
@@ -2097,6 +2188,7 @@
             // legacy bookkeeping arrays so buildSnapshot()/auto-fit start clean.
             engine.layers.l5.removeChildren();
             engine.io_pills = [];
+            engine.ioPillById.clear();
             engine.nodes = [];
             engine.groups = [];
             engine.edges = [];
@@ -2209,14 +2301,50 @@
         return counts;
     }
 
-    function clonePorts(map) {
-        const out = {};
-        if (!map) { return out; }
-        Object.keys(map).forEach(function (key) {
-            const p = map[key];
-            out[key] = { cx: p.cx, cy: p.cy };
+    // Reconstruct the legacy ``snapshot.ports`` map purely from the LIVE boxes
+    // (pool node/group views, io pills) and the boundary-port index.  This is a
+    // read-only introspection view computed on demand at snapshot time — it is
+    // NOT the deleted ``nodePortMap`` dead-coord dictionary and is never read by
+    // edge routing (edges resolve their endpoints through portPointForEndpoint).
+    // Its key layout is byte-identical to the former registration:
+    //   * node / io pill id  -> bare(center), id__in(top-mid), id__out(bottom-mid)
+    //   * group id           -> gid__in, gid__out, plus gid__center when collapsed
+    //   * boundary port node -> bare id == owning group's in/out port
+    function buildPortsFromLive() {
+        const ports = {};
+        engine.nodePool.forEach(function (view) {
+            if (view.visible !== true) { return; }
+            const id = String(view.id);
+            const box = { x: view.x, y: view.y, w: view.w, h: view.h };
+            ports[id] = centerPortOf(box);
+            ports[id + '__in'] = inPortOf(box);
+            ports[id + '__out'] = outPortOf(box);
         });
-        return out;
+        engine.groupPool.forEach(function (view) {
+            if (view.visible !== true) { return; }
+            const id = String(view.id);
+            const box = { x: view.x, y: view.y, w: view.w, h: view.h };
+            ports[id + '__in'] = inPortOf(box);
+            ports[id + '__out'] = outPortOf(box);
+            if (view.snapshot && view.snapshot.collapsed === true) {
+                ports[id + '__center'] = centerPortOf(box);
+            }
+        });
+        engine.ioPillById.forEach(function (pill, id) {
+            const sid = String(id);
+            const box = { x: pill.x, y: pill.y, w: pill.w, h: pill.h };
+            ports[sid] = centerPortOf(box);
+            ports[sid + '__in'] = inPortOf(box);
+            ports[sid + '__out'] = outPortOf(box);
+        });
+        // Boundary port nodes redirect to their (visible) owning group's in/out
+        // port — exactly the legacy bare ``nodePortMap[port.node_id]`` override.
+        ensurePortNodeIndex().forEach(function (info, portNodeId) {
+            const gbox = boxForId(info.groupId);
+            if (!gbox) { return; }
+            ports[String(portNodeId)] = info.kind === 'in' ? inPortOf(gbox) : outPortOf(gbox);
+        });
+        return ports;
     }
 
     function poolSnapshot() {
@@ -2291,10 +2419,19 @@
         engine.edgePool.forEach(function (view) {
             if (view.visible !== true || !view.snapshot) { return; }
             const s = view.snapshot;
+            // Re-derive the endpoints from the LIVE boxes addressed by srcId /
+            // dstId (pool views + io pills, with boundary port nodes redirected
+            // onto their group) — the snapshot no longer carries baked start/end
+            // coordinates.  A missing live endpoint is a hard error.
+            const fromPort = portPointForEndpoint(s.srcId, 'src', boxForId);
+            const toPort = portPointForEndpoint(s.dstId, 'dst', boxForId);
+            if (!fromPort || !toPort) {
+                throw new Error('render_canvas.js: rebuildLegacyArraysFromPool edge endpoint missing from live pools/io: ' + s.srcId + ' -> ' + s.dstId);
+            }
             edges.push({
                 from: s.from, to: s.to, type: s.type, colorKey: s.colorKey,
-                start: { cx: s.start.cx, cy: s.start.cy },
-                end: { cx: s.end.cx, cy: s.end.cy },
+                start: { cx: fromPort.cx, cy: fromPort.cy },
+                end: { cx: toPort.cx, cy: toPort.cy },
                 branch: s.branch, dashed: s.dashed, arrow: s.arrow
             });
         });
@@ -2326,7 +2463,7 @@
                     branch: e.branch, dashed: e.dashed, arrow: e.arrow
                 };
             }),
-            ports: clonePorts(lookupNodePortMap()),
+            ports: buildPortsFromLive(),
             io_pills: (engine.io_pills || []).map(function (p) {
                 return {
                     id: p.id,
