@@ -1900,8 +1900,22 @@
     // correct, complete coordinates for whatever the next visible set will be.
     function computeLayoutMeta(data) {
         const computeLayout = requireInline('computeFlowchartLayout', lookupComputeFlowchartLayout());
+        const focusStack = engine.focusStackRef;
+        const focusActive = Array.isArray(focusStack) && focusStack.length > 0;
+        const focusRootId = focusActive ? String(focusStack[focusStack.length - 1]) : null;
         resetInlineLayoutCache();
-        const layoutInfo = computeLayout(data, resolveContainerSize('computeVisibleScene').w);
+        const containerW = resolveContainerSize('computeVisibleScene').w;
+        // Step 5 — Semantic Zoom subgraph layout (problem 3): in focus mode we do
+        // NOT reuse the full-graph coordinates (which would leave the drilled-in
+        // subtree at its original far-away position and fling the one-hop boundary
+        // off-screen).  Instead we re-run the layout engine on a reduced graph
+        // rooted at the focus group alone, producing compact origin-based coords,
+        // then place the one-hop boundary cards in flanking rows (see
+        // ``augmentFocusBoundaryMeta``).
+        const layoutData = focusActive
+            ? { root_groups: [focusRootId], io_groups: [], input_node_ids: [], param_node_ids: [], const_node_ids: [], output_node_ids: [] }
+            : data;
+        const layoutInfo = computeLayout(layoutData, containerW);
         const layoutMap = lookupGroupLayout();
         if (!layoutMap) {
             throw new Error('render_canvas.js: computeVisibleScene requires groupLayout after computeFlowchartLayout');
@@ -1930,8 +1944,131 @@
         (layoutInfo.rootPositions || []).forEach(function (root) {
             walk(root.id, root.x, root.y);
         });
+        if (focusActive) {
+            augmentFocusBoundaryMeta(data, focusRootId, layoutInfo, nodeMeta, groupMeta);
+        }
         return { layoutInfo: layoutInfo, nodeMeta: nodeMeta, groupMeta: groupMeta };
     }
+
+    // ``augmentFocusBoundaryMeta`` positions the one-hop boundary cards around the
+    // freshly re-laid-out focus subtree.  ``nodeMeta`` / ``groupMeta`` already hold
+    // the compact subtree boxes (only the focus subtree was laid out).  We classify
+    // every visible cross-boundary edge into IN-neighbours (feed the subtree, placed
+    // in a row above) and OUT-neighbours (consume from the subtree, placed in a row
+    // below), give each a card-sized box, and grow ``layoutInfo.svgW/svgH`` so the
+    // world bounds (and hence the auto-fit) cover the whole local closure.
+    //
+    // IO pills (global model inputs/params/consts/outputs) are intentionally NOT
+    // re-projected into the focus layout — they belong to the model root, not the
+    // submodule's local closure — so edges to them are dropped by the existing
+    // boundary path in computeVisibleScene (addBoundary returns false, the id is not
+    // a live io pill, so the edge is skipped).
+    function augmentFocusBoundaryMeta(data, focusRootId, layoutInfo, nodeMeta, groupMeta) {
+        const groupById = new Map();
+        (data.groups || []).forEach(function (g) { groupById.set(String(g.id), g); });
+        const nodeById = new Map();
+        (data.nodes || []).forEach(function (n) { nodeById.set(String(n.id), n); });
+        const portIndex = ensurePortNodeIndex();
+        const subtreeIds = new Set();
+        groupMeta.forEach(function (_v, k) { subtreeIds.add(k); });
+        nodeMeta.forEach(function (_v, k) { subtreeIds.add(k); });
+        function insideFocus(id) {
+            const sid = String(id);
+            if (subtreeIds.has(sid)) { return true; }
+            const portInfo = portIndex.get(sid);
+            return !!(portInfo && subtreeIds.has(String(portInfo.groupId)));
+        }
+        const resolveAncestor = lookupResolveCollapsedAncestor();
+        const isVisible = lookupIsEdgeVisible();
+        if (typeof resolveAncestor !== 'function' || typeof isVisible !== 'function') {
+            throw new Error('render_canvas.js: augmentFocusBoundaryMeta requires resolveCollapsedAncestor + isEdgeVisible');
+        }
+        const inNeighbors = [];
+        const outNeighbors = [];
+        const seen = new Set();
+        function classify(rawId, isSource) {
+            const sid = String(resolveAncestor(rawId));
+            if (insideFocus(sid)) { return; }
+            // Only real, layout-able cards (groups / nodes) get a boundary box; IO
+            // pills and virtual ids fall through to the drop path downstream.
+            const isGroup = groupById.has(sid);
+            const isNode = !isGroup && nodeById.has(sid);
+            if (!isGroup && !isNode) { return; }
+            if (seen.has(sid)) { return; }
+            seen.add(sid);
+            const entry = { id: sid, isGroup: isGroup };
+            if (isSource) { inNeighbors.push(entry); } else { outNeighbors.push(entry); }
+        }
+        (data.edges || []).forEach(function (e) {
+            if (!isVisible(e)) { return; }
+            const fromId = String(resolveAncestor(e.from));
+            const toId = String(resolveAncestor(e.to));
+            if (fromId === toId) { return; }
+            const fromIn = insideFocus(fromId);
+            const toIn = insideFocus(toId);
+            if (fromIn === toIn) { return; }
+            if (!fromIn) { classify(e.from, true); }   // outside source feeds the subtree
+            if (!toIn) { classify(e.to, false); }      // outside dest consumes from the subtree
+        });
+        if (inNeighbors.length === 0 && outNeighbors.length === 0) { return; }
+
+        const GAP = 60;
+        const COL_GAP = 24;
+        function boxFor(entry) {
+            return entry.isGroup
+                ? { w: LAYOUT.nodeW + 20, h: LAYOUT.nodeH + 8 }
+                : { w: LAYOUT.nodeW, h: LAYOUT.nodeH };
+        }
+        // Subtree bounding box (pre-offset).
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        function expand(m) {
+            minX = Math.min(minX, m.x); minY = Math.min(minY, m.y);
+            maxX = Math.max(maxX, m.x + m.w); maxY = Math.max(maxY, m.y + m.h);
+        }
+        groupMeta.forEach(expand);
+        nodeMeta.forEach(expand);
+        const inH = inNeighbors.length ? Math.max.apply(null, inNeighbors.map(function (e) { return boxFor(e).h; })) : 0;
+        const topPad = inNeighbors.length ? (inH + GAP) : 0;
+        // Shift the subtree down to make room for the IN row.
+        if (topPad > 0) {
+            groupMeta.forEach(function (m) { m.y += topPad; });
+            nodeMeta.forEach(function (m) { m.y += topPad; });
+            minY += topPad; maxY += topPad;
+        }
+        const centerX = (minX + maxX) / 2;
+        function placeRow(neighbors, rowY) {
+            const boxes = neighbors.map(boxFor);
+            let total = 0;
+            boxes.forEach(function (b, i) { total += b.w + (i > 0 ? COL_GAP : 0); });
+            let x = centerX - total / 2;
+            let rowMaxBottom = rowY;
+            neighbors.forEach(function (entry, i) {
+                const b = boxes[i];
+                const meta = { x: x, y: rowY, w: b.w, h: b.h, collapsed: true };
+                if (entry.isGroup) { groupMeta.set(entry.id, meta); }
+                else { nodeMeta.set(entry.id, { x: x, y: rowY, w: b.w, h: b.h }); }
+                rowMaxBottom = Math.max(rowMaxBottom, rowY + b.h);
+                x += b.w + COL_GAP;
+            });
+            return { left: centerX - total / 2, right: centerX - total / 2 + total, bottom: rowMaxBottom };
+        }
+        let worldMinX = minX, worldMaxX = maxX, worldMaxY = maxY;
+        if (inNeighbors.length) {
+            const r = placeRow(inNeighbors, (topPad - inH) / 2);
+            worldMinX = Math.min(worldMinX, r.left); worldMaxX = Math.max(worldMaxX, r.right);
+        }
+        if (outNeighbors.length) {
+            const r = placeRow(outNeighbors, maxY + GAP);
+            worldMinX = Math.min(worldMinX, r.left); worldMaxX = Math.max(worldMaxX, r.right);
+            worldMaxY = Math.max(worldMaxY, r.bottom);
+        }
+        // Grow the reported world so applyWorldLayout / auto-fit cover the boundary
+        // rows.  computeFlowchartLayout anchors content at x>=0; if a wide boundary
+        // row would spill left of 0 we keep svgW big enough to contain it.
+        layoutInfo.svgW = Math.max(layoutInfo.svgW, worldMaxX, worldMaxX - Math.min(0, worldMinX));
+        layoutInfo.svgH = Math.max(layoutInfo.svgH, worldMaxY + 30);
+    }
+
 
     function computeVisibleScene(layoutMeta) {
         ensureEngine();
@@ -2081,6 +2218,10 @@
                 if (!gmeta) { return false; }
                 visibleGroupSet.add(sid);
                 groupIds.push(sid);
+                // Step 5 (problem 3): the boundary card is now re-laid-out adjacent
+                // to the focus subtree, so include it in the auto-fit set — the
+                // whole local closure should fit the viewport together.
+                if (engine.lastFocusSubtreeIds) { engine.lastFocusSubtreeIds.add(sid); }
                 // Boundary groups always render as collapsed cards (we do not
                 // recurse into them in focus mode), regardless of whether the
                 // user happens to have them expanded in the global state.
@@ -2095,6 +2236,7 @@
                 if (!nmeta) { return false; }
                 visibleNodeSet.add(sid);
                 nodeIds.push(sid);
+                if (engine.lastFocusSubtreeIds) { engine.lastFocusSubtreeIds.add(sid); }
                 nodeSnapshots[sid] = makeIncrNodeSnapshot(nodeRecord, nmeta);
                 return true;
             }

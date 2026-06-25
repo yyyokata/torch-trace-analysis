@@ -65,6 +65,13 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 .tb-capsule.tb-capsule-disabled { cursor: default; }
 .tb-capsule.tb-capsule-disabled::after { color: #4a5568; }
 .tb-nav-sep { color: #4a5568; margin: 0 6px; font-size: 13px; }
+/* Phase 2 step 5 — Training / runstep capsule dropdown menu (multi-tab L1/L2
+   switcher).  Absolutely positioned under the clicked capsule, above the
+   sticky topbar (z-index 200). */
+.tb-dropdown-menu { position: fixed; z-index: 300; background: #16213e; border: 1px solid rgba(255,255,255,0.12); border-radius: 6px; box-shadow: 0 6px 20px rgba(0,0,0,0.5); padding: 4px; min-width: 140px; max-height: 60vh; overflow-y: auto; }
+.tb-dropdown-item { padding: 6px 12px; margin: 2px 0; font-size: 12px; line-height: 1.4; color: #cbd5e1; background: #1e3a5f; border-radius: 4px; cursor: pointer; white-space: nowrap; }
+.tb-dropdown-item:hover { background: #2a4d7a; color: #ffffff; }
+.tb-dropdown-item.tb-dropdown-active { color: #72c0ff; font-weight: 600; }
 /* Focus-path breadcrumb segments (Semantic Zoom) — appended into
    #dag-breadcrumb-nav after the static Training / runstep capsules. */
 .focus-breadcrumb-seg { font-size: 12px; line-height: 1.4; }
@@ -2191,16 +2198,119 @@ invokeRender();
 if (typeof document !== 'undefined' && document.getElementById('dag-breadcrumb-nav')) {
     initTopbarRunstep();
     renderBreadcrumb();
+    // Wire the L1/L2 capsule dropdowns.  No-op on the single-runstep base page
+    // (ALL_TAB_DATA / DATA_TRAIN are only defined by the multi-/dual-tab wrappers,
+    // whose switch scripts call refreshTopbarCapsules() again after they load).
+    refreshTopbarCapsules();
 }
 
-// Topbar Training/Inference capsule — cosmetic label toggle only.  No trace
-// data is recomputed; the capsule simply flips its displayed scope.
-if (typeof document !== 'undefined') {
-    const __modeCapsule = document.getElementById('tb-mode-capsule');
-    if (__modeCapsule && typeof __modeCapsule.addEventListener === 'function') {
-        __modeCapsule.addEventListener('click', () => {
-            __modeCapsule.textContent = (__modeCapsule.textContent === 'Training') ? 'Inference' : 'Training';
+// ── Topbar L1/L2 capsule dropdowns (Phase 2 step 5) ─────────────────────────
+// The legacy two-row tab bar (.iter14-tabs / .multi-tabs-l1) has been removed;
+// the Training (L1) and runstep (L2) switchers now live in the unified topbar as
+// dropdown menus.  ``refreshTopbarCapsules()`` (re)labels the two capsules and
+// (re)binds their click handlers from the active dataset model.  It is wired by
+// the multi-/dual-tab switch scripts (which define ALL_TAB_DATA / DATA_TRAIN);
+// on the single-runstep base page it leaves both capsules inert.
+function _closeTopbarDropdown() {
+    if (typeof document === 'undefined') { return; }
+    const existing = document.getElementById('tb-active-dropdown');
+    if (existing && existing.parentNode && typeof existing.parentNode.removeChild === 'function') {
+        existing.parentNode.removeChild(existing);
+    }
+}
+function _openTopbarDropdown(anchorEl, items, activeIdx, onSelect) {
+    if (typeof document === 'undefined') { return; }
+    _closeTopbarDropdown();
+    const menu = document.createElement('div');
+    menu.className = 'tb-dropdown-menu';
+    menu.id = 'tb-active-dropdown';
+    for (let i = 0; i < items.length; i++) {
+        const it = document.createElement('div');
+        it.className = 'tb-dropdown-item' + (i === activeIdx ? ' tb-dropdown-active' : '');
+        it.textContent = items[i];
+        const idx = i;
+        it.addEventListener('click', (ev) => {
+            if (ev && typeof ev.stopPropagation === 'function') { ev.stopPropagation(); }
+            _closeTopbarDropdown();
+            onSelect(idx);
         });
+        menu.appendChild(it);
+    }
+    document.body.appendChild(menu);
+    // Anchor the menu just under the clicked capsule when geometry is available.
+    if (anchorEl && typeof anchorEl.getBoundingClientRect === 'function') {
+        const r = anchorEl.getBoundingClientRect();
+        menu.style.left = r.left + 'px';
+        menu.style.top = (r.bottom + 4) + 'px';
+    }
+    // One-shot outside-click dismissal (deferred so the opening click does not
+    // immediately re-close it).
+    setTimeout(() => {
+        if (typeof document.addEventListener === 'function') {
+            document.addEventListener('click', _closeTopbarDropdown, { once: true });
+        }
+    }, 0);
+}
+function _capitalizeMode(s) {
+    return (typeof s === 'string' && s.length) ? (s.charAt(0).toUpperCase() + s.slice(1)) : s;
+}
+function refreshTopbarCapsules() {
+    if (typeof document === 'undefined') { return; }
+    const modeCap = document.getElementById('tb-mode-capsule');
+    const runCap = document.getElementById('tb-runstep-capsule');
+    const hasMulti = (typeof ALL_TAB_DATA !== 'undefined') && ALL_TAB_DATA;
+    const hasDual = (typeof DATA_TRAIN !== 'undefined') && (typeof DATA_INFER !== 'undefined');
+    // L1 (Training / Inference) capsule.
+    if (modeCap) {
+        if (hasMulti) {
+            const modes = Object.keys(ALL_TAB_DATA);
+            modeCap.textContent = _capitalizeMode(ACTIVE_L1);
+            if (modes.length > 1) {
+                modeCap.classList.remove('tb-capsule-disabled');
+                modeCap.onclick = (ev) => {
+                    if (ev && typeof ev.stopPropagation === 'function') { ev.stopPropagation(); }
+                    _openTopbarDropdown(modeCap, modes.map(_capitalizeMode), modes.indexOf(ACTIVE_L1), (i) => activateL1(modes[i]));
+                };
+            } else {
+                modeCap.classList.add('tb-capsule-disabled');
+                modeCap.onclick = null;
+            }
+        } else if (hasDual) {
+            const order = ['train', 'infer'];
+            const cur = (typeof DATA !== 'undefined' && DATA === DATA_INFER) ? 'infer' : 'train';
+            modeCap.textContent = (cur === 'infer') ? 'Inference' : 'Training';
+            modeCap.classList.remove('tb-capsule-disabled');
+            modeCap.onclick = (ev) => {
+                if (ev && typeof ev.stopPropagation === 'function') { ev.stopPropagation(); }
+                _openTopbarDropdown(modeCap, ['Training', 'Inference'], order.indexOf(cur), (i) => {
+                    if (typeof window !== 'undefined' && typeof window.__iter14_activateTab === 'function') {
+                        window.__iter14_activateTab(order[i]);
+                    }
+                    refreshTopbarCapsules();
+                });
+            };
+        } else {
+            // single-runstep base page: nothing to switch.
+            modeCap.classList.add('tb-capsule-disabled');
+            modeCap.onclick = null;
+        }
+    }
+    // L2 (runstep) capsule — only meaningful in multi mode with >1 runstep.
+    if (runCap && hasMulti) {
+        const steps = ALL_TAB_DATA[ACTIVE_L1] || [];
+        const curIdx = ACTIVE_L2[ACTIVE_L1] || 0;
+        const labelOf = (e) => String((e && e.label != null) ? e.label : 'runstep');
+        runCap.textContent = steps.length ? labelOf(steps[curIdx]) : 'runstep';
+        if (steps.length > 1) {
+            runCap.classList.remove('tb-capsule-disabled');
+            runCap.onclick = (ev) => {
+                if (ev && typeof ev.stopPropagation === 'function') { ev.stopPropagation(); }
+                _openTopbarDropdown(runCap, steps.map(labelOf), curIdx, (i) => activateL2(ACTIVE_L1, i));
+            };
+        } else {
+            runCap.classList.add('tb-capsule-disabled');
+            runCap.onclick = null;
+        }
     }
 }
 
@@ -2363,7 +2473,6 @@ def _generate_flowchart_html_multi(tabs: dict[str, list[dict]]) -> str:
     base_html = _generate_flowchart_html(default_data)
 
     all_tab_data = {mode: items for mode, items in tabs.items()}
-    all_tab_labels = {mode: [str(item["label"]) for item in items] for mode, items in tabs.items()}
     active_l2 = {mode: 0 for mode in tabs.keys()}
     active_l2[default_mode] = default_idx
 
@@ -2382,69 +2491,12 @@ def _generate_flowchart_html_multi(tabs: dict[str, list[dict]]) -> str:
         context="multi-tab flowchart html",
     )
 
-    tab_styles = (
-        "<style>\n"
-        ".multi-tabs-l1 {\n"
-        "    position: sticky; top: 0; z-index: 200;\n"
-        "    display: flex; align-items: center;\n"
-        "    height: 48px; padding: 0 16px;\n"
-        "    background: #0d1117; border-bottom: 1px solid #21262d;\n"
-        "}\n"
-        ".multi-tab-l1 {\n"
-        "    height: 48px; padding: 0 20px;\n"
-        "    background: none; border: none; border-bottom: 2px solid transparent;\n"
-        "    color: #8b949e; font-size: 14px; cursor: pointer;\n"
-        "    transition: color .15s, border-color .15s;\n"
-        "}\n"
-        ".multi-tab-l1.active { color: #64b5f6; border-bottom-color: #64b5f6; background: rgba(100,181,246,.07); }\n"
-        ".multi-tab-l1:hover:not(.active) { color: #c9d1d9; }\n"
-        ".multi-tabs-l2-container {\n"
-        "    background: #0d1117; border-bottom: 1px solid #161b22;\n"
-        "    padding: 4px 0 4px 32px;\n"
-        "}\n"
-        ".multi-l1-panel { display: none; }\n"
-        ".multi-l1-panel.active { display: block; }\n"
-        ".multi-tabs-l2 { display: flex; gap: 6px; flex-wrap: wrap; }\n"
-        ".multi-tab-l2 {\n"
-        "    height: 28px; padding: 0 12px;\n"
-        "    background: #161b22; border: 1px solid #30363d; border-radius: 14px;\n"
-        "    color: #8b949e; font-size: 12px; cursor: pointer;\n"
-        "    transition: background .15s, color .15s;\n"
-        "}\n"
-        ".multi-tab-l2.active { background: #1f3a5f; border-color: #388bfd; color: #64b5f6; }\n"
-        ".multi-tab-l2:hover:not(.active) { background: #21262d; color: #c9d1d9; }\n"
-        "</style>\n"
-    )
-    if "</head>" in base_html:
-        base_html = base_html.replace("</head>", tab_styles + "</head>", 1)
-    else:
-        base_html = tab_styles + base_html
-
-    l1_buttons: list[str] = []
-    l2_panels: list[str] = []
-    for idx, (mode, labels) in enumerate(all_tab_labels.items()):
-        is_active = idx == 0
-        l1_class = "multi-tab-l1 active" if is_active else "multi-tab-l1"
-        l1_buttons.append(
-            f'<button class="{l1_class}" data-l1="{mode}" onclick="activateL1({mode!r})">{mode.title()}</button>'
-        )
-        l2_buttons: list[str] = []
-        for step_idx, label in enumerate(labels):
-            l2_class = "multi-tab-l2 active" if step_idx == 0 else "multi-tab-l2"
-            l2_buttons.append(
-                f'<button class="{l2_class}" data-l1="{mode}" onclick="activateL2({mode!r}, {step_idx})">{label}</button>'
-            )
-        panel_class = "multi-l1-panel active" if is_active else "multi-l1-panel"
-        l2_panels.append(
-            f'<div class="{panel_class}" data-l1-panel="{mode}"><div class="multi-tabs-l2">' + "".join(l2_buttons) + "</div></div>"
-        )
-    tab_html = (
-        '<div class="multi-tabs-l1">' + "".join(l1_buttons) + "</div>\n"
-        '<div class="multi-tabs-l2-container">' + "".join(l2_panels) + "</div>\n"
-    )
-    base_html, body_sub = re.subn(r"(<body[^>]*>)", r"\1\n" + tab_html, base_html, count=1)
-    if body_sub != 1:
-        raise RuntimeError("failed to inject multi-tab bar into flowchart html body")
+    # Phase 2 step 5 — the legacy two-row tab header (L1 Training/Inference tabs
+    # + L2 runstep tabs) has been removed.  L1/L2 switching is now driven by the
+    # unified topbar's Training and runstep capsule dropdowns (see the inline
+    # runtime's ``refreshTopbarCapsules`` / dropdown wiring), which reuse
+    # ``ALL_TAB_DATA`` + ``activateL1`` / ``activateL2`` below.  No tab-row HTML
+    # or CSS is injected anymore.
 
     switch_js = (
         "\n<script>\n"
@@ -2521,25 +2573,15 @@ def _generate_flowchart_html_multi(tabs: dict[str, list[dict]]) -> str:
         "}\n"
         "function activateL1(mode) {\n"
         "    ACTIVE_L1 = mode;\n"
-        "    document.querySelectorAll('.multi-tab-l1').forEach(b => {\n"
-        "        b.classList.toggle('active', b.dataset.l1 === mode);\n"
-        "    });\n"
-        "    document.querySelectorAll('.multi-l1-panel').forEach(p => {\n"
-        "        p.classList.toggle('active', p.dataset.l1Panel === mode);\n"
-        "    });\n"
-        "    document.querySelectorAll(`.multi-tab-l2[data-l1=\"${mode}\"]`).forEach((b, i) => {\n"
-        "        b.classList.toggle('active', i === ACTIVE_L2[mode]);\n"
-        "    });\n"
         "    switchDataset(ALL_TAB_DATA[ACTIVE_L1][ACTIVE_L2[ACTIVE_L1]]);\n"
+        "    if (typeof refreshTopbarCapsules === 'function') { refreshTopbarCapsules(); }\n"
         "}\n"
         "function activateL2(mode, idx) {\n"
         "    ACTIVE_L2[mode] = idx;\n"
         "    if (mode === ACTIVE_L1) {\n"
-        "        document.querySelectorAll(`.multi-tab-l2[data-l1=\"${mode}\"]`).forEach((b, i) => {\n"
-        "            b.classList.toggle('active', i === idx);\n"
-        "        });\n"
         "        switchDataset(ALL_TAB_DATA[ACTIVE_L1][ACTIVE_L2[ACTIVE_L1]]);\n"
         "    }\n"
+        "    if (typeof refreshTopbarCapsules === 'function') { refreshTopbarCapsules(); }\n"
         "}\n"
         "function switchDataset(nextTabEntry) {\n"
         "    var nextData = _resolveTabPayload(nextTabEntry);\n"
@@ -2554,6 +2596,11 @@ def _generate_flowchart_html_multi(tabs: dict[str, list[dict]]) -> str:
         "    _rebuildIndices();\n"
         "    invokeRender();\n"
         "}\n"
+        # Multi-tab mode: now that ALL_TAB_DATA / ACTIVE_L1 / ACTIVE_L2 exist,
+        # relabel the topbar Training + runstep capsules and turn them into the
+        # active dropdowns (the base inline runtime saw them as undefined at its
+        # own load time and left them inert).
+        "if (typeof refreshTopbarCapsules === 'function') { refreshTopbarCapsules(); }\n"
         "</script>\n"
     )
     if "</body>" in base_html:
@@ -2610,58 +2657,12 @@ def _generate_flowchart_html_dual(data_train, data_infer):
         print("  ⚠️ 双 Tab: 未在内嵌模板中找到 DATA 注入锚点，回退为单 Tab(train) 输出")
         return base_html
 
-    # ---- 2. inject the tab bar UI right after <body> ------------------------
-    summary = lambda d: {
-        "nodes": len(d.get("nodes", [])),
-        "groups": len(d.get("groups", [])),
-        "edges": len(d.get("edges", [])),
-    }
-    s_train = summary(data_train)
-    s_infer = summary(data_infer)
-
-    tab_styles = (
-        "<style>\n"
-        "  .iter14-tabs { display: flex; align-items: stretch; gap: 0;"
-        " padding: 0 16px; background: #14142b;"
-        " border-bottom: 1px solid rgba(255,255,255,0.08);"
-        " margin: -20px -20px 16px -20px; position: sticky; top: 0; z-index: 50; }\n"
-        "  .iter14-tab { background: transparent; border: none; color: #8892b0;"
-        " padding: 14px 22px; font-size: 14px; cursor: pointer;"
-        " position: relative; transition: all 0.2s; font-weight: 500;"
-        " letter-spacing: 0.3px; outline: none; font-family: inherit; }\n"
-        "  .iter14-tab:hover { color: #cfd6e8; background: rgba(100,181,246,0.06); }\n"
-        "  .iter14-tab.active { color: #64b5f6; background: rgba(100,181,246,0.10); }\n"
-        "  .iter14-tab.active::after { content: \"\"; position: absolute;"
-        " left: 12px; right: 12px; bottom: -1px; height: 3px;"
-        " background: #64b5f6; border-radius: 2px 2px 0 0; }\n"
-        "  .iter14-tab-stats { color: #5d6a85; font-size: 11px; margin-left: 8px;"
-        " font-weight: 400; }\n"
-        "  .iter14-tab.active .iter14-tab-stats { color: #93b9e6; }\n"
-        "  .iter14-tab-spacer { flex: 1; }\n"
-        "  .iter14-tab-info { color: #5d6a85; font-size: 11px; padding: 14px 8px; }\n"
-        "</style>\n"
-    )
-    tab_html = (
-        '<div class="iter14-tabs" role="tablist">\n'
-        '  <button class="iter14-tab active" data-iter14-tab="train" role="tab"'
-        ' aria-selected="true" type="button">训练图'
-        '<span class="iter14-tab-stats">' + str(s_train["nodes"]) + ' nodes · '
-        + str(s_train["groups"]) + ' groups · ' + str(s_train["edges"]) + ' edges</span></button>\n'
-        '  <button class="iter14-tab" data-iter14-tab="infer" role="tab"'
-        ' aria-selected="false" type="button">推理图'
-        '<span class="iter14-tab-stats">' + str(s_infer["nodes"]) + ' nodes · '
-        + str(s_infer["groups"]) + ' groups · ' + str(s_infer["edges"]) + ' edges</span></button>\n'
-        '  <div class="iter14-tab-spacer"></div>\n'
-        '  <div class="iter14-tab-info">点击 Tab 切换训练/推理 DAG</div>\n'
-        '</div>\n'
-    )
-
-    # Insert styles right before </head>; insert tab bar right after <body>.
-    if '</head>' in base_html:
-        base_html = base_html.replace('</head>', tab_styles + '</head>', 1)
-    else:
-        base_html = tab_styles + base_html
-    base_html = re.sub(r'(<body[^>]*>)', r'\1\n' + tab_html, base_html, count=1)
+    # ---- 2. legacy two-row tab bar removed -------------------------------
+    # Phase 2 step 5 — the standalone ``.iter14-tabs`` train/infer tab row that
+    # used to be injected after <body> is gone.  The unified topbar (rendered by
+    # the base single-tab template) is the only header now.  ``activateTab`` is
+    # retained below so the proven reset/rebuild/render switch pipeline stays
+    # intact, but no tab-row HTML or CSS is injected.
 
     # ---- 3. inject tab-switching JS at the very end (after final render()) --
     switch_js = (
@@ -2708,12 +2709,6 @@ def _generate_flowchart_html_dual(data_train, data_infer):
         '    (DATA.io_groups || []).forEach(g => { if (!(g.id in collapsedState)) collapsedState[g.id] = g.collapsed; });\n'
         '  }\n'
         '  function activateTab(mode){\n'
-        '    var btns = document.querySelectorAll(".iter14-tab");\n'
-        '    btns.forEach(function(b){\n'
-        '      var on = b.getAttribute("data-iter14-tab") === mode;\n'
-        '      b.classList.toggle("active", on);\n'
-        '      b.setAttribute("aria-selected", on ? "true" : "false");\n'
-        '    });\n'
         '    var nextData = (mode === "infer") ? DATA_INFER : DATA_TRAIN;\n'
         '    if (DATA === nextData) return;\n'
         '    _resetSharedState();\n'
@@ -2721,14 +2716,13 @@ def _generate_flowchart_html_dual(data_train, data_infer):
         '    _ensureDagShell();\n'
         '    _rebuildIndices();\n'
         '    if (typeof invokeRender === "function") invokeRender();\n'
+        '    if (typeof refreshTopbarCapsules === "function") refreshTopbarCapsules();\n'
         '  }\n'
-        '  document.querySelectorAll(".iter14-tab").forEach(function(b){\n'
-        '    b.addEventListener("click", function(){\n'
-        '      activateTab(b.getAttribute("data-iter14-tab"));\n'
-        '    });\n'
-        '  });\n'
         '  // Expose for debugging.\n'
         '  window.__iter14_activateTab = activateTab;\n'
+        '  // The standalone .iter14-tabs tab row was removed; the Training /\n'
+        '  // Inference switch now lives in the unified topbar mode capsule.\n'
+        '  if (typeof refreshTopbarCapsules === "function") refreshTopbarCapsules();\n'
         '})();\n'
         '</script>\n'
     )
