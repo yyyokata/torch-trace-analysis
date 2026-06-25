@@ -215,6 +215,9 @@
             hasRenderedOnce: false,
             lastKnownContainerW: null,
             lastKnownContainerH: null,
+            viewportHeight: (global.innerHeight && global.innerHeight > 0)
+                ? global.innerHeight
+                : null,
             nodes: [],
             groups: [],
             edges: [],
@@ -546,6 +549,9 @@
             cw = stageW;
         }
         let ch = getContainerHeight(engine.container);
+        if (engine.viewportHeight && engine.viewportHeight > 0 && ch !== null && ch > engine.viewportHeight) {
+            ch = engine.viewportHeight;
+        }
         if (ch === null || ch <= 0) {
             ch = numericOrNull(global.innerHeight);
         }
