@@ -1566,9 +1566,9 @@ async function render(renderOpts) {
 // Phase 2 step 4: ``invokeIncrementalRender`` is the post-toggle render entry.
 // Step 4 routes it through ``__canvasInvokeIncrementalRender`` which captures
 // the current ``engine.visible*`` sets, computes the next visible scene from
-// ``DATA + collapsedState``, and drives ``diffAndPatch`` only.  This path
-// MUST NOT touch ``resetScene()``, ``renderer.resize()`` or trigger an
-// auto-fit; those remain reserved for the initial ``invokeRender()`` path.
+// ``DATA + collapsedState``, and drives the canvas bundle's incremental
+// diff/auto-fit path.  This path MUST NOT touch ``resetScene()`` or the legacy
+// full ``invokeRender`` pipeline.
 function invokeIncrementalRender(ctx) {
     if (typeof window === 'undefined' || typeof window.__canvasInvokeIncrementalRender !== 'function') {
         throw new Error('Canvas incremental render entry __canvasInvokeIncrementalRender is missing; render_canvas.js must be loaded before the inline runtime');
@@ -1582,11 +1582,13 @@ function invokeIncrementalRender(ctx) {
 // page load and explicit user-driven re-fits.
 function expandAll() {
     DATA.groups.forEach(g => collapsedState[g.id] = false);
+    (DATA.io_groups || []).forEach(g => { collapsedState[g.id] = false; });
     invokeIncrementalRender({ reason: 'expand-all' });
 }
 
 function collapseAll() {
     DATA.groups.forEach(g => { if (g.depth >= 1) collapsedState[g.id] = true; });
+    (DATA.io_groups || []).forEach(g => { collapsedState[g.id] = true; });
     invokeIncrementalRender({ reason: 'collapse-all' });
 }
 

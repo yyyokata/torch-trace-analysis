@@ -1882,6 +1882,10 @@
         applyWorldLayout(layoutMeta.layoutInfo);
         const next = computeVisibleScene(layoutMeta);
         diffAndPatch(prev, next);
+        engine.layers.l5.removeChildren();
+        engine.io_pills = [];
+        resetNodePortMap();
+        drawIOTasks(layoutMeta.layoutInfo.ioTasks || []);
         performAutoFit();
         // Phase 2 step 4 invariant: this path still stays pool-first — it
         // reflows layout, refreshes canvas size, patches visible objects in
@@ -1895,16 +1899,6 @@
         engine.viewport.worldWidth = layoutInfo.svgW;
         engine.viewport.worldHeight = layoutInfo.svgH;
         engine.worldBounds = { x: 0, y: 0, w: layoutInfo.svgW, h: layoutInfo.svgH };
-        // The canvas/renderer must stay sized to the visible viewport (container),
-        // NOT to the full world.  The world (engine.world) is scaled + translated by
-        // the viewport so the whole DAG fits inside this fixed canvas.  Sizing the
-        // renderer to svgW x svgH blows the canvas up to the entire graph and pushes
-        // everything off-screen, which defeats the first-screen auto-fit.
-        const containerSize = resolveContainerSize('applyWorldLayout');
-        if (engine.app && engine.app.renderer && typeof engine.app.renderer.resize === 'function') {
-            engine.rendererResizeCallCount = (engine.rendererResizeCallCount || 0) + 1;
-            engine.app.renderer.resize(Math.ceil(containerSize.w), Math.ceil(containerSize.h));
-        }
         if (engine.app && engine.app.canvas) {
             engine.app.canvas.style.width = '100%';
         }
@@ -1913,7 +1907,8 @@
 
     // Stage 1.5: fit the freshly-laid-out world into the visible container.
     // Required on the first render and after Expand/Collapse-All re-layouts.
-    function performAutoFit() {
+    function performAutoFit(options) {
+        const snapToTop = (options && options.snapToTop === true);
         if (!engine.worldBounds) {
             throw new Error('render_canvas.js: auto-fit requires worldBounds');
         }
@@ -1948,57 +1943,59 @@
         // the top when its content resizes, which hides the top-of-graph
         // Input/Const nodes on first load.  Explicitly snap the stage back to the
         // top so the freshly top-aligned fit is actually what the user sees.
-        if (engine.container && typeof engine.container.scrollTop !== 'undefined') {
-            engine.container.scrollTop = 0;
-        }
-        // The top IO pills are laid out correctly (cy≈50), but page chrome above the
-        // canvas can still leave them below the initial viewport on high-DPR setups.
-        // Scroll to the document Y of the top-most IO pill (rather than merely page
-        // top) so Input/Const are visible on first paint regardless of header height.
-        if (global.window && global.document && typeof global.window.scrollTo === 'function') {
-            var _win = global.window;
-            var _doc = global.document;
-            var snapToTopInput = function () {
-                var canvas = engine.app && engine.app.canvas;
-                if (!canvas || typeof canvas.getBoundingClientRect !== 'function') {
-                    _win.scrollTo(0, 0);
-                    return;
-                }
-                var currentY = numericOrNull(_win.scrollY);
-                if (currentY === null && _doc.documentElement) {
-                    currentY = numericOrNull(_doc.documentElement.scrollTop);
-                }
-                if (currentY === null && _doc.body) {
-                    currentY = numericOrNull(_doc.body.scrollTop);
-                }
-                if (currentY === null) {
-                    currentY = 0;
-                }
-                var topPill = null;
-                (engine.io_pills || []).forEach(function (pill) {
-                    if (!pill || !Number.isFinite(pill.cy)) {
+        if (snapToTop) {
+            if (engine.container && typeof engine.container.scrollTop !== 'undefined') {
+                engine.container.scrollTop = 0;
+            }
+            // The top IO pills are laid out correctly (cy≈50), but page chrome above the
+            // canvas can still leave them below the initial viewport on high-DPR setups.
+            // Scroll to the document Y of the top-most IO pill (rather than merely page
+            // top) so Input/Const are visible on first paint regardless of header height.
+            if (global.window && global.document && typeof global.window.scrollTo === 'function') {
+                const _win = global.window;
+                const _doc = global.document;
+                const snapToTopInput = function () {
+                    const canvas = engine.app && engine.app.canvas;
+                    if (!canvas || typeof canvas.getBoundingClientRect !== 'function') {
+                        _win.scrollTo(0, 0);
                         return;
                     }
-                    if (!topPill || pill.cy < topPill.cy) {
-                        topPill = pill;
+                    let currentY = numericOrNull(_win.scrollY);
+                    if (currentY === null && _doc.documentElement) {
+                        currentY = numericOrNull(_doc.documentElement.scrollTop);
                     }
-                });
-                var rect = canvas.getBoundingClientRect();
-                var margin = 24;
-                var revealY = rect.top;
-                if (topPill && engine.viewport && Number.isFinite(engine.viewport.scale) && Number.isFinite(engine.viewport.y)) {
-                    revealY += engine.viewport.y + topPill.cy * engine.viewport.scale;
-                }
-                var targetY = Math.max(0, Math.round(currentY + revealY - margin));
-                _win.scrollTo(0, targetY);
-            };
-            snapToTopInput();
-            if (typeof _win.requestAnimationFrame === 'function') {
-                _win.requestAnimationFrame(function () {
-                    _win.requestAnimationFrame(function () {
-                        snapToTopInput();
+                    if (currentY === null && _doc.body) {
+                        currentY = numericOrNull(_doc.body.scrollTop);
+                    }
+                    if (currentY === null) {
+                        currentY = 0;
+                    }
+                    let topPill = null;
+                    (engine.io_pills || []).forEach(function (pill) {
+                        if (!pill || !Number.isFinite(pill.cy)) {
+                            return;
+                        }
+                        if (!topPill || pill.cy < topPill.cy) {
+                            topPill = pill;
+                        }
                     });
-                });
+                    const rect = canvas.getBoundingClientRect();
+                    const margin = 24;
+                    let revealY = rect.top;
+                    if (topPill && engine.viewport && Number.isFinite(engine.viewport.scale) && Number.isFinite(engine.viewport.y)) {
+                        revealY += engine.viewport.y + topPill.cy * engine.viewport.scale;
+                    }
+                    const targetY = Math.max(0, Math.round(currentY + revealY - margin));
+                    _win.scrollTo(0, targetY);
+                };
+                snapToTopInput();
+                if (typeof _win.requestAnimationFrame === 'function') {
+                    _win.requestAnimationFrame(function () {
+                        _win.requestAnimationFrame(function () {
+                            snapToTopInput();
+                        });
+                    });
+                }
             }
         }
         return vp;
@@ -2168,7 +2165,7 @@
                     engine.app.canvas.style.width = '100%';
                 }
                 await requestAnimationFramePromise(function () {
-                    return performAutoFit();
+                    return performAutoFit({ snapToTop: true });
                 });
             }
             engine.hasRenderedOnce = true;
