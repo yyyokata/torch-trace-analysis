@@ -2113,20 +2113,34 @@
                 const toInside = focusSubtreeNodeSet.has(toId) || focusSubtreeGroupSet.has(toId);
                 if (!fromInside && !toInside) { return; }
                 if (!fromInside) {
-                    // ``addBoundary`` returns true if the outside endpoint was
-                    // recognised as a node/group with valid layout meta; an IO
+                    // ``addBoundary`` returns true if the outside endpoint
+                    // resolves to a node/group with valid layout meta; an IO
                     // pill returns false but is still a legitimate anchor (its
-                    // box lives in ``engine.ioPillById``).  Neither resolves →
-                    // hard error so silent geometry drops are caught early.
+                    // box lives in ``engine.ioPillById``).  If neither path
+                    // resolves the endpoint, drop the boundary edge silently.
+                    //
+                    // Rationale: the backend occasionally emits edges to
+                    // virtual ids (e.g. ``__return_val__`` placeholders) that
+                    // are never registered in data.nodes / data.groups /
+                    // data.io_groups.member_ids.  In global mode this is
+                    // hidden by depth-based default collapsing — the
+                    // surrounding ancestor groups stay collapsed so
+                    // resolveCollapsedAncestor short-circuits before reaching
+                    // the unregistered id.  cascadeExpand in focus mode
+                    // expands the entire subtree and exposes the issue.
+                    // Throwing here would block ``enterFocus`` for valid user
+                    // gestures because of upstream data we cannot fix from
+                    // the renderer, so we mirror the existing implicit
+                    // "drop malformed edge" behaviour instead.
                     const ok = addBoundary(fromId);
                     if (!ok && !isIoPill(fromId)) {
-                        throw new Error('render_canvas.js: focus boundary endpoint not resolvable: ' + fromId);
+                        return;
                     }
                 }
                 if (!toInside) {
                     const ok = addBoundary(toId);
                     if (!ok && !isIoPill(toId)) {
-                        throw new Error('render_canvas.js: focus boundary endpoint not resolvable: ' + toId);
+                        return;
                     }
                 }
             }
