@@ -917,10 +917,8 @@
     // byte-identical to the deleted nodePortMap registration:
     //   * out-port  = bottom-edge mid-point  (was ``id__out``)
     //   * in-port   = top-edge mid-point     (was ``id__in``)
-    //   * center    = box centre             (was ``id__center`` / bare ``id``)
     function outPortOf(box) { return { cx: box.x + box.w / 2, cy: box.y + box.h }; }
     function inPortOf(box) { return { cx: box.x + box.w / 2, cy: box.y }; }
-    function centerPortOf(box) { return { cx: box.x + box.w / 2, cy: box.y + box.h / 2 }; }
 
     // Resolve an id to its LIVE {x,y,w,h} box from the object pools (visible
     // views only) or the io pill index.  Returns null when no live box owns the
@@ -2301,52 +2299,6 @@
         return counts;
     }
 
-    // Reconstruct the legacy ``snapshot.ports`` map purely from the LIVE boxes
-    // (pool node/group views, io pills) and the boundary-port index.  This is a
-    // read-only introspection view computed on demand at snapshot time — it is
-    // NOT the deleted ``nodePortMap`` dead-coord dictionary and is never read by
-    // edge routing (edges resolve their endpoints through portPointForEndpoint).
-    // Its key layout is byte-identical to the former registration:
-    //   * node / io pill id  -> bare(center), id__in(top-mid), id__out(bottom-mid)
-    //   * group id           -> gid__in, gid__out, plus gid__center when collapsed
-    //   * boundary port node -> bare id == owning group's in/out port
-    function buildPortsFromLive() {
-        const ports = {};
-        engine.nodePool.forEach(function (view) {
-            if (view.visible !== true) { return; }
-            const id = String(view.id);
-            const box = { x: view.x, y: view.y, w: view.w, h: view.h };
-            ports[id] = centerPortOf(box);
-            ports[id + '__in'] = inPortOf(box);
-            ports[id + '__out'] = outPortOf(box);
-        });
-        engine.groupPool.forEach(function (view) {
-            if (view.visible !== true) { return; }
-            const id = String(view.id);
-            const box = { x: view.x, y: view.y, w: view.w, h: view.h };
-            ports[id + '__in'] = inPortOf(box);
-            ports[id + '__out'] = outPortOf(box);
-            if (view.snapshot && view.snapshot.collapsed === true) {
-                ports[id + '__center'] = centerPortOf(box);
-            }
-        });
-        engine.ioPillById.forEach(function (pill, id) {
-            const sid = String(id);
-            const box = { x: pill.x, y: pill.y, w: pill.w, h: pill.h };
-            ports[sid] = centerPortOf(box);
-            ports[sid + '__in'] = inPortOf(box);
-            ports[sid + '__out'] = outPortOf(box);
-        });
-        // Boundary port nodes redirect to their (visible) owning group's in/out
-        // port — exactly the legacy bare ``nodePortMap[port.node_id]`` override.
-        ensurePortNodeIndex().forEach(function (info, portNodeId) {
-            const gbox = boxForId(info.groupId);
-            if (!gbox) { return; }
-            ports[String(portNodeId)] = info.kind === 'in' ? inPortOf(gbox) : outPortOf(gbox);
-        });
-        return ports;
-    }
-
     function poolSnapshot() {
         const groups = [];
         engine.groupPool.forEach(function (view) {
@@ -2463,7 +2415,6 @@
                     branch: e.branch, dashed: e.dashed, arrow: e.arrow
                 };
             }),
-            ports: buildPortsFromLive(),
             io_pills: (engine.io_pills || []).map(function (p) {
                 return {
                     id: p.id,
