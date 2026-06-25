@@ -653,6 +653,32 @@
         return bounds;
     }
 
+    // Step 5 fit (problem 2/4): bounds of the focus subtree only.  ``idSet`` is
+    // ``engine.lastFocusSubtreeIds`` — the drilled-in group/node ids EXCLUDING
+    // the one-hop boundary.  Returns null when the set is empty or none of its
+    // members are currently rendered, so the caller falls back to the full
+    // renderable bounds.  IO pills are intentionally excluded: they sit on a
+    // group's edge and the 40px fit padding already covers them.
+    function computeFocusSubtreeBounds(idSet) {
+        if (!idSet || typeof idSet.forEach !== 'function') { return null; }
+        let bounds = null;
+        idSet.forEach(function (id) {
+            const key = String(id);
+            const gv = engine.groupPool.get(key);
+            if (gv && gv.visible === true && gv.snapshot) {
+                const s = gv.snapshot;
+                bounds = expandBounds(bounds, { x: s.x, y: s.y, w: s.w, h: s.h });
+                return;
+            }
+            const nv = engine.nodePool.get(key);
+            if (nv && nv.visible === true && nv.snapshot) {
+                const s = nv.snapshot;
+                bounds = expandBounds(bounds, { x: s.x, y: s.y, w: s.w, h: s.h });
+            }
+        });
+        return bounds;
+    }
+
     function ViewportController(owner) {
         this.owner = owner;
     }
@@ -849,6 +875,12 @@
         );
         state.rightLastDown = 0;
         box.on('rightclick', function (e) {
+            // Suppress the browser context menu for the Semantic-Zoom right
+            // double-click gesture.  Pixi v8 federated events expose the
+            // underlying DOM event via ``nativeEvent``; calling
+            // ``preventDefault`` only on the federated event is not always
+            // enough to stop the OS menu, so we cancel the native event too.
+            if (e && e.nativeEvent && typeof e.nativeEvent.preventDefault === 'function') { e.nativeEvent.preventDefault(); }
             if (e && typeof e.preventDefault === 'function') { e.preventDefault(); }
         });
         box.on('pointerdown', function (e) {
@@ -2014,6 +2046,22 @@
         const focusSubtreeGroupSet = new Set(visibleGroupSet);
         const focusSubtreeNodeSet = new Set(visibleNodeSet);
 
+        // Step 5 fit (problem 2/4): remember the focus subtree (the drilled-in
+        // closure, EXCLUDING the one-hop boundary that is augmented below) so
+        // ``performAutoFit`` can zoom to the subgraph itself.  Without this the
+        // fit would use the boundary-inflated visible set and the drill-down
+        // would not visibly magnify (and a far boundary would stretch the
+        // frame).  Cleared to null on the full-graph path so exit restores the
+        // normal full-graph fit.
+        if (focusActive) {
+            const focusFitIds = new Set();
+            focusSubtreeGroupSet.forEach(function (gid) { focusFitIds.add(gid); });
+            focusSubtreeNodeSet.forEach(function (nid) { focusFitIds.add(nid); });
+            engine.lastFocusSubtreeIds = focusFitIds;
+        } else {
+            engine.lastFocusSubtreeIds = null;
+        }
+
         // Boundary helper (Step 5): add a one-hop outside endpoint to the
         // visible set so the focus frame still shows where the focus root
         // connects to the rest of the graph.  The id is whatever
@@ -2085,6 +2133,22 @@
         function isIoPill(id) {
             return engine.ioPillById.get(String(id)) ? true : false;
         }
+        // Step 5 (problem 5 — ReturnVal edge): an endpoint counts as "inside the
+        // focus subtree" when it is a focus-subtree node/group directly, OR when
+        // it is a boundary-port node id (Group in/out_port, e.g. a ReturnVal
+        // output port) whose owning group is inside the focus subtree.  The
+        // ReturnVal port id is never a member of data.nodes/groups, so the bare
+        // ``focusSubtreeNodeSet/GroupSet`` membership check misses it; without
+        // this the focus group's own return edge would be treated as fully
+        // outside and dropped (after resolveCollapsedAncestor stops redirecting
+        // it onto the collapsed parent card).  ``portPointForEndpoint`` then
+        // anchors the port to the (expanded) owning group's real out-port box.
+        function isInsideFocus(id) {
+            const sid = String(id);
+            if (focusSubtreeNodeSet.has(sid) || focusSubtreeGroupSet.has(sid)) { return true; }
+            const portInfo = ensurePortNodeIndex().get(sid);
+            return !!(portInfo && focusSubtreeGroupSet.has(portInfo.groupId));
+        }
         const isVisible = lookupIsEdgeVisible();
         const resolveAncestor = lookupResolveCollapsedAncestor();
         const edgeKeyFn = lookupEdgeKey();
@@ -2109,8 +2173,8 @@
             // Edges with neither endpoint inside the focus subtree are
             // dropped — they are not part of the local semantic closure.
             if (focusActive) {
-                const fromInside = focusSubtreeNodeSet.has(fromId) || focusSubtreeGroupSet.has(fromId);
-                const toInside = focusSubtreeNodeSet.has(toId) || focusSubtreeGroupSet.has(toId);
+                const fromInside = isInsideFocus(fromId);
+                const toInside = isInsideFocus(toId);
                 if (!fromInside && !toInside) { return; }
                 if (!fromInside) {
                     // ``addBoundary`` returns true if the outside endpoint
@@ -2239,13 +2303,34 @@
         if (!engine.worldBounds) {
             throw new Error('render_canvas.js: auto-fit requires worldBounds');
         }
-        const fitBounds = computeRenderableContentBounds();
+        // Step 5 fit (problem 2/4): when focused, zoom to the drilled-in subtree
+        // (excluding the one-hop boundary) and allow upscaling up to
+        // ``FOCUS_MAX_SCALE`` so the subgraph actually fills the viewport width
+        // — the previous code fit the boundary-inflated visible set with a 1.0
+        // cap, so the drill-down never visibly magnified.  On the full-graph
+        // path (including focus exit, where ``lastFocusSubtreeIds`` is null)
+        // use the full renderable bounds with the normal 1.0 cap so the graph
+        // is never enlarged past native size.
+        const FOCUS_MAX_SCALE = 4.0;
+        const focusActive = Array.isArray(engine.focusStackRef) && engine.focusStackRef.length > 0;
+        let fitBounds = null;
+        let fitMaxScale = 1.0;
+        if (focusActive) {
+            const subtreeBounds = computeFocusSubtreeBounds(engine.lastFocusSubtreeIds);
+            if (subtreeBounds) {
+                fitBounds = subtreeBounds;
+                fitMaxScale = FOCUS_MAX_SCALE;
+            }
+        }
+        if (!fitBounds) {
+            fitBounds = computeRenderableContentBounds();
+        }
         engine.contentBounds = fitBounds;
         const containerSize = resolveContainerSize('auto-fit');
         const cw = containerSize.w;
         const ch = containerSize.h;
         const FIT_PADDING = 40;
-        const vp = engine.viewportController.fitToView(fitBounds, cw, ch, { padding: FIT_PADDING, maxScale: 1.0 });
+        const vp = engine.viewportController.fitToView(fitBounds, cw, ch, { padding: FIT_PADDING, maxScale: fitMaxScale });
         // Width-only fit: the canvas width fills the container so there is no
         // horizontal scroll.  The height is grown to the full scaled content so a
         // graph taller than the viewport overflows into the .dag-stage's vertical

@@ -62,13 +62,14 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 .header .mode-structure { background: rgba(39, 174, 96, 0.2); color: #27ae60; border: 1px solid rgba(39, 174, 96, 0.3); }
 .header .mode-timing { background: rgba(41, 128, 185, 0.2); color: #64b5f6; border: 1px solid rgba(41, 128, 185, 0.3); }
 .controls { display: flex; gap: 10px; justify-content: center; margin-bottom: 16px; }
-/* Phase 2 step 5 — Semantic Zoom breadcrumb. */
-.focus-breadcrumb { display: flex; align-items: center; gap: 6px; padding: 8px 14px; margin: 0 16px 12px; font-size: 12px; color: #cbd5e1; background: rgba(15, 23, 42, 0.6); border: 1px solid rgba(100, 181, 246, 0.18); border-radius: 6px; overflow-x: auto; white-space: nowrap; }
-.focus-breadcrumb-seg { padding: 2px 8px; border-radius: 4px; line-height: 1.4; }
-.focus-breadcrumb-clickable { color: #64b5f6; cursor: pointer; }
-.focus-breadcrumb-clickable:hover { background: rgba(100, 181, 246, 0.18); color: #fff; }
-.focus-breadcrumb-current { color: #fff; font-weight: 600; }
-.focus-breadcrumb-sep { color: #475569; font-size: 13px; }
+/* Phase 2 step 5 — Semantic Zoom breadcrumb (floating overlay, top-left of the
+   canvas area). */
+#focus-breadcrumb { position: absolute; top: 12px; left: 12px; z-index: 100; background: rgba(255,255,255,0.92); border: 1px solid #d0d5dd; border-radius: 8px; padding: 6px 14px; font-size: 13px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; color: #344054; display: flex; align-items: center; gap: 4px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); pointer-events: auto; user-select: none; max-width: calc(100% - 24px); overflow-x: auto; white-space: nowrap; }
+.focus-breadcrumb-seg { line-height: 1.4; border-radius: 4px; }
+.focus-breadcrumb-sep { color: #98a2b3; font-size: 12px; margin: 0 2px; }
+.focus-breadcrumb-clickable { cursor: pointer; color: #1570ef; font-weight: 500; border-radius: 4px; padding: 2px 4px; transition: background 0.15s; }
+.focus-breadcrumb-clickable:hover { background: #eff4ff; }
+.focus-breadcrumb-current { color: #344054; font-weight: 600; padding: 2px 4px; }
 .controls button { background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.15); color: #ccc; padding: 6px 14px; border-radius: 6px; font-size: 12px; cursor: pointer; transition: all 0.2s; }
 .controls button:hover { background: rgba(255,255,255,0.15); color: #fff; }
 .controls button.active { background: rgba(100,181,246,0.2); border-color: #64b5f6; color: #64b5f6; }
@@ -220,12 +221,13 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 </div>
 <!-- Phase 2 step 5 — Semantic Zoom breadcrumb.  Always rendered (the
      '全图' affordance is the home button); ``renderBreadcrumb()`` populates
-     the segments + click handlers from ``focusStack``.  The element sits
-     above the canvas as an HTML overlay (NOT in Pixi) so users can click
-     individual segments to jump to that focus depth. -->
-<div id="focus-breadcrumb" class="focus-breadcrumb"></div>
+     the segments + click handlers from ``focusStack``.  The element is a
+     floating HTML overlay (NOT in Pixi) anchored to the top-left of the
+     positioned .dag-container, so users can click individual segments to
+     jump to that focus depth without overlapping the page header. -->
 <div class="legend" id="legend"></div>
 <div class="dag-container" id="dag-container">
+    <div id="focus-breadcrumb" class="focus-breadcrumb"></div>
     <div id="dag-stage" class="dag-stage"></div>
 </div>
 <div class="tooltip" id="tooltip"></div>
@@ -365,9 +367,27 @@ function isEdgeVisible(edge) {
 
 function resolveCollapsedAncestor(nodeId) {
     // nodeAncestorGroups 存储顺序：从根到近（外层 group 在前）
-    // 从前往后遍历找最外层的已折叠祖先
+    // 从前往后遍历找最外层的已折叠祖先。
+    //
+    // Phase 2 step 5 (problem 5 — ReturnVal edge): in focus mode the focus
+    // root subtree is cascade-expanded, but the focus root's *parent* chain
+    // stays collapsed.  A boundary-port node id (e.g. a Group out_port that
+    // backs a ReturnVal return edge) carries the full ancestor chain
+    // ``[root, ..., parentGroup, focusGroup]``.  Walking from index 0 would
+    // hit the collapsed ``parentGroup`` and redirect the focus group's own
+    // out-port onto the parent card.  Anchoring the scan at the current focus
+    // root makes the resolution honour the locally-expanded subtree: only the
+    // focus root and the ancestors *below* it are considered, so an out-port
+    // owned by the (expanded) focus group resolves to the port id itself and
+    // ``portPointForEndpoint`` can anchor it to the focus group's real box.
     const ancestors = nodeAncestorGroups.get(nodeId) || [];
-    for (let i = 0; i < ancestors.length; i++) {
+    let startIdx = 0;
+    if (focusStack && focusStack.length > 0) {
+        const rootId = focusStack[focusStack.length - 1];
+        const idx = ancestors.findIndex(a => String(a) === String(rootId));
+        if (idx !== -1) startIdx = idx;
+    }
+    for (let i = startIdx; i < ancestors.length; i++) {
         if (collapsedState[ancestors[i]]) return ancestors[i];
     }
     return nodeId;
@@ -2103,6 +2123,20 @@ document.addEventListener('keydown', (e) => {
         document.getElementById('side-panel').classList.remove('open');
     }
 });
+
+// Phase 2 step 5 — Semantic Zoom: the right double-click drill-down gesture
+// happens on the Pixi canvas, which lives inside #dag-stage.  Browsers fire a
+// native ``contextmenu`` on right-mouse-up; the Pixi-level ``rightclick``
+// handler cannot always cancel it, so suppress it at the DOM container level
+// too.  This is purely a UX guard (no system menu over the canvas) and never
+// touches trace data.
+(function bindCanvasContextMenuGuard() {
+    const stage = document.getElementById('dag-stage');
+    if (!stage || typeof stage.addEventListener !== 'function') { return; }
+    stage.addEventListener('contextmenu', function (e) {
+        if (e && typeof e.preventDefault === 'function') { e.preventDefault(); }
+    });
+})();
 
 document.getElementById('btn-expand-all').addEventListener('click', () => {
     expandAll();
