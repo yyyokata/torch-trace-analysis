@@ -183,8 +183,9 @@ def _build_structured_node(
 
 
 def _is_group_node(entry: dict) -> bool:
-    children = entry.get("children_nodes")
-    return entry.get("inner_dag") is not None or (children is not None and len(children) > 0)
+    # group 节点的唯一判据是 inner_dag：容器与普通可展开 module 都恒带 inner_dag。
+    # serializer 已保证容器 inner_dag 不为 None（否则 raise），故无需再看 children_nodes。
+    return entry.get("inner_dag") is not None
 
 
 def _build_group_node(
