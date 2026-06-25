@@ -766,28 +766,22 @@ focusStack: string[]
 
 ```text
 VisibleNodes  = DescLeafNodes(G) ∪ Boundary(G)
-VisibleGroups = DescGroups(G) ∪ AncestorPath(G)
-VisibleEdges  = 所有满足 from/to 均属于 VisibleNodes 或 VisibleGroups 映射端点的边
+VisibleGroups = DescGroups(G) ∪ BoundaryGroups(G)
+VisibleEdges  = 所有满足 from/to 均属于 VisibleNodes ∪ VisibleGroups 映射端点的边
 ```
 
-这里 `AncestorPath(G)` 保留的原因是：
+其中：
+- `BoundaryGroups(G)`：与 `Desc(G)` 内任一节点存在直接 edge 连接、但自身不属于 `Desc(G)` 的外部一跳 group（含父 group，若父 group 与子图有 IO 边则自然出现在此集合中）
+- **父 group 不做任何特殊处理**：父 group 若无 IO 边则隐藏；若有 IO 边则作为普通一跳边界 group 显示，与其他外部 group 行为完全一致，**不淡出、不弱化**。
+- **放弃"父链淡出"设定**：原设计的 `alpha=0.3`/`eventMode='none'` 父链逻辑全部删除。
 
-- 用户需要看到当前 focus 在整棵 group 树中的父链位置。
-- 但父链不应继续强交互、也不应抢视觉中心，因此只做“淡出保留”。
+> **NaN 2026-06-25 最终确认**：去掉父淡出。focus 视图 = 子孙子图 + 一跳边界（group/node/IO），父 group 按普通边界节点规则处理，无特殊弱化。
 
-### 6.6 父 group 淡出规则
+### 6.6 ~~父 group 淡出规则~~（已废弃）
 
-当 focus 到子 group 时，父 group 仍显示，但必须弱化：
-
-- `alpha = 0.3`（建议值）
-- `eventMode = 'none'`
-- 不响应 click / dblclick / right-dblclick
-
-目的：
-
-1. 让用户保留上下文感知。
-2. 避免焦点外父层抢交互。
-3. 让 breadcrumb 成为唯一“跨层跳转”的显式入口。
+> **NaN 2026-06-25 最终确认**：父淡出设定已放弃，本节内容废弃。
+>
+> 父 group 按普通一跳边界节点规则处理：有 IO 边则显示，无 IO 边则隐藏，不弱化、不特殊标记。
 
 ### 6.7 右键双击的事件约定
 
