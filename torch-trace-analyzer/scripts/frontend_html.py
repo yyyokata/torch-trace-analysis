@@ -62,6 +62,13 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 .header .mode-structure { background: rgba(39, 174, 96, 0.2); color: #27ae60; border: 1px solid rgba(39, 174, 96, 0.3); }
 .header .mode-timing { background: rgba(41, 128, 185, 0.2); color: #64b5f6; border: 1px solid rgba(41, 128, 185, 0.3); }
 .controls { display: flex; gap: 10px; justify-content: center; margin-bottom: 16px; }
+/* Phase 2 step 5 — Semantic Zoom breadcrumb. */
+.focus-breadcrumb { display: flex; align-items: center; gap: 6px; padding: 8px 14px; margin: 0 16px 12px; font-size: 12px; color: #cbd5e1; background: rgba(15, 23, 42, 0.6); border: 1px solid rgba(100, 181, 246, 0.18); border-radius: 6px; overflow-x: auto; white-space: nowrap; }
+.focus-breadcrumb-seg { padding: 2px 8px; border-radius: 4px; line-height: 1.4; }
+.focus-breadcrumb-clickable { color: #64b5f6; cursor: pointer; }
+.focus-breadcrumb-clickable:hover { background: rgba(100, 181, 246, 0.18); color: #fff; }
+.focus-breadcrumb-current { color: #fff; font-weight: 600; }
+.focus-breadcrumb-sep { color: #475569; font-size: 13px; }
 .controls button { background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.15); color: #ccc; padding: 6px 14px; border-radius: 6px; font-size: 12px; cursor: pointer; transition: all 0.2s; }
 .controls button:hover { background: rgba(255,255,255,0.15); color: #fff; }
 .controls button.active { background: rgba(100,181,246,0.2); border-color: #64b5f6; color: #64b5f6; }
@@ -211,6 +218,12 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
     <button id="btn-collapse-all">Collapse All</button>
     <button id="btn-fit">Fit to View</button>
 </div>
+<!-- Phase 2 step 5 — Semantic Zoom breadcrumb.  Always rendered (the
+     '全图' affordance is the home button); ``renderBreadcrumb()`` populates
+     the segments + click handlers from ``focusStack``.  The element sits
+     above the canvas as an HTML overlay (NOT in Pixi) so users can click
+     individual segments to jump to that focus depth. -->
+<div id="focus-breadcrumb" class="focus-breadcrumb"></div>
 <div class="legend" id="legend"></div>
 <div class="dag-container" id="dag-container">
     <div id="dag-stage" class="dag-stage"></div>
@@ -256,6 +269,14 @@ const collapsedState = {};
 // ``window.__canvasOnGroupToggle`` mutates this map; ``window.__canvas_collapsed_state``
 // is the read alias used by UTs to assert toggle behaviour.
 if (typeof window !== 'undefined') { window.__canvas_collapsed_state = collapsedState; }
+// Phase 2 step 5 — Semantic Zoom: ``focusStack`` is the *single source of
+// truth* for drill-down focus state (see design/frontend_canvas_phase2.md
+// §6.3).  An empty array means full graph; a non-empty array's last element
+// is the current focus root.  ``window.__canvas_focus_stack`` mirrors the
+// ``__canvas_collapsed_state`` pattern so UTs can assert focus state without
+// touching the engine.
+const focusStack = [];
+if (typeof window !== 'undefined') { window.__canvas_focus_stack = focusStack; }
 let groupLayout = {};
 let edgeDomRegistry = [];
 const edgeByNodeId = new Map();
@@ -815,7 +836,7 @@ DATA.groups.forEach(g => {
 // only present once render_canvas.js has loaded; it is invoked once here at
 // startup and never again.
 if (typeof window !== 'undefined' && typeof window.__canvasSetIncrementalContext === 'function') {
-    window.__canvasSetIncrementalContext({ data: DATA, collapsedState: collapsedState });
+    window.__canvasSetIncrementalContext({ data: DATA, collapsedState: collapsedState, focusStack: focusStack });
 }
 
 function formatDur(us) {
@@ -1614,6 +1635,147 @@ if (typeof window !== 'undefined') {
     };
 }
 
+// Phase 2 step 5 — Semantic Zoom helpers.
+//
+// ``cascadeExpandSubtree(gid)`` flips ``collapsedState[descendant] = false``
+// for ``gid`` and every group reachable through ``children_group_ids``.  This
+// is invoked the moment we enter focus so that ``computeVisibleScene`` (in
+// render_canvas.js) sees a fully-expanded subtree under the focus root and
+// emits the entire local semantic closure on the very first frame.  The
+// recursion ignores ``DATA.io_groups`` (those are sibling rows, not children
+// of any group), and silently skips unknown ids — they are emitted by the
+// upstream backend and a missing one is a backend bug, not a frontend
+// concern, so we surface it as a hard error.
+function cascadeExpandSubtree(gid) {
+    const g = groupMap[gid];
+    if (!g) {
+        throw new Error('cascadeExpandSubtree: unknown group id ' + gid);
+    }
+    collapsedState[gid] = false;
+    const queue = (g.children_group_ids || []).slice();
+    while (queue.length > 0) {
+        const cgid = queue.shift();
+        const cg = groupMap[cgid];
+        if (!cg) {
+            throw new Error('cascadeExpandSubtree: child group ' + cgid + ' missing from groupMap');
+        }
+        collapsedState[cgid] = false;
+        (cg.children_group_ids || []).forEach(nextId => queue.push(nextId));
+    }
+}
+
+// ``buildBreadcrumbLabel(gid)`` returns a short, human-readable label for the
+// breadcrumb segment associated with ``gid``.  Falls back to the raw id only
+// when neither ``label`` nor ``name`` is populated on the group record.
+function buildBreadcrumbLabel(gid) {
+    const g = groupMap[gid];
+    if (!g) {
+        throw new Error('buildBreadcrumbLabel: unknown group id ' + gid);
+    }
+    return g.label || g.name || g.id;
+}
+
+// ``renderBreadcrumb()`` rebuilds the breadcrumb DOM from ``focusStack``.  The
+// '全图' segment is always rendered (clickable when the stack is non-empty);
+// each focus level after that renders the focus root's label, separated by
+// ``›``.  All segments are real ``<span>`` elements so tests can assert layout
+// and click handling without parsing HTML.
+function renderBreadcrumb() {
+    if (typeof document === 'undefined') { return; }
+    const host = document.getElementById('focus-breadcrumb');
+    if (!host) {
+        throw new Error('renderBreadcrumb: #focus-breadcrumb element missing');
+    }
+    host.innerHTML = '';
+    const seg0 = document.createElement('span');
+    seg0.className = 'focus-breadcrumb-seg';
+    seg0.textContent = '全图';
+    seg0.dataset.depth = '0';
+    if (focusStack.length > 0) {
+        seg0.classList.add('focus-breadcrumb-clickable');
+        seg0.addEventListener('click', () => setFocusToDepth(0));
+    } else {
+        seg0.classList.add('focus-breadcrumb-current');
+    }
+    host.appendChild(seg0);
+    for (let i = 0; i < focusStack.length; i++) {
+        const sep = document.createElement('span');
+        sep.className = 'focus-breadcrumb-sep';
+        sep.textContent = '›';
+        host.appendChild(sep);
+        const seg = document.createElement('span');
+        seg.className = 'focus-breadcrumb-seg';
+        seg.textContent = buildBreadcrumbLabel(focusStack[i]);
+        seg.dataset.depth = String(i + 1);
+        if (i < focusStack.length - 1) {
+            seg.classList.add('focus-breadcrumb-clickable');
+            const targetDepth = i + 1;
+            seg.addEventListener('click', () => setFocusToDepth(targetDepth));
+        } else {
+            seg.classList.add('focus-breadcrumb-current');
+        }
+        host.appendChild(seg);
+    }
+    // Hide the breadcrumb container when we are in full-graph mode AND the
+    // page does not need the '全图' affordance.  Today we always render it so
+    // the affordance is never blank — a deliberate decision for discoverability.
+    host.style.display = '';
+}
+
+// ``enterFocus(gid)`` pushes ``gid`` onto ``focusStack``, cascade-expands the
+// focus subtree, refreshes the breadcrumb, and triggers the incremental
+// render.  Re-entering the SAME current focus root is a no-op.
+function enterFocus(gid) {
+    if (gid === undefined || gid === null) {
+        throw new Error('enterFocus: gid is required');
+    }
+    if (!groupMap[gid]) {
+        throw new Error('enterFocus: unknown group id ' + gid);
+    }
+    if (focusStack.length > 0 && String(focusStack[focusStack.length - 1]) === String(gid)) {
+        return;
+    }
+    cascadeExpandSubtree(gid);
+    focusStack.push(String(gid));
+    renderBreadcrumb();
+    invokeIncrementalRender({ reason: 'focus-enter', gid: gid });
+}
+
+// ``exitFocus()`` pops one level off ``focusStack``.  Empty stack → no-op
+// (keeps the keyboard handler trivially idempotent).  Cascade-expansion is
+// NOT reverted — the user accepts the persistent expansion (NaN explicit,
+// 2026-06-25).
+function exitFocus() {
+    if (focusStack.length === 0) { return; }
+    focusStack.pop();
+    renderBreadcrumb();
+    invokeIncrementalRender({ reason: 'focus-exit' });
+}
+
+// ``setFocusToDepth(depth)`` truncates ``focusStack`` to ``depth`` entries
+// (depth=0 → full graph).  Used by breadcrumb segment clicks.  Calling with
+// the current depth is a no-op so successive clicks on the active segment do
+// not trigger a redundant re-render.
+function setFocusToDepth(depth) {
+    if (typeof depth !== 'number' || depth < 0 || depth > focusStack.length) {
+        throw new Error('setFocusToDepth: depth out of range: ' + depth + ' (stack=' + focusStack.length + ')');
+    }
+    if (depth === focusStack.length) { return; }
+    focusStack.length = depth;
+    renderBreadcrumb();
+    invokeIncrementalRender({ reason: 'focus-jump', depth: depth });
+}
+
+if (typeof window !== 'undefined') {
+    // Engine callbacks for right-double-click on a group box.  Pure
+    // forwarders so render_canvas.js does not need to know about
+    // ``focusStack`` directly.
+    window.__canvasOnEnterFocus = function (gid) { enterFocus(gid); };
+    window.__canvasOnExitFocus = function () { exitFocus(); };
+    // Convenience hook for tests + breadcrumb integration tests.
+    window.__canvasSetFocusToDepth = function (depth) { setFocusToDepth(depth); };
+}
+
 function showGroupPanel(g) {
     const sp = document.getElementById('side-panel');
     const body = document.getElementById('sp-body');
@@ -1928,7 +2090,18 @@ document.getElementById('sp-close').addEventListener('click', () => {
     document.getElementById('side-panel').classList.remove('open');
 });
 document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') document.getElementById('side-panel').classList.remove('open');
+    if (e.key === 'Escape') {
+        // Phase 2 step 5 — Semantic Zoom: ESC pops a focus level first.
+        // Only when the focus stack is empty does ESC fall through to the
+        // legacy "close side panel" behaviour, matching the priority order
+        // in design/frontend_canvas_phase2.md §6.2 ("focus 退栈优先，再
+        // side-panel 关闭").
+        if (focusStack.length > 0) {
+            exitFocus();
+            return;
+        }
+        document.getElementById('side-panel').classList.remove('open');
+    }
 });
 
 document.getElementById('btn-expand-all').addEventListener('click', () => {
@@ -1955,6 +2128,13 @@ document.getElementById('btn-fit').addEventListener('click', () => {
 });
 
 invokeRender();
+
+// Phase 2 step 5 — render the breadcrumb's '全图' affordance once at
+// startup so it is visible even before the user enters focus.  The
+// breadcrumb DOM is the canonical surface for "are we focused?" status.
+if (typeof document !== 'undefined' && document.getElementById('focus-breadcrumb')) {
+    renderBreadcrumb();
+}
 
 // ── metric-help custom tooltip ──────────────────────────────────────────────
 (function() {

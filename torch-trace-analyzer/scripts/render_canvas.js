@@ -302,6 +302,22 @@
             }
             global.__canvasOnGroupSelect(gid);
         };
+        // Step 5: right-button double click on a group box enters Semantic
+        // Zoom (drill-down focus).  The inline runtime owns ``focusStack`` /
+        // ``collapsedState`` and exposes ``window.__canvasOnEnterFocus`` /
+        // ``window.__canvasOnExitFocus`` for the engine to call back into.
+        built.onEnterFocus = function (gid) {
+            if (typeof global.__canvasOnEnterFocus !== 'function') {
+                throw new Error('render_canvas.js: window.__canvasOnEnterFocus is not wired by inline runtime');
+            }
+            global.__canvasOnEnterFocus(gid);
+        };
+        built.onExitFocus = function () {
+            if (typeof global.__canvasOnExitFocus !== 'function') {
+                throw new Error('render_canvas.js: window.__canvasOnExitFocus is not wired by inline runtime');
+            }
+            global.__canvasOnExitFocus();
+        };
         built.viewportController = new ViewportController(built);
         built.cullManager = new CullManager();
         return built;
@@ -403,6 +419,12 @@
     function lookupResolveCollapsedAncestor() { return (typeof resolveCollapsedAncestor === 'function') ? resolveCollapsedAncestor : null; }
     function lookupEdgeKey() { return (typeof edgeKey === 'function') ? edgeKey : null; }
     function lookupCollapsedState() { return (typeof collapsedState !== 'undefined') ? collapsedState : null; }
+    // Phase 2 step 5 — Semantic Zoom: ``focusStack`` is the inline runtime's
+    // global focus stack (declared in frontend_html.py).  Lazy lookup mirrors
+    // the collapsedState pattern so headless probes that drive
+    // ``canvasRenderPhase1`` directly (without calling
+    // ``__canvasSetIncrementalContext``) still find a valid reference.
+    function lookupFocusStack() { return (typeof focusStack !== 'undefined') ? focusStack : null; }
     function lookupEdgeBundleMeta() { return (typeof EDGE_BUNDLE_META !== 'undefined') ? EDGE_BUNDLE_META : null; }
     function lookupComputeFlowchartLayout() { return (typeof computeFlowchartLayout === 'function') ? computeFlowchartLayout : null; }
     function lookupComputeIOGroupExpandedLayout() { return (typeof computeIOGroupExpandedLayout === 'function') ? computeIOGroupExpandedLayout : null; }
@@ -834,7 +856,22 @@
             const now = (typeof Date !== 'undefined' && typeof Date.now === 'function') ? Date.now() : 0;
             if (now - state.rightLastDown < rightDblIntervalMs) {
                 state.rightLastDown = 0;
-                // TODO Step5: semantic zoom
+                // Step 5: right-button double click on a group box drives the
+                // Semantic Zoom drill-down protocol.  Behaviour:
+                //   - if ``focusStackRef`` already has this gid as its current
+                //     top, treat the second right-dblclick as "exit one level"
+                //     (per design §6.2: "focus 态下再次右键双击当前层 group →
+                //     弹栈一级").
+                //   - otherwise, push a new focus level via onEnterFocus.
+                const stack = engine.focusStackRef;
+                const topId = (Array.isArray(stack) && stack.length > 0)
+                    ? String(stack[stack.length - 1])
+                    : null;
+                if (topId !== null && topId === String(gid)) {
+                    engine.onExitFocus();
+                } else {
+                    engine.onEnterFocus(gid);
+                }
             } else {
                 state.rightLastDown = now;
             }
@@ -1724,8 +1761,15 @@
         if (!ctx.collapsedState || typeof ctx.collapsedState !== 'object') {
             throw new Error('render_canvas.js: __canvasSetIncrementalContext: ctx.collapsedState is required');
         }
+        // Step 5: ``focusStack`` is the inline runtime's array of focus root ids
+        // (see design/frontend_canvas_phase2.md §6.3).  It is a HARD requirement
+        // — Step 5 has shipped and there is no global-mode-only path any more.
+        if (!Array.isArray(ctx.focusStack)) {
+            throw new Error('render_canvas.js: __canvasSetIncrementalContext: ctx.focusStack must be an array');
+        }
         engine.dataRef = ctx.data;
         engine.collapsedStateRef = ctx.collapsedState;
+        engine.focusStackRef = ctx.focusStack;
     }
 
     function requireFiniteXYWH(kind, id, meta) {
@@ -1867,10 +1911,27 @@
         if (!collapsed) {
             throw new Error('render_canvas.js: computeVisibleScene requires collapsedStateRef to be wired');
         }
+        // Step 5 — Semantic Zoom: ``focusStackRef`` is the inline runtime's
+        // focus stack.  Empty = full graph (legacy behaviour).  Non-empty =
+        // focus on top-of-stack group; only the focus subtree is walked, and
+        // edges crossing the focus boundary are augmented with the one-hop
+        // outside endpoint (a leaf node, a collapsed-ancestor group, or an IO
+        // pill) so users see the "local semantic closure" defined in
+        // design/frontend_canvas_phase2.md §6.
+        const focusStack = engine.focusStackRef;
+        if (!Array.isArray(focusStack)) {
+            throw new Error('render_canvas.js: computeVisibleScene requires focusStackRef to be wired');
+        }
+        const focusActive = focusStack.length > 0;
+        const focusRootId = focusActive ? String(focusStack[focusStack.length - 1]) : null;
         const groupById = new Map();
         (data.groups || []).forEach(function (g) { groupById.set(String(g.id), g); });
         const nodeById = new Map();
         (data.nodes || []).forEach(function (n) { nodeById.set(String(n.id), n); });
+
+        if (focusActive && !groupById.has(focusRootId)) {
+            throw new Error('render_canvas.js: computeVisibleScene focus root not found in data.groups: ' + focusRootId);
+        }
 
         // Real, current-state coordinates for every node/group the visible walk
         // can possibly reach (see computeLayoutMeta's rationale).
@@ -1927,9 +1988,73 @@
                 walk(cgid);
             });
         }
-        (data.root_groups || []).forEach(function (rid) {
-            walk(rid);
-        });
+        if (focusActive) {
+            // Focus mode: only descend from the focus root.  The inline runtime
+            // is responsible for ensuring the focus root + all its descendants
+            // are expanded BEFORE the render starts (see ``cascadeExpand`` in
+            // frontend_html.py).  If the focus root itself is still flagged as
+            // collapsed in ``collapsedState`` that is a hard wiring bug — the
+            // walk would emit just the collapsed card and produce an empty
+            // focus, which we surface as an error rather than silently render
+            // nothing.
+            if (collapsed[focusRootId] === true) {
+                throw new Error('render_canvas.js: focus root ' + focusRootId + ' is still collapsed; inline cascadeExpand failed to flip collapsedState before render');
+            }
+            walk(focusRootId);
+        } else {
+            (data.root_groups || []).forEach(function (rid) {
+                walk(rid);
+            });
+        }
+        // Snapshot the focus-subtree membership BEFORE boundary augmentation.
+        // The edge loop must classify endpoints against the original subtree
+        // (one hop = "outside the focus subtree, not yet boundary"); without
+        // this snapshot, a two-hop chain ``inside → boundary1 → boundary2``
+        // would silently promote ``boundary2`` to one-hop visible.
+        const focusSubtreeGroupSet = new Set(visibleGroupSet);
+        const focusSubtreeNodeSet = new Set(visibleNodeSet);
+
+        // Boundary helper (Step 5): add a one-hop outside endpoint to the
+        // visible set so the focus frame still shows where the focus root
+        // connects to the rest of the graph.  The id is whatever
+        // ``resolveCollapsedAncestor`` returned, so it may point at:
+        //   - a leaf node currently visible in the original full graph
+        //     (parent group is expanded outside focus)
+        //   - a collapsed group card
+        //   - neither, in which case the endpoint is an IO pill (handled in
+        //     the edge loop's metaBoxForId lookup) or a hard wiring bug.
+        // Boundary entries are *non-recursive* — we never expand inside them.
+        function addBoundary(id) {
+            const sid = String(id);
+            if (visibleGroupSet.has(sid) || visibleNodeSet.has(sid)) { return true; }
+            const groupRecord = groupById.get(sid);
+            if (groupRecord) {
+                const gmeta = groupMetaById.get(sid);
+                if (!gmeta) { return false; }
+                visibleGroupSet.add(sid);
+                groupIds.push(sid);
+                // Boundary groups always render as collapsed cards (we do not
+                // recurse into them in focus mode), regardless of whether the
+                // user happens to have them expanded in the global state.
+                const boundaryCollapsed = Object.assign({}, collapsed);
+                boundaryCollapsed[sid] = true;
+                groupSnapshots[sid] = makeIncrGroupSnapshot(groupRecord, boundaryCollapsed, gmeta);
+                return true;
+            }
+            const nodeRecord = nodeById.get(sid);
+            if (nodeRecord) {
+                const nmeta = nodeMetaById.get(sid);
+                if (!nmeta) { return false; }
+                visibleNodeSet.add(sid);
+                nodeIds.push(sid);
+                nodeSnapshots[sid] = makeIncrNodeSnapshot(nodeRecord, nmeta);
+                return true;
+            }
+            // IO pill or unresolvable id — caller falls back to ioPillById
+            // through ``metaBoxForId``; we don't add it to the node/group
+            // visible sets because IO pills live in their own L5 pool.
+            return false;
+        }
 
         // Global edges (ported from the legacy ``drawGlobalEdges`` path): each
         // endpoint is redirected to its outermost collapsed ancestor, and the
@@ -1957,6 +2082,9 @@
             if (pill) { return { x: pill.x, y: pill.y, w: pill.w, h: pill.h }; }
             return null;
         }
+        function isIoPill(id) {
+            return engine.ioPillById.get(String(id)) ? true : false;
+        }
         const isVisible = lookupIsEdgeVisible();
         const resolveAncestor = lookupResolveCollapsedAncestor();
         const edgeKeyFn = lookupEdgeKey();
@@ -1970,6 +2098,38 @@
             const fromId = String(resolveAncestor(e.from));
             const toId = String(resolveAncestor(e.to));
             if (fromId === toId) { return; }
+            // ── Step 5 focus filter ────────────────────────────────────────
+            // In focus mode the visible edge set is the union of:
+            //   - both endpoints inside the focus subtree (purely-internal),
+            //   - exactly one endpoint inside (boundary edge → augment the
+            //     outside endpoint into the visible set as a non-recursive
+            //     boundary entry; IO pills are accepted as implicit
+            //     "always-visible" anchors and do not need an entry in the
+            //     node/group visible sets).
+            // Edges with neither endpoint inside the focus subtree are
+            // dropped — they are not part of the local semantic closure.
+            if (focusActive) {
+                const fromInside = focusSubtreeNodeSet.has(fromId) || focusSubtreeGroupSet.has(fromId);
+                const toInside = focusSubtreeNodeSet.has(toId) || focusSubtreeGroupSet.has(toId);
+                if (!fromInside && !toInside) { return; }
+                if (!fromInside) {
+                    // ``addBoundary`` returns true if the outside endpoint was
+                    // recognised as a node/group with valid layout meta; an IO
+                    // pill returns false but is still a legitimate anchor (its
+                    // box lives in ``engine.ioPillById``).  Neither resolves →
+                    // hard error so silent geometry drops are caught early.
+                    const ok = addBoundary(fromId);
+                    if (!ok && !isIoPill(fromId)) {
+                        throw new Error('render_canvas.js: focus boundary endpoint not resolvable: ' + fromId);
+                    }
+                }
+                if (!toInside) {
+                    const ok = addBoundary(toId);
+                    if (!ok && !isIoPill(toId)) {
+                        throw new Error('render_canvas.js: focus boundary endpoint not resolvable: ' + toId);
+                    }
+                }
+            }
             const fromPort = portPointForEndpoint(fromId, 'src', metaBoxForId);
             const toPort = portPointForEndpoint(toId, 'dst', metaBoxForId);
             if (!fromPort || !toPort) {
@@ -2229,6 +2389,16 @@
             const liveCollapsed = lookupCollapsedState();
             if (liveCollapsed && typeof liveCollapsed === 'object') {
                 engine.collapsedStateRef = liveCollapsed;
+            }
+            // Phase 2 step 5 — same lazy fallback for the focus stack.
+            // Headless probes mutate the inline ``focusStack`` global directly
+            // (or skip the inline runtime entirely); either way we must hand
+            // computeVisibleScene a non-null Array reference.
+            const liveFocus = lookupFocusStack();
+            if (Array.isArray(liveFocus)) {
+                engine.focusStackRef = liveFocus;
+            } else if (!Array.isArray(engine.focusStackRef)) {
+                engine.focusStackRef = [];
             }
         }
         await ensureStageMounted();
