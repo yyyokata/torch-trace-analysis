@@ -616,12 +616,14 @@
             bounds = expandBounds(bounds, { x: s.x, y: s.y, w: s.w, h: s.h });
         });
         (engine.io_pills || []).forEach(function (pill) {
-            bounds = expandBounds(bounds, {
-                x: pill.cx - pill.w / 2,
-                y: pill.cy - pill.h / 2,
-                w: pill.w,
-                h: pill.h
-            });
+            const x = numericOrNull(pill.x);
+            const y = numericOrNull(pill.y);
+            const w = numericOrNull(pill.w);
+            const h = numericOrNull(pill.h);
+            if (x === null || y === null || w === null || h === null) {
+                throw new Error('render_canvas.js: io pill bounds must expose finite x/y/w/h');
+            }
+            bounds = expandBounds(bounds, { x: x, y: y, w: w, h: h });
         });
         if (!bounds) {
             throw new Error('render_canvas.js: auto-fit requires rendered content bounds');
@@ -770,27 +772,29 @@
     // the recognition handler and the body is a placeholder.  ``rightclick``
     // is intercepted purely to suppress the browser context menu (Pixi v8
     // emits ``rightclick`` synthetically on right-mouse-up).
-    function bindGroupBox(gid, box) {
-        if (!box) {
-            throw new Error('render_canvas.js: bindGroupBox missing box for group ' + gid);
+    function bindDoubleClickToggle(target, onSingleClick, onDoubleClick, clickDelayMs) {
+        if (!target) {
+            throw new Error('render_canvas.js: bindDoubleClickToggle missing target');
         }
-        if (box.__phase2EventsBound) { return; }
-        box.__phase2EventsBound = true;
-        box.eventMode = 'static';
-        const clickDelayMs = 200;
-        const rightDblIntervalMs = 250;
-        const state = { clickTimer: null, lastClickTime: 0, rightLastDown: 0 };
-        box.on('click', function (e) {
+        if (typeof onDoubleClick !== 'function') {
+            throw new Error('render_canvas.js: bindDoubleClickToggle requires onDoubleClick');
+        }
+        const delay = numericOrNull(clickDelayMs);
+        const effectiveDelay = (delay !== null && delay > 0) ? delay : 200;
+        target.eventMode = 'static';
+        target.cursor = 'pointer';
+        const state = { clickTimer: null, lastClickTime: 0 };
+        target.on('click', function (e) {
             if (e && typeof e.stopPropagation === 'function') { e.stopPropagation(); }
             const now = (typeof Date !== 'undefined' && typeof Date.now === 'function') ? Date.now() : 0;
-            const isDoubleClick = state.lastClickTime > 0 && (now - state.lastClickTime) <= clickDelayMs;
+            const isDoubleClick = state.lastClickTime > 0 && (now - state.lastClickTime) <= effectiveDelay;
             state.lastClickTime = now;
             if (isDoubleClick) {
                 if (state.clickTimer !== null) {
                     clearTimeout(state.clickTimer);
                     state.clickTimer = null;
                 }
-                engine.onGroupToggle(gid);
+                onDoubleClick();
                 return;
             }
             if (state.clickTimer !== null) {
@@ -799,9 +803,29 @@
             }
             state.clickTimer = setTimeout(function () {
                 state.clickTimer = null;
-                engine.onGroupSelect(gid);
-            }, clickDelayMs);
+                if (typeof onSingleClick === 'function') {
+                    onSingleClick();
+                }
+            }, effectiveDelay);
         });
+        return state;
+    }
+
+    function bindGroupBox(gid, box) {
+        if (!box) {
+            throw new Error('render_canvas.js: bindGroupBox missing box for group ' + gid);
+        }
+        if (box.__phase2EventsBound) { return; }
+        box.__phase2EventsBound = true;
+        const clickDelayMs = 200;
+        const rightDblIntervalMs = 250;
+        const state = bindDoubleClickToggle(
+            box,
+            function () { engine.onGroupSelect(gid); },
+            function () { engine.onGroupToggle(gid); },
+            clickDelayMs
+        );
+        state.rightLastDown = 0;
         box.on('rightclick', function (e) {
             if (e && typeof e.preventDefault === 'function') { e.preventDefault(); }
         });
@@ -840,12 +864,9 @@
         }
         if (target.__ioGroupToggleBound) { return; }
         target.__ioGroupToggleBound = true;
-        target.eventMode = 'static';
-        target.cursor = 'pointer';
-        target.on('click', function (e) {
-            if (e && typeof e.stopPropagation === 'function') { e.stopPropagation(); }
+        bindDoubleClickToggle(target, null, function () {
             toggleIOGroup(ioGroupId);
-        });
+        }, 200);
     }
 
     // ── EdgeRoute (pure geometry) ──────────────────────────────────────────
@@ -1093,6 +1114,8 @@
         engine.io_pills.push({
             id: spec.id,
             subtype: spec.subtype,
+            x: spec.cx - spec.w / 2,
+            y: spec.cy - spec.h / 2,
             cx: spec.cx,
             cy: spec.cy,
             w: spec.w,
@@ -1128,16 +1151,17 @@
             this.layer.addChild(frame);
             bindIOGroupToggle(ioGroup.id, frame);
             engine.ioPillById.set(String(ioGroup.id), {
-                x: geom.cx - availableW / 2, y: geom.cy - expanded.height / 2,
-                w: availableW, h: expanded.height
+                x: frameX, y: frameY, w: frameW, h: frameH
             });
             engine.io_pills.push({
                 id: ioGroup.id,
                 subtype: ioGroup.io_subtype,
-                cx: geom.cx,
-                cy: geom.cy,
-                w: availableW,
-                h: expanded.height,
+                x: frameX,
+                y: frameY,
+                cx: frameX + frameW / 2,
+                cy: frameY + frameH / 2,
+                w: frameW,
+                h: frameH,
                 expanded: true
             });
             for (let rowIdx = 0; rowIdx < expanded.memberRows; rowIdx++) {
@@ -1168,16 +1192,6 @@
                     left += expanded.pillW + cfg.pillGap;
                 }
             }
-            const collapseCx = geom.cx;
-            const collapseCy = frameY + frameH - 4;
-            const collapseBtn = makeGraphics('io-group-collapse:' + ioGroup.id);
-            fillStrokeBox(collapseBtn, collapseCx - 34, collapseCy - 9, 68, 18, {
-                radius: 9, fill: 0x000000, fillAlpha: 0.35, stroke: 0xffffff, strokeAlpha: 0.4, strokeWidth: 1
-            });
-            this.layer.addChild(collapseBtn);
-            bindIOGroupToggle(ioGroup.id, collapseBtn);
-            addLabel(this.layer, '\u25B2 \u6536\u8D77', 'io-group-collapse-label:' + ioGroup.id,
-                collapseCx, collapseCy, TEXT_STYLE.ioSub, { ax: 0.5, ay: 0.5 });
             return frameY + frameH;
         }
         const groupPillX = geom.cx - geom.w / 2;
@@ -1197,6 +1211,8 @@
         engine.io_pills.push({
             id: ioGroup.id,
             subtype: ioGroup.io_subtype,
+            x: geom.cx - geom.w / 2,
+            y: geom.cy - geom.h / 2,
             cx: geom.cx,
             cy: geom.cy,
             w: geom.w,
@@ -2467,6 +2483,8 @@
                 return {
                     id: p.id,
                     subtype: p.subtype,
+                    x: p.x,
+                    y: p.y,
                     cx: p.cx,
                     cy: p.cy,
                     w: p.w,
