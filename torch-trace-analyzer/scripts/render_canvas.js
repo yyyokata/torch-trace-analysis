@@ -347,51 +347,6 @@
         }
     }
 
-    function repaintStageAfterContextRestore(eng) {
-        if (!eng || !eng.app || !eng.app.stage) { return; }
-        const renderOnce = function () {
-            if (eng.app.renderer && typeof eng.app.renderer.render === 'function') {
-                eng.app.renderer.render(eng.app.stage);
-            } else if (typeof eng.app.render === 'function') {
-                eng.app.render();
-            }
-        };
-        if (global.window && typeof global.window.requestAnimationFrame === 'function') {
-            global.window.requestAnimationFrame(function () {
-                global.window.requestAnimationFrame(renderOnce);
-            });
-        } else {
-            renderOnce();
-        }
-    }
-
-    function attachContextRestoreHandlers(eng) {
-        if (!eng || eng.__contextRestoreHandlersAttached) { return; }
-        eng.__contextRestoreHandlersAttached = true;
-        const canvas = eng.app && eng.app.canvas;
-        if (canvas && typeof canvas.addEventListener === 'function') {
-            canvas.addEventListener('webglcontextlost', function (e) {
-                if (e && typeof e.preventDefault === 'function') { e.preventDefault(); }
-            });
-            canvas.addEventListener('webglcontextrestored', function () {
-                repaintStageAfterContextRestore(eng);
-            });
-        }
-        if (global.document && typeof global.document.addEventListener === 'function') {
-            global.document.addEventListener('visibilitychange', function () {
-                if (global.document.visibilityState === 'visible') {
-                    repaintStageAfterContextRestore(eng);
-                }
-            });
-        }
-        const ctx = eng.app && eng.app.renderer && eng.app.renderer.context;
-        if (ctx && typeof ctx.on === 'function') {
-            ctx.on('contextrestored', function () {
-                repaintStageAfterContextRestore(eng);
-            });
-        }
-    }
-
     // Stage 1.5: perform the async PixiJS v8 `app.init()` lazily on the first real
     // render.  Idempotent via `initPromise`; the headless mock resolves instantly.
     async function ensureStageMounted() {
@@ -416,7 +371,6 @@
                 }
                 eng.initialized = true;
                 attachInitializedCanvasToCurrentContainer(eng);
-                attachContextRestoreHandlers(eng);
                 // `init()` may (re)create app.stage; (re-)attach the world graph.
                 if (eng.app.stage && typeof eng.app.stage.addChild === 'function') {
                     eng.app.stage.addChild(eng.world);
@@ -888,15 +842,6 @@
                 engine.onGroupSelect(gid);
             }, clickDelayMs);
         });
-        box.on('dblclick', function (e) {
-            if (e && typeof e.stopPropagation === 'function') { e.stopPropagation(); }
-            if (state.clickTimer !== null) {
-                clearTimeout(state.clickTimer);
-                state.clickTimer = null;
-            }
-            state.lastClickTime = 0;
-            engine.onGroupToggle(gid);
-        });
         box.on('rightclick', function (e) {
             if (e && typeof e.preventDefault === 'function') { e.preventDefault(); }
         });
@@ -910,30 +855,6 @@
                 state.rightLastDown = now;
             }
         });
-    }
-
-    function bindToggleOnlyBox(gid, box) {
-        if (!box) {
-            throw new Error('render_canvas.js: bindToggleOnlyBox missing box for group ' + gid);
-        }
-        if (box.__phase2ToggleOnlyEventsBound) { return; }
-        box.__phase2ToggleOnlyEventsBound = true;
-        box.eventMode = 'static';
-        const clickDelayMs = 200;
-        const state = { lastClickTime: 0 };
-        const toggle = function (e) {
-            if (e && typeof e.stopPropagation === 'function') { e.stopPropagation(); }
-            state.lastClickTime = 0;
-            engine.onGroupToggle(gid);
-        };
-        box.on('click', function (e) {
-            if (e && typeof e.stopPropagation === 'function') { e.stopPropagation(); }
-            const now = (typeof Date !== 'undefined' && typeof Date.now === 'function') ? Date.now() : 0;
-            const isDoubleClick = state.lastClickTime > 0 && (now - state.lastClickTime) <= clickDelayMs;
-            state.lastClickTime = now;
-            if (isDoubleClick) { toggle(e); }
-        });
-        box.on('dblclick', toggle);
     }
 
     // ── EdgeRoute (pure geometry) ──────────────────────────────────────────
@@ -1133,7 +1054,6 @@
                 stroke: fillColor, strokeAlpha: 0.7, strokeWidth: 1.2
             });
             this.layer.addChild(frame);
-            bindToggleOnlyBox(ioGroup.id, frame);
             engine.io_pills.push({
                 id: ioGroup.id,
                 subtype: ioGroup.io_subtype,
@@ -1178,7 +1098,6 @@
                 radius: 9, fill: 0x000000, fillAlpha: 0.35, stroke: 0xffffff, strokeAlpha: 0.4, strokeWidth: 1
             });
             this.layer.addChild(collapseBtn);
-            bindToggleOnlyBox(ioGroup.id, collapseBtn);
             addLabel(this.layer, '\u25B2 \u6536\u8D77', 'io-group-collapse-label:' + ioGroup.id,
                 collapseCx, collapseCy, TEXT_STYLE.ioSub, { ax: 0.5, ay: 0.5 });
             return frameY + frameH;
@@ -1191,7 +1110,6 @@
             stroke: 0xffffff, strokeAlpha: 0.2, strokeWidth: 1
         });
         this.layer.addChild(groupPill);
-        bindToggleOnlyBox(ioGroup.id, groupPill);
         addLabel(this.layer, '\u25B6 ' + ioGroup.label, 'io-group-label:' + ioGroup.id,
             geom.cx, geom.cy, TEXT_STYLE.ioTitle, { ax: 0.5, ay: 0.5 });
         registerNodePorts(ioGroup.id, geom.cx - geom.w / 2, geom.cy - geom.h / 2, geom.w, geom.h);
@@ -1962,12 +1880,12 @@
         };
         const layoutMeta = computeLayoutMeta(engine.dataRef);
         applyWorldLayout(layoutMeta.layoutInfo);
+        const next = computeVisibleScene(layoutMeta);
+        diffAndPatch(prev, next);
         engine.layers.l5.removeChildren();
         engine.io_pills = [];
         resetNodePortMap();
         drawIOTasks(layoutMeta.layoutInfo.ioTasks || []);
-        const next = computeVisibleScene(layoutMeta);
-        diffAndPatch(prev, next);
         performAutoFit();
         // Phase 2 step 4 invariant: this path still stays pool-first — it
         // reflows layout, refreshes canvas size, patches visible objects in

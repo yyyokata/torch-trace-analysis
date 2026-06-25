@@ -1594,13 +1594,11 @@ function collapseAll() {
 
 // Phase 2 step 3: click / dblclick handlers on group hit boxes forward to
 // these inline-runtime globals (render_canvas.js' engine.onGroupToggle /
-// onGroupSelect read them at call time).  Toggle accepts either a module group
-// or an io_group id; unknown ids still throw hard instead of being ignored.
+// onGroupSelect read them at call time).  Missing groupMap[gid] is a hard
+// error — no silent fallback.
 if (typeof window !== 'undefined') {
     window.__canvasOnGroupToggle = function (gid) {
-        const isModuleGroup = !!groupMap[gid];
-        const isIOGroup = (DATA.io_groups || []).some(g => g.id === gid);
-        if (!isModuleGroup && !isIOGroup) {
+        if (!groupMap[gid]) {
             throw new Error('__canvasOnGroupToggle: unknown group id ' + gid);
         }
         collapsedState[gid] = !collapsedState[gid];
