@@ -55,24 +55,32 @@ FLOWCHART_HTML_TEMPLATE = r"""<!DOCTYPE html>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 html, body { overflow-anchor: none; }
 body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #1a1a2e; color: #e0e0e0; padding: 20px; min-height: 100vh; }
-.header { text-align: center; margin-bottom: 24px; }
-.header h1 { font-size: 22px; color: #ffffff; margin-bottom: 6px; }
-.header .meta { font-size: 12px; color: #8892b0; }
-.header .mode-badge { display: inline-block; font-size: 11px; padding: 3px 12px; border-radius: 12px; margin-top: 6px; }
-.header .mode-structure { background: rgba(39, 174, 96, 0.2); color: #27ae60; border: 1px solid rgba(39, 174, 96, 0.3); }
-.header .mode-timing { background: rgba(41, 128, 185, 0.2); color: #64b5f6; border: 1px solid rgba(41, 128, 185, 0.3); }
-.controls { display: flex; gap: 10px; justify-content: center; margin-bottom: 16px; }
-/* Phase 2 step 5 — Semantic Zoom breadcrumb (floating overlay, top-left of the
-   canvas area). */
-#focus-breadcrumb { position: absolute; top: 12px; left: 12px; z-index: 100; background: rgba(255,255,255,0.92); border: 1px solid #d0d5dd; border-radius: 8px; padding: 6px 14px; font-size: 13px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; color: #344054; display: flex; align-items: center; gap: 4px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); pointer-events: auto; user-select: none; max-width: calc(100% - 24px); overflow-x: auto; white-space: nowrap; }
-.focus-breadcrumb-seg { line-height: 1.4; border-radius: 4px; }
-.focus-breadcrumb-sep { color: #98a2b3; font-size: 12px; margin: 0 2px; }
-.focus-breadcrumb-clickable { cursor: pointer; color: #1570ef; font-weight: 500; border-radius: 4px; padding: 2px 4px; transition: background 0.15s; }
-.focus-breadcrumb-clickable:hover { background: #eff4ff; }
-.focus-breadcrumb-current { color: #344054; font-weight: 600; padding: 2px 4px; }
-.controls button { background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.15); color: #ccc; padding: 6px 14px; border-radius: 6px; font-size: 12px; cursor: pointer; transition: all 0.2s; }
-.controls button:hover { background: rgba(255,255,255,0.15); color: #fff; }
-.controls button.active { background: rgba(100,181,246,0.2); border-color: #64b5f6; color: #64b5f6; }
+/* Phase 2 step 5 — unified single-row sticky topbar (mockup4).  Replaces the
+   old centered header / controls / standalone legend + floating breadcrumb. */
+.topbar { position: sticky; top: 0; z-index: 200; height: 48px; box-sizing: border-box; margin: -20px -20px 16px -20px; padding: 0 16px; display: flex; align-items: center; justify-content: space-between; gap: 16px; background: #16213e; border-bottom: 1px solid rgba(255,255,255,0.08); box-shadow: 0 2px 8px rgba(0,0,0,0.35); }
+.topbar-left { display: flex; align-items: center; min-width: 0; overflow-x: auto; white-space: nowrap; }
+.topbar-right { display: flex; align-items: center; gap: 8px; flex-shrink: 0; white-space: nowrap; }
+.tb-capsule { background: #1e3a5f; color: #72c0ff; border-radius: 6px; padding: 4px 10px; font-size: 12px; line-height: 1.4; cursor: pointer; user-select: none; }
+.tb-capsule::after { content: '▾'; margin-left: 5px; font-size: 10px; color: #72c0ff; }
+.tb-capsule.tb-capsule-disabled { cursor: default; }
+.tb-capsule.tb-capsule-disabled::after { color: #4a5568; }
+.tb-nav-sep { color: #4a5568; margin: 0 6px; font-size: 13px; }
+/* Focus-path breadcrumb segments (Semantic Zoom) — appended into
+   #dag-breadcrumb-nav after the static Training / runstep capsules. */
+.focus-breadcrumb-seg { font-size: 12px; line-height: 1.4; }
+.focus-breadcrumb-sep { color: #4a5568; margin: 0 6px; font-size: 13px; }
+.focus-breadcrumb-clickable { color: #8892b0; cursor: pointer; }
+.focus-breadcrumb-clickable:hover { color: #cbd5e1; }
+.focus-breadcrumb-current { color: #ffffff; font-weight: 600; }
+.tb-btn { background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.15); color: #ccc; padding: 6px 12px; border-radius: 6px; font-size: 12px; cursor: pointer; transition: all 0.2s; }
+.tb-btn:hover { background: rgba(255,255,255,0.15); color: #fff; }
+.tb-btn.active { background: rgba(100,181,246,0.2); border-color: #64b5f6; color: #64b5f6; }
+.tb-divider { width: 1px; height: 24px; background: rgba(255,255,255,0.15); margin: 0 6px; }
+.tb-legend { display: flex; align-items: center; gap: 12px; }
+.tb-legend-item { display: flex; align-items: center; gap: 4px; font-size: 11px; color: #8892b0; }
+.tb-legend-dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+.tb-legend-sq { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
+.tb-legend-dep { color: #2ecc71; font-weight: bold; }
 .dag-container { width: 100%; overflow-x: hidden; position: relative; }
 .dag-stage { display: block; margin: 0 auto; width: 100%; overflow: visible; overflow-anchor: none; }
 .dag-stage canvas { display: block; width: 100%; }
@@ -80,9 +88,6 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 .tooltip.visible { opacity: 1; }
 .tooltip .tt-title { font-weight: 600; color: #64b5f6; margin-bottom: 4px; }
 .tooltip .tt-row { margin-top: 2px; }
-.legend { display: flex; gap: 16px; justify-content: center; margin-bottom: 16px; flex-wrap: wrap; }
-.legend-item { display: flex; align-items: center; gap: 5px; font-size: 11px; color: #8892b0; }
-.legend-dot { width: 10px; height: 10px; border-radius: 3px; }
 .summary { margin-top: 24px; padding: 14px 18px; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08); border-radius: 8px; }
 .summary h3 { font-size: 13px; color: #64b5f6; margin-bottom: 6px; }
 .summary p { font-size: 11px; color: #8892b0; line-height: 1.7; }
@@ -209,25 +214,30 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 </style>
 </head>
 <body>
-<div class="header">
-    <h1>🔥 Module Architecture DAG</h1>
-    <div class="meta" id="meta-info"></div>
-    <div id="mode-badge"></div>
+<!-- Phase 2 step 5 — unified single-row sticky topbar (mockup4).  Left:
+     Training / runstep capsules + dynamic Semantic-Zoom focus path
+     (#dag-breadcrumb-nav).  Right: graph controls + inline static legend. -->
+<div class="topbar">
+    <div class="topbar-left" id="dag-breadcrumb-nav">
+        <span class="tb-capsule" id="tb-mode-capsule">Training</span>
+        <span class="tb-nav-sep">›</span>
+        <span class="tb-capsule tb-capsule-disabled" id="tb-runstep-capsule">runstep</span>
+    </div>
+    <div class="topbar-right">
+        <button id="btn-expand-all" class="tb-btn">Expand All</button>
+        <button id="btn-collapse-all" class="tb-btn">Collapse All</button>
+        <button id="btn-fit" class="tb-btn">Fit to View</button>
+        <span class="tb-divider"></span>
+        <span class="tb-legend">
+            <span class="tb-legend-item"><span class="tb-legend-dot" style="background:#4a6fa5"></span>Depth0</span>
+            <span class="tb-legend-item"><span class="tb-legend-sq" style="background:#5b8c5a"></span>Depth1</span>
+            <span class="tb-legend-item"><span class="tb-legend-sq" style="background:#8e6fad"></span>Depth2</span>
+            <span class="tb-legend-item"><span class="tb-legend-sq" style="background:#c77a3c"></span>Depth3+</span>
+            <span class="tb-legend-item"><span class="tb-legend-dep">━▶</span>dep</span>
+        </span>
+    </div>
 </div>
-<div class="controls">
-    <button id="btn-expand-all">Expand All</button>
-    <button id="btn-collapse-all">Collapse All</button>
-    <button id="btn-fit">Fit to View</button>
-</div>
-<!-- Phase 2 step 5 — Semantic Zoom breadcrumb.  Always rendered (the
-     '全图' affordance is the home button); ``renderBreadcrumb()`` populates
-     the segments + click handlers from ``focusStack``.  The element is a
-     floating HTML overlay (NOT in Pixi) anchored to the top-left of the
-     positioned .dag-container, so users can click individual segments to
-     jump to that focus depth without overlapping the page header. -->
-<div class="legend" id="legend"></div>
 <div class="dag-container" id="dag-container">
-    <div id="focus-breadcrumb" class="focus-breadcrumb"></div>
     <div id="dag-stage" class="dag-stage"></div>
 </div>
 <div class="tooltip" id="tooltip"></div>
@@ -1695,34 +1705,50 @@ function buildBreadcrumbLabel(gid) {
     return g.label || g.name || g.id;
 }
 
-// ``renderBreadcrumb()`` rebuilds the breadcrumb DOM from ``focusStack``.  The
-// '全图' segment is always rendered (clickable when the stack is non-empty);
-// each focus level after that renders the focus root's label, separated by
-// ``›``.  All segments are real ``<span>`` elements so tests can assert layout
-// and click handling without parsing HTML.
+// ``initTopbarRunstep()`` labels the topbar runstep capsule from the model
+// root(s).  Single-runstep traces keep the ▾ disabled (CSS only); the label is
+// purely informational and never drives any trace processing.
+function initTopbarRunstep() {
+    if (typeof document === 'undefined') { return; }
+    const cap = document.getElementById('tb-runstep-capsule');
+    if (!cap) { return; }
+    const meta = (typeof DATA !== 'undefined' && DATA && DATA.meta) ? DATA.meta : {};
+    if (meta.roots && meta.roots.length > 0) {
+        cap.textContent = meta.roots.join(' / ');
+    }
+}
+
+// ``renderBreadcrumb()`` rebuilds the Semantic-Zoom focus path inside the
+// unified topbar nav (#dag-breadcrumb-nav).  The static Training / runstep
+// capsules are authored in HTML and never touched here — only the dynamic
+// focus-path segments (one ``›`` separator + one label per focus level) are
+// managed.  The deepest level renders as the current (white, non-clickable)
+// segment; shallower levels are clickable to jump back up via
+// ``setFocusToDepth()``.  Returning to the full graph is done via ESC or a
+// right double-click on the focus root (Semantic Zoom protocol), so there is
+// no '全图' home affordance here anymore.
+let __focusBreadcrumbEls = [];
 function renderBreadcrumb() {
     if (typeof document === 'undefined') { return; }
-    const host = document.getElementById('focus-breadcrumb');
+    const host = document.getElementById('dag-breadcrumb-nav');
     if (!host) {
-        throw new Error('renderBreadcrumb: #focus-breadcrumb element missing');
+        throw new Error('renderBreadcrumb: #dag-breadcrumb-nav element missing');
     }
-    host.innerHTML = '';
-    const seg0 = document.createElement('span');
-    seg0.className = 'focus-breadcrumb-seg';
-    seg0.textContent = '全图';
-    seg0.dataset.depth = '0';
-    if (focusStack.length > 0) {
-        seg0.classList.add('focus-breadcrumb-clickable');
-        seg0.addEventListener('click', () => setFocusToDepth(0));
-    } else {
-        seg0.classList.add('focus-breadcrumb-current');
+    // Remove the focus-path segments appended by the previous call, leaving the
+    // static Training / runstep capsules in place.
+    for (let i = 0; i < __focusBreadcrumbEls.length; i++) {
+        const el = __focusBreadcrumbEls[i];
+        if (el && el.parentNode === host && typeof host.removeChild === 'function') {
+            host.removeChild(el);
+        }
     }
-    host.appendChild(seg0);
+    __focusBreadcrumbEls = [];
     for (let i = 0; i < focusStack.length; i++) {
         const sep = document.createElement('span');
         sep.className = 'focus-breadcrumb-sep';
         sep.textContent = '›';
         host.appendChild(sep);
+        __focusBreadcrumbEls.push(sep);
         const seg = document.createElement('span');
         seg.className = 'focus-breadcrumb-seg';
         seg.textContent = buildBreadcrumbLabel(focusStack[i]);
@@ -1735,11 +1761,8 @@ function renderBreadcrumb() {
             seg.classList.add('focus-breadcrumb-current');
         }
         host.appendChild(seg);
+        __focusBreadcrumbEls.push(seg);
     }
-    // Hide the breadcrumb container when we are in full-graph mode AND the
-    // page does not need the '全图' affordance.  Today we always render it so
-    // the affordance is never blank — a deliberate decision for discoverability.
-    host.style.display = '';
 }
 
 // ``enterFocus(gid)`` pushes ``gid`` onto ``focusStack``, cascade-expands the
@@ -2163,11 +2186,22 @@ document.getElementById('btn-fit').addEventListener('click', () => {
 
 invokeRender();
 
-// Phase 2 step 5 — render the breadcrumb's '全图' affordance once at
-// startup so it is visible even before the user enters focus.  The
-// breadcrumb DOM is the canonical surface for "are we focused?" status.
-if (typeof document !== 'undefined' && document.getElementById('focus-breadcrumb')) {
+// Phase 2 step 5 — populate the topbar runstep capsule from the model meta and
+// render the (initially empty) Semantic-Zoom focus path once at startup.
+if (typeof document !== 'undefined' && document.getElementById('dag-breadcrumb-nav')) {
+    initTopbarRunstep();
     renderBreadcrumb();
+}
+
+// Topbar Training/Inference capsule — cosmetic label toggle only.  No trace
+// data is recomputed; the capsule simply flips its displayed scope.
+if (typeof document !== 'undefined') {
+    const __modeCapsule = document.getElementById('tb-mode-capsule');
+    if (__modeCapsule && typeof __modeCapsule.addEventListener === 'function') {
+        __modeCapsule.addEventListener('click', () => {
+            __modeCapsule.textContent = (__modeCapsule.textContent === 'Training') ? 'Inference' : 'Training';
+        });
+    }
 }
 
 // ── metric-help custom tooltip ──────────────────────────────────────────────

@@ -2418,27 +2418,13 @@
         if (!global.document || typeof global.document.getElementById !== 'function') {
             throw new Error('render_canvas.js: document.getElementById is unavailable while updating DOM panels');
         }
-        const meta = data.meta || {};
-        const modeBadge = global.document.getElementById('mode-badge');
-        const metaInfo = global.document.getElementById('meta-info');
-        const legendDiv = global.document.getElementById('legend');
+        // Phase 2 step 5 — the unified topbar now carries a *static* inline
+        // legend plus the breadcrumb nav; the standalone legend div, mode badge
+        // and meta line were removed from the template.  Only the bottom
+        // architecture / timing summary is still populated here.
         const summaryDiv = global.document.getElementById('summary');
-        if (!modeBadge || !metaInfo || !legendDiv || !summaryDiv) {
-            throw new Error('render_canvas.js: legend/summary DOM is incomplete');
-        }
-
-        if (data.has_timing) {
-            modeBadge.innerHTML = '<span class="mode-badge mode-timing">📊 Structure + Timing</span>';
-            metaInfo.textContent = 'Device: ' + meta.device + ' | Step: ' + meta.step_dur_str + ' | Modules: ' + meta.num_modules;
-        } else {
-            modeBadge.innerHTML = '<span class="mode-badge mode-structure">🏗️ Static Structure (source code)</span>';
-            metaInfo.textContent = 'Modules: ' + meta.num_modules + ' | Root: ' + (meta.roots ? meta.roots.join(', ') : 'N/A');
-        }
-
-        if (data.has_timing) {
-            legendDiv.innerHTML = '\n                <div class="legend-item"><div class="legend-dot" style="background:#2980b9"></div>&gt;20%</div>\n                <div class="legend-item"><div class="legend-dot" style="background:#27ae60"></div>10-20%</div>\n                <div class="legend-item"><div class="legend-dot" style="background:#8e44ad"></div>5-10%</div>\n                <div class="legend-item"><div class="legend-dot" style="background:#5a6c7d"></div>&lt;5%</div>\n                <div class="legend-item"><div class="legend-dot" style="background:#e74c3c"></div>Worker &gt;20%</div>\n                <div class="legend-item"><div class="legend-dot" style="background:#e67e22"></div>Worker 10-20%</div>';
-        } else {
-            legendDiv.innerHTML = '\n                <div class="legend-item"><div class="legend-dot" style="background:#4a6fa5"></div>Depth 0</div>\n                <div class="legend-item"><div class="legend-dot" style="background:#5b8c5a"></div>Depth 1</div>\n                <div class="legend-item"><div class="legend-dot" style="background:#8e6fad"></div>Depth 2</div>\n                <div class="legend-item"><div class="legend-dot" style="background:#c77a3c"></div>Depth 3+</div>\n                <div class="legend-item" style="margin-left: 12px;"><span style="color:#64b5f6">▶</span> Click to expand</div>\n                <div class="legend-item" style="margin-left: 12px;"><span style="color:rgba(46,204,113,0.8)">━━▶</span> Data dependency</div>\n                <div class="legend-item"><span style="color:rgba(255,255,255,0.3)">╌╌▶</span> Sequential (fallback)</div>';
+        if (!summaryDiv) {
+            throw new Error('render_canvas.js: summary DOM is missing');
         }
 
         const allNodes = data.nodes || [];
