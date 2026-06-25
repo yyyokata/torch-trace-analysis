@@ -2018,7 +2018,7 @@
         // graph taller than the viewport overflows into the .dag-stage's vertical
         // scroll (matches the legacy SVG semantics) instead of being squeezed.
         const contentHeight = Math.ceil(fitBounds.h * vp.scale + 2 * FIT_PADDING);
-        const canvasHeight = Math.max(Math.ceil(ch), contentHeight);
+        const canvasHeight = contentHeight;
         if (engine.app && engine.app.renderer && typeof engine.app.renderer.resize === 'function') {
             engine.rendererResizeCallCount = (engine.rendererResizeCallCount || 0) + 1;
             engine.app.renderer.resize(Math.ceil(cw), Math.ceil(canvasHeight));
