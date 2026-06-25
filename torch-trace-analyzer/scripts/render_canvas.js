@@ -280,7 +280,8 @@
             // The regression tests assert this advances while
             // ``rendererResizeCallCount`` stays put — proving the pool-first
             // incremental path ran instead of a full re-render.
-            incrementalRenderCount: 0
+            incrementalRenderCount: 0,
+            isIncrementalPatching: false
         };
         // Phase 2 step 3: ``engine.onGroupToggle`` / ``engine.onGroupSelect``
         // are the *engine-side* interaction hooks fired by ``bindGroupBox()``.
@@ -744,6 +745,9 @@
         if (!engine.hasRenderedOnce) {
             return true;
         }
+        if (engine.isIncrementalPatching === true) {
+            return true;
+        }
         return engine.cullManager.isVisible(rect, engine.viewportController.currentBounds());
     }
 
@@ -810,6 +814,37 @@
             } else {
                 state.rightLastDown = now;
             }
+        });
+    }
+
+    function toggleIOGroup(ioGroupId) {
+        ensureEngine();
+        if (!engine.dataRef || !Array.isArray(engine.dataRef.io_groups)) {
+            throw new Error('render_canvas.js: IO group toggle requires dataRef.io_groups');
+        }
+        const sid = String(ioGroupId);
+        const found = engine.dataRef.io_groups.some(function (g) { return g && String(g.id) === sid; });
+        if (!found) {
+            throw new Error('render_canvas.js: unknown IO group id ' + ioGroupId);
+        }
+        if (!engine.collapsedStateRef || typeof engine.collapsedStateRef !== 'object') {
+            throw new Error('render_canvas.js: IO group toggle requires collapsedStateRef');
+        }
+        engine.collapsedStateRef[ioGroupId] = !engine.collapsedStateRef[ioGroupId];
+        invokeIncrementalRender();
+    }
+
+    function bindIOGroupToggle(ioGroupId, target) {
+        if (!target) {
+            throw new Error('render_canvas.js: bindIOGroupToggle missing target for io group ' + ioGroupId);
+        }
+        if (target.__ioGroupToggleBound) { return; }
+        target.__ioGroupToggleBound = true;
+        target.eventMode = 'static';
+        target.cursor = 'pointer';
+        target.on('click', function (e) {
+            if (e && typeof e.stopPropagation === 'function') { e.stopPropagation(); }
+            toggleIOGroup(ioGroupId);
         });
     }
 
@@ -1091,6 +1126,7 @@
                 stroke: fillColor, strokeAlpha: 0.7, strokeWidth: 1.2
             });
             this.layer.addChild(frame);
+            bindIOGroupToggle(ioGroup.id, frame);
             engine.ioPillById.set(String(ioGroup.id), {
                 x: geom.cx - availableW / 2, y: geom.cy - expanded.height / 2,
                 w: availableW, h: expanded.height
@@ -1139,6 +1175,7 @@
                 radius: 9, fill: 0x000000, fillAlpha: 0.35, stroke: 0xffffff, strokeAlpha: 0.4, strokeWidth: 1
             });
             this.layer.addChild(collapseBtn);
+            bindIOGroupToggle(ioGroup.id, collapseBtn);
             addLabel(this.layer, '\u25B2 \u6536\u8D77', 'io-group-collapse-label:' + ioGroup.id,
                 collapseCx, collapseCy, TEXT_STYLE.ioSub, { ax: 0.5, ay: 0.5 });
             return frameY + frameH;
@@ -1151,6 +1188,7 @@
             stroke: 0xffffff, strokeAlpha: 0.2, strokeWidth: 1
         });
         this.layer.addChild(groupPill);
+        bindIOGroupToggle(ioGroup.id, groupPill);
         addLabel(this.layer, '\u25B6 ' + ioGroup.label, 'io-group-label:' + ioGroup.id,
             geom.cx, geom.cy, TEXT_STYLE.ioTitle, { ax: 0.5, ay: 0.5 });
         engine.ioPillById.set(String(ioGroup.id), {
@@ -1979,7 +2017,12 @@
         engine.ioPillById.clear();
         drawIOTasks(layoutMeta.layoutInfo.ioTasks || []);
         const next = computeVisibleScene(layoutMeta);
-        diffAndPatch(prev, next);
+        engine.isIncrementalPatching = true;
+        try {
+            diffAndPatch(prev, next);
+        } finally {
+            engine.isIncrementalPatching = false;
+        }
         performAutoFit();
         // Phase 2 step 4 invariant: this path still stays pool-first — it
         // reflows layout, refreshes canvas size, patches visible objects in
