@@ -76,6 +76,23 @@
             removed.forEach(function (c) { c.parent = null; });
             return removed;
         };
+        // Mirror PixiJS v8 ``DisplayObject.destroy``: detach from the parent and
+        // (with ``{children:true}``) recursively destroy children.  The headless
+        // mock needs this so the dataset-switch stale-pool teardown (problem 4)
+        // runs identically under node and the real WebGL renderer.
+        Container.prototype.destroy = function (opts) {
+            const destroyChildren = !!(opts && opts.children);
+            if (this.parent && Array.isArray(this.parent.children)) {
+                this.parent.children = this.parent.children.filter((c) => c !== this);
+            }
+            this.parent = null;
+            if (destroyChildren) {
+                const kids = this.children.slice();
+                kids.forEach(function (c) { if (c && typeof c.destroy === 'function') { c.destroy(opts); } });
+            }
+            this.children = [];
+            this.destroyed = true;
+        };
         // Phase 2 step 3: headless Pixi mock gains a minimal EventEmitter so the
         // node-side render probe can simulate click / dblclick / pointerdown on
         // group hit boxes (real PixiJS v8 wires the same API through Federated
@@ -273,6 +290,10 @@
             // Expand-All / Collapse-All path never re-runs ``renderer.resize()``
             // (only the initial render / auto-fit path may bump it).
             dataRef: null,
+            // Problem 4: the payload the pools were last built from.  A render
+            // whose ``data`` differs from this is a dataset switch and triggers
+            // the stale-pool teardown in canvasRenderPhase1.
+            renderedDataRef: null,
             collapsedStateRef: null,
             rendererResizeCallCount: 0,
             // Phase 2 step 4: positive diagnostic counter bumped once per
@@ -1096,6 +1117,73 @@
         return idx;
     }
 
+    // ── Semantic-Zoom boundary anchor resolution (problem 1) ───────────────
+    // ``buildBoundaryAnchorCtx`` precomputes the id → record lookups
+    // ``resolveBoundaryAnchor`` needs.  Building them once per call site (instead
+    // of per edge) keeps the focus boundary classification O(E) rather than
+    // O(E·(G+N+IO)).  All four lookups are keyed by *string* ids.
+    function buildBoundaryAnchorCtx(data) {
+        if (!data || typeof data !== 'object') {
+            throw new Error('render_canvas.js: buildBoundaryAnchorCtx requires data');
+        }
+        const groupById = new Map();
+        (data.groups || []).forEach(function (g) { groupById.set(String(g.id), g); });
+        const nodeById = new Map();
+        (data.nodes || []).forEach(function (n) { nodeById.set(String(n.id), n); });
+        const ioById = new Map();
+        const ioByMember = new Map();
+        (data.io_groups || []).forEach(function (ig) {
+            ioById.set(String(ig.id), ig);
+            (ig.member_ids || []).forEach(function (mid) { ioByMember.set(String(mid), ig); });
+        });
+        const resolveAncestor = lookupResolveCollapsedAncestor();
+        if (typeof resolveAncestor !== 'function') {
+            throw new Error('render_canvas.js: resolveBoundaryAnchor requires resolveCollapsedAncestor');
+        }
+        return {
+            groupById: groupById,
+            nodeById: nodeById,
+            ioById: ioById,
+            ioByMember: ioByMember,
+            portIndex: ensurePortNodeIndex(),
+            resolveAncestor: resolveAncestor
+        };
+    }
+
+    // Resolve a raw cross-boundary endpoint id to a stable *anchor* describing
+    // how it should be drawn in focus mode.  Order matters and is the single
+    // source of truth shared by ``augmentFocusBoundaryMeta`` (which lays the
+    // boundary card / io pill out) and ``computeVisibleScene.addBoundary`` (which
+    // admits it to the visible set):
+    //   1. resolveCollapsedAncestor(rawId) → resolved id
+    //   2. resolved is a Group in/out port node id → its owning group (kind=group)
+    //   3. resolved is an io_group id            → that io_group  (kind=io)
+    //   4. resolved is an io_group member node id → its owning io_group (kind=io)
+    //   5. resolved is a data.groups id          → the group      (kind=group)
+    //   6. resolved is a data.nodes id           → the node       (kind=node)
+    //   7. otherwise → hard error (fail-fast, no silent drop)
+    function resolveBoundaryAnchor(rawId, ctx) {
+        const resolved = String(ctx.resolveAncestor(rawId));
+        const portInfo = ctx.portIndex.get(resolved);
+        if (portInfo) {
+            return { kind: 'group', id: String(portInfo.groupId) };
+        }
+        if (ctx.ioById.has(resolved)) {
+            return { kind: 'io', id: resolved, ioGroup: ctx.ioById.get(resolved) };
+        }
+        const ownerIo = ctx.ioByMember.get(resolved);
+        if (ownerIo) {
+            return { kind: 'io', id: String(ownerIo.id), ioGroup: ownerIo };
+        }
+        if (ctx.groupById.has(resolved)) {
+            return { kind: 'group', id: resolved };
+        }
+        if (ctx.nodeById.has(resolved)) {
+            return { kind: 'node', id: resolved };
+        }
+        throw new Error('render_canvas.js: resolveBoundaryAnchor could not resolve boundary id ' + rawId + ' (resolved=' + resolved + ')');
+    }
+
     // Resolve a (already collapsed-ancestor-redirected) endpoint id to its draw
     // port {cx,cy} using ``boxResolver`` for the LIVE/fresh box lookup.
     //   * a boundary port node id  -> its owning group's in/out port (the legacy
@@ -1726,7 +1814,7 @@
         });
     }
 
-    function diffAndPatch(prevVisible, nextVisible) {
+    function _assertDiffInputs(prevVisible, nextVisible) {
         if (!prevVisible || typeof prevVisible !== 'object') {
             throw new Error('render_canvas.js: diffAndPatch requires prevVisible');
         }
@@ -1752,12 +1840,96 @@
         (nextVisible.edgeKeys || []).forEach(function (ek) {
             requireSnapshotFields('edge', ek, getSnapshotEntry(nextVisible.edgeSnapshots, ek), EDGE_SNAPSHOT_FIELDS);
         });
-        patchGroups(prevVisible.groupIds, nextVisible.groupIds, nextVisible.groupSnapshots);
-        patchNodes(prevVisible.nodeIds, nextVisible.nodeIds, nextVisible.nodeSnapshots);
-        patchEdges(prevVisible.edgeKeys, nextVisible.edgeKeys, nextVisible.edgeSnapshots);
+    }
+
+    function _commitVisibleSets(nextVisible) {
         engine.visibleGroupIds = new Set((nextVisible.groupIds || []).map(String));
         engine.visibleNodeIds  = new Set((nextVisible.nodeIds  || []).map(String));
         engine.visibleEdgeKeys = new Set((nextVisible.edgeKeys || []).map(String));
+    }
+
+    function diffAndPatch(prevVisible, nextVisible) {
+        _assertDiffInputs(prevVisible, nextVisible);
+        patchGroups(prevVisible.groupIds, nextVisible.groupIds, nextVisible.groupSnapshots);
+        patchNodes(prevVisible.nodeIds, nextVisible.nodeIds, nextVisible.nodeSnapshots);
+        patchEdges(prevVisible.edgeKeys, nextVisible.edgeKeys, nextVisible.edgeSnapshots);
+        _commitVisibleSets(nextVisible);
+    }
+
+    // Frame-chunked variant of ``diffAndPatch`` (problem 4): the dataset-switch /
+    // initial render path creates *all* new Graphics in one go, which makes
+    // PixiJS flush the entire geometry buffer to the GPU in a single tick
+    // (~1 s ``bufferSubData`` for the 5698781 model — confirmed by the Chrome
+    // trace).  Yielding a frame between patchGroups → patchNodes → patchEdges
+    // lets PixiJS upload each slice in its own tick, spreading the GPU cost over
+    // three frames instead of one.  Snapshot validation still happens up front so
+    // a malformed frame aborts before any pool mutation.  ``p`` is the progress
+    // API (its ``nextFrame`` yields to the event loop / rAF).
+    async function diffAndPatchChunked(prevVisible, nextVisible, p) {
+        if (!p || typeof p.nextFrame !== 'function') {
+            throw new Error('render_canvas.js: diffAndPatchChunked requires a progress api with nextFrame()');
+        }
+        _assertDiffInputs(prevVisible, nextVisible);
+        patchGroups(prevVisible.groupIds, nextVisible.groupIds, nextVisible.groupSnapshots);
+        await p.nextFrame();
+        patchNodes(prevVisible.nodeIds, nextVisible.nodeIds, nextVisible.nodeSnapshots);
+        await p.nextFrame();
+        patchEdges(prevVisible.edgeKeys, nextVisible.edgeKeys, nextVisible.edgeSnapshots);
+        _commitVisibleSets(nextVisible);
+    }
+
+    // Destroy a single pool entry: tear down its Pixi display object (freeing the
+    // GPU geometry/texture it holds) and drop it from the pool Map and the live
+    // visible-id set so the next diffAndPatch never tries to recycle a destroyed
+    // view.  ``view.root.destroy({children:true})`` releases the whole subtree.
+    function destroyPoolEntry(pool, key, visibleSet) {
+        const view = pool.get(key);
+        if (!view) { return false; }
+        if (!view.root || typeof view.root.destroy !== 'function') {
+            throw new Error('render_canvas.js: destroyPoolEntry pool view ' + key + ' has no destroyable root');
+        }
+        view.root.destroy({ children: true });
+        pool.delete(key);
+        if (visibleSet instanceof Set) { visibleSet.delete(String(key)); }
+        return true;
+    }
+
+    // Dataset-switch teardown (problem 4): when the page swaps to a different
+    // dataset (e.g. Training → Inference) the new graph's node/group/edge ids
+    // barely overlap the old one's, so the object pools would otherwise keep
+    // every stale view alive forever — holding their VRAM geometry and inflating
+    // the pool the diff has to walk.  Destroy every pool view whose key is absent
+    // from the new dataset and prune it from the live visible-id sets.  Returns
+    // the number of views destroyed (used by tests / diagnostics).
+    function destroyStalePoolViews(data) {
+        if (!data || typeof data !== 'object') {
+            throw new Error('render_canvas.js: destroyStalePoolViews requires data');
+        }
+        const validGroupIds = new Set((data.groups || []).map(function (g) { return String(g.id); }));
+        const validNodeIds = new Set((data.nodes || []).map(function (n) { return String(n.id); }));
+        const edgeKeyFn = lookupEdgeKey();
+        if (typeof edgeKeyFn !== 'function') {
+            throw new Error('render_canvas.js: destroyStalePoolViews requires the inline edgeKey() helper');
+        }
+        const validEdgeKeys = new Set();
+        (data.edges || []).forEach(function (e) { validEdgeKeys.add(String(edgeKeyFn(e))); });
+        let destroyed = 0;
+        Array.from(engine.groupPool.keys()).forEach(function (key) {
+            if (!validGroupIds.has(String(key))) {
+                if (destroyPoolEntry(engine.groupPool, key, engine.visibleGroupIds)) { destroyed++; }
+            }
+        });
+        Array.from(engine.nodePool.keys()).forEach(function (key) {
+            if (!validNodeIds.has(String(key))) {
+                if (destroyPoolEntry(engine.nodePool, key, engine.visibleNodeIds)) { destroyed++; }
+            }
+        });
+        Array.from(engine.edgePool.keys()).forEach(function (key) {
+            if (!validEdgeKeys.has(String(key))) {
+                if (destroyPoolEntry(engine.edgePool, key, engine.visibleEdgeKeys)) { destroyed++; }
+            }
+        });
+        return destroyed;
     }
 
     // ── Phase 2 step 4: incremental render path ────────────────────────────
@@ -1958,16 +2130,13 @@
     // below), give each a card-sized box, and grow ``layoutInfo.svgW/svgH`` so the
     // world bounds (and hence the auto-fit) cover the whole local closure.
     //
-    // IO pills (global model inputs/params/consts/outputs) are intentionally NOT
-    // re-projected into the focus layout — they belong to the model root, not the
-    // submodule's local closure — so edges to them are dropped by the existing
-    // boundary path in computeVisibleScene (addBoundary returns false, the id is not
-    // a live io pill, so the edge is skipped).
+    // Problem 1: cross-boundary endpoints that resolve to a model IO group
+    // (input / param / const / output) are now drawn too.  They are placed in the
+    // SAME flanking IN / OUT rows as the regular boundary cards, and each emits an
+    // ``io_pill`` draw task appended to ``layoutInfo.ioTasks`` so ``drawIOTasks``
+    // (which runs before ``computeVisibleScene``) registers the pill in
+    // ``engine.ioPillById`` — giving ``addBoundary`` / edge routing a live box.
     function augmentFocusBoundaryMeta(data, focusRootId, layoutInfo, nodeMeta, groupMeta) {
-        const groupById = new Map();
-        (data.groups || []).forEach(function (g) { groupById.set(String(g.id), g); });
-        const nodeById = new Map();
-        (data.nodes || []).forEach(function (n) { nodeById.set(String(n.id), n); });
         const portIndex = ensurePortNodeIndex();
         const subtreeIds = new Set();
         groupMeta.forEach(function (_v, k) { subtreeIds.add(k); });
@@ -1983,20 +2152,20 @@
         if (typeof resolveAncestor !== 'function' || typeof isVisible !== 'function') {
             throw new Error('render_canvas.js: augmentFocusBoundaryMeta requires resolveCollapsedAncestor + isEdgeVisible');
         }
+        const boundaryCtx = buildBoundaryAnchorCtx(data);
         const inNeighbors = [];
         const outNeighbors = [];
         const seen = new Set();
         function classify(rawId, isSource) {
-            const sid = String(resolveAncestor(rawId));
-            if (insideFocus(sid)) { return; }
-            // Only real, layout-able cards (groups / nodes) get a boundary box; IO
-            // pills and virtual ids fall through to the drop path downstream.
-            const isGroup = groupById.has(sid);
-            const isNode = !isGroup && nodeById.has(sid);
-            if (!isGroup && !isNode) { return; }
-            if (seen.has(sid)) { return; }
-            seen.add(sid);
-            const entry = { id: sid, isGroup: isGroup };
+            const anchor = resolveBoundaryAnchor(rawId, boundaryCtx);
+            // ``kind === 'io'`` keys on the io_group id; group / node anchors key
+            // on the resolved card id (and must still sit outside the subtree).
+            if (anchor.kind !== 'io' && insideFocus(anchor.id)) { return; }
+            if (seen.has(anchor.id)) { return; }
+            seen.add(anchor.id);
+            const entry = (anchor.kind === 'io')
+                ? { kind: 'io', id: anchor.id, ioGroup: anchor.ioGroup }
+                : { kind: anchor.kind, id: anchor.id };
             if (isSource) { inNeighbors.push(entry); } else { outNeighbors.push(entry); }
         }
         (data.edges || []).forEach(function (e) {
@@ -2015,9 +2184,27 @@
         const GAP = 60;
         const COL_GAP = 24;
         function boxFor(entry) {
-            return entry.isGroup
-                ? { w: LAYOUT.nodeW + 20, h: LAYOUT.nodeH + 8 }
-                : { w: LAYOUT.nodeW, h: LAYOUT.nodeH };
+            if (entry.kind === 'group') { return { w: LAYOUT.nodeW + 20, h: LAYOUT.nodeH + 8 }; }
+            // node + io boundary entries both use a node-sized card/pill.
+            return { w: LAYOUT.nodeW, h: LAYOUT.nodeH };
+        }
+        if (!Array.isArray(layoutInfo.ioTasks)) { layoutInfo.ioTasks = []; }
+        function emitIoTask(entry, cx, cy, w, h) {
+            const ig = entry.ioGroup;
+            const subtype = ig.io_subtype;
+            layoutInfo.ioTasks.push({
+                type: 'io',
+                taskKind: 'io_pill',
+                nid: ig.id,
+                subtype: subtype,
+                cx: cx,
+                cy: cy,
+                w: w,
+                h: h,
+                label: ig.label || IO_GROUP_MEMBER_LABEL[subtype] || String(subtype),
+                sublabel: '',
+                fillColor: IO_GROUP_FILL[subtype] || 'rgba(127,140,141,0.55)'
+            });
         }
         // Subtree bounding box (pre-offset).
         let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
@@ -2044,9 +2231,14 @@
             let rowMaxBottom = rowY;
             neighbors.forEach(function (entry, i) {
                 const b = boxes[i];
-                const meta = { x: x, y: rowY, w: b.w, h: b.h, collapsed: true };
-                if (entry.isGroup) { groupMeta.set(entry.id, meta); }
-                else { nodeMeta.set(entry.id, { x: x, y: rowY, w: b.w, h: b.h }); }
+                if (entry.kind === 'group') {
+                    groupMeta.set(entry.id, { x: x, y: rowY, w: b.w, h: b.h, collapsed: true });
+                } else if (entry.kind === 'node') {
+                    nodeMeta.set(entry.id, { x: x, y: rowY, w: b.w, h: b.h });
+                } else {
+                    // io boundary: emit an io_pill draw task (cx/cy are centre).
+                    emitIoTask(entry, x + b.w / 2, rowY + b.h / 2, b.w, b.h);
+                }
                 rowMaxBottom = Math.max(rowMaxBottom, rowY + b.h);
                 x += b.w + COL_GAP;
             });
@@ -2199,51 +2391,83 @@
             engine.lastFocusSubtreeIds = null;
         }
 
-        // Boundary helper (Step 5): add a one-hop outside endpoint to the
-        // visible set so the focus frame still shows where the focus root
-        // connects to the rest of the graph.  The id is whatever
-        // ``resolveCollapsedAncestor`` returned, so it may point at:
-        //   - a leaf node currently visible in the original full graph
-        //     (parent group is expanded outside focus)
-        //   - a collapsed group card
-        //   - neither, in which case the endpoint is an IO pill (handled in
-        //     the edge loop's metaBoxForId lookup) or a hard wiring bug.
-        // Boundary entries are *non-recursive* — we never expand inside them.
-        function addBoundary(id) {
-            const sid = String(id);
-            if (visibleGroupSet.has(sid) || visibleNodeSet.has(sid)) { return true; }
-            const groupRecord = groupById.get(sid);
-            if (groupRecord) {
-                const gmeta = groupMetaById.get(sid);
-                if (!gmeta) { return false; }
-                visibleGroupSet.add(sid);
-                groupIds.push(sid);
-                // Step 5 (problem 3): the boundary card is now re-laid-out adjacent
-                // to the focus subtree, so include it in the auto-fit set — the
-                // whole local closure should fit the viewport together.
-                if (engine.lastFocusSubtreeIds) { engine.lastFocusSubtreeIds.add(sid); }
-                // Boundary groups always render as collapsed cards (we do not
-                // recurse into them in focus mode), regardless of whether the
-                // user happens to have them expanded in the global state.
-                const boundaryCollapsed = Object.assign({}, collapsed);
-                boundaryCollapsed[sid] = true;
-                groupSnapshots[sid] = makeIncrGroupSnapshot(groupRecord, boundaryCollapsed, gmeta);
-                return true;
+        // Shared boundary-anchor classifier (problem 1).  Built once per scene in
+        // focus mode and reused by every ``addBoundary`` call so the admission and
+        // the layout (augmentFocusBoundaryMeta) agree id-for-id.
+        const boundaryCtx = focusActive ? buildBoundaryAnchorCtx(data) : null;
+
+        // Boundary helper (Step 5 / problem 1): admit a one-hop *outside* endpoint
+        // to the focus frame so users still see where the focus root connects to
+        // the rest of the graph.  The classification is delegated to the shared
+        // ``resolveBoundaryAnchor`` so this admission path and
+        // ``augmentFocusBoundaryMeta`` (which lays the boundary card / io pill out)
+        // can never disagree on what an id resolves to.  The anchor kind is one of:
+        //   - 'group' : a collapsed parent-group boundary card (also covers a
+        //               Group in/out port node id → its owning group)
+        //   - 'node'  : a leaf-node boundary card
+        //   - 'io'    : a model IO group (input/param/const/output) drawn as a pill
+        // Anything that resolves to none of these is a hard wiring bug and raises
+        // (no silent drop).  Returns the *route id* the edge must use for its
+        // endpoint box lookup (the owning group for ports, the io_group id for io
+        // anchors, the resolved card id otherwise) so the caller routes and
+        // snapshots against the exact box admitted here.  Boundary entries are
+        // *non-recursive* — we never expand inside them.
+        function addBoundary(rawId) {
+            if (!boundaryCtx) {
+                throw new Error('render_canvas.js: addBoundary called outside focus mode (boundaryCtx unset)');
             }
-            const nodeRecord = nodeById.get(sid);
-            if (nodeRecord) {
-                const nmeta = nodeMetaById.get(sid);
-                if (!nmeta) { return false; }
-                visibleNodeSet.add(sid);
-                nodeIds.push(sid);
-                if (engine.lastFocusSubtreeIds) { engine.lastFocusSubtreeIds.add(sid); }
-                nodeSnapshots[sid] = makeIncrNodeSnapshot(nodeRecord, nmeta);
-                return true;
+            const anchor = resolveBoundaryAnchor(rawId, boundaryCtx);
+            const sid = anchor.id;
+            if (anchor.kind === 'group') {
+                if (!(visibleGroupSet.has(sid) || visibleNodeSet.has(sid))) {
+                    const groupRecord = groupById.get(sid);
+                    if (!groupRecord) {
+                        throw new Error('render_canvas.js: boundary group ' + sid + ' missing from data.groups');
+                    }
+                    const gmeta = groupMetaById.get(sid);
+                    if (!gmeta) {
+                        throw new Error('render_canvas.js: boundary group ' + sid + ' has no layout meta (augmentFocusBoundaryMeta did not place it)');
+                    }
+                    visibleGroupSet.add(sid);
+                    groupIds.push(sid);
+                    // Step 5 (problem 3): the boundary card is re-laid-out adjacent
+                    // to the focus subtree, so include it in the auto-fit set — the
+                    // whole local closure should fit the viewport together.
+                    if (engine.lastFocusSubtreeIds) { engine.lastFocusSubtreeIds.add(sid); }
+                    // Boundary groups always render as collapsed cards (we never
+                    // recurse into them in focus mode), regardless of the user's
+                    // global expand state.
+                    const boundaryCollapsed = Object.assign({}, collapsed);
+                    boundaryCollapsed[sid] = true;
+                    groupSnapshots[sid] = makeIncrGroupSnapshot(groupRecord, boundaryCollapsed, gmeta);
+                }
+                return sid;
             }
-            // IO pill or unresolvable id — caller falls back to ioPillById
-            // through ``metaBoxForId``; we don't add it to the node/group
-            // visible sets because IO pills live in their own L5 pool.
-            return false;
+            if (anchor.kind === 'node') {
+                if (!(visibleNodeSet.has(sid) || visibleGroupSet.has(sid))) {
+                    const nodeRecord = nodeById.get(sid);
+                    if (!nodeRecord) {
+                        throw new Error('render_canvas.js: boundary node ' + sid + ' missing from data.nodes');
+                    }
+                    const nmeta = nodeMetaById.get(sid);
+                    if (!nmeta) {
+                        throw new Error('render_canvas.js: boundary node ' + sid + ' has no layout meta (augmentFocusBoundaryMeta did not place it)');
+                    }
+                    visibleNodeSet.add(sid);
+                    nodeIds.push(sid);
+                    if (engine.lastFocusSubtreeIds) { engine.lastFocusSubtreeIds.add(sid); }
+                    nodeSnapshots[sid] = makeIncrNodeSnapshot(nodeRecord, nmeta);
+                }
+                return sid;
+            }
+            // anchor.kind === 'io': the pill box must already be live —
+            // augmentFocusBoundaryMeta emitted an io_pill task that drawIOTasks
+            // registered in engine.ioPillById before computeVisibleScene ran.
+            if (!engine.ioPillById.get(sid)) {
+                throw new Error('render_canvas.js: boundary io group ' + sid + ' has no live pill box (augmentFocusBoundaryMeta/drawIOTasks did not register it)');
+            }
+            if (engine.lastFocusSubtreeIds) { engine.lastFocusSubtreeIds.add(sid); }
+            return sid;
         }
 
         // Global edges (ported from the legacy ``drawGlobalEdges`` path): each
@@ -2275,6 +2499,7 @@
         function isIoPill(id) {
             return engine.ioPillById.get(String(id)) ? true : false;
         }
+        void isIoPill; // retained for diagnostics; addBoundary now fail-fasts on io anchors
         // Step 5 (problem 5 — ReturnVal edge): an endpoint counts as "inside the
         // focus subtree" when it is a focus-subtree node/group directly, OR when
         // it is a boundary-port node id (Group in/out_port, e.g. a ReturnVal
@@ -2307,51 +2532,26 @@
             // ── Step 5 focus filter ────────────────────────────────────────
             // In focus mode the visible edge set is the union of:
             //   - both endpoints inside the focus subtree (purely-internal),
-            //   - exactly one endpoint inside (boundary edge → augment the
-            //     outside endpoint into the visible set as a non-recursive
-            //     boundary entry; IO pills are accepted as implicit
-            //     "always-visible" anchors and do not need an entry in the
-            //     node/group visible sets).
-            // Edges with neither endpoint inside the focus subtree are
-            // dropped — they are not part of the local semantic closure.
+            //   - exactly one endpoint inside (boundary edge → admit the outside
+            //     endpoint as a non-recursive boundary anchor; ``addBoundary``
+            //     returns the *route id* of the live box it admitted — the owning
+            //     group for a port, the io_group id for an IO anchor, the resolved
+            //     card id otherwise).
+            // Edges with neither endpoint inside the focus subtree are dropped —
+            // they are not part of the local semantic closure.  An outside
+            // endpoint that resolves to nothing drawable raises in addBoundary
+            // (no silent skip).
+            let routeFromId = fromId;
+            let routeToId = toId;
             if (focusActive) {
                 const fromInside = isInsideFocus(fromId);
                 const toInside = isInsideFocus(toId);
                 if (!fromInside && !toInside) { return; }
-                if (!fromInside) {
-                    // ``addBoundary`` returns true if the outside endpoint
-                    // resolves to a node/group with valid layout meta; an IO
-                    // pill returns false but is still a legitimate anchor (its
-                    // box lives in ``engine.ioPillById``).  If neither path
-                    // resolves the endpoint, drop the boundary edge silently.
-                    //
-                    // Rationale: the backend occasionally emits edges to
-                    // virtual ids (e.g. ``__return_val__`` placeholders) that
-                    // are never registered in data.nodes / data.groups /
-                    // data.io_groups.member_ids.  In global mode this is
-                    // hidden by depth-based default collapsing — the
-                    // surrounding ancestor groups stay collapsed so
-                    // resolveCollapsedAncestor short-circuits before reaching
-                    // the unregistered id.  cascadeExpand in focus mode
-                    // expands the entire subtree and exposes the issue.
-                    // Throwing here would block ``enterFocus`` for valid user
-                    // gestures because of upstream data we cannot fix from
-                    // the renderer, so we mirror the existing implicit
-                    // "drop malformed edge" behaviour instead.
-                    const ok = addBoundary(fromId);
-                    if (!ok && !isIoPill(fromId)) {
-                        return;
-                    }
-                }
-                if (!toInside) {
-                    const ok = addBoundary(toId);
-                    if (!ok && !isIoPill(toId)) {
-                        return;
-                    }
-                }
+                if (!fromInside) { routeFromId = addBoundary(e.from); }
+                if (!toInside) { routeToId = addBoundary(e.to); }
             }
-            const fromPort = portPointForEndpoint(fromId, 'src', metaBoxForId);
-            const toPort = portPointForEndpoint(toId, 'dst', metaBoxForId);
+            const fromPort = portPointForEndpoint(routeFromId, 'src', metaBoxForId);
+            const toPort = portPointForEndpoint(routeToId, 'dst', metaBoxForId);
             if (!fromPort || !toPort) {
                 throw new Error('global edge endpoint missing: ' + e.from + ' -> ' + e.to);
             }
@@ -2368,8 +2568,8 @@
             const st = EDGE_STYLE[colorKey];
             edgeKeys.push(key);
             edgeSnapshots[key] = makeIncrEdgeSnapshot(e, {
-                srcId: fromId,
-                dstId: toId,
+                srcId: routeFromId,
+                dstId: routeToId,
                 routeMeta: routeMeta,
                 dashed: route.dashed,
                 stroke: st.color,
@@ -2453,7 +2653,7 @@
         // path (including focus exit, where ``lastFocusSubtreeIds`` is null)
         // use the full renderable bounds with the normal 1.0 cap so the graph
         // is never enlarged past native size.
-        const FOCUS_MAX_SCALE = 4.0;
+        const FOCUS_MAX_SCALE = 2.0;
         const focusActive = Array.isArray(engine.focusStackRef) && engine.focusStackRef.length > 0;
         let fitBounds = null;
         let fitMaxScale = 1.0;
@@ -2604,6 +2804,7 @@
 
     async function canvasRenderPhase1(data, renderOpts) {
         ensureEngine();
+        let datasetSwitched = false;
         // Pool-first initial render needs computeVisibleScene() context. The
         // inline runtime normally installs it via __canvasSetIncrementalContext
         // before the first render, but headless probes call canvasRenderPhase1
@@ -2612,6 +2813,10 @@
         // from the render's own ``data`` argument + the live collapsedState so
         // the initial scene walk always has a valid, current reference.
         if (data && typeof data === 'object') {
+            // Problem 4: detect a dataset switch (a *different* payload object than
+            // the one the pools were last built from) so the draw-edges chunk can
+            // destroy the now-stale pool views before diffing the new scene.
+            datasetSwitched = engine.renderedDataRef != null && engine.renderedDataRef !== data;
             engine.dataRef = data;
             const liveCollapsed = lookupCollapsedState();
             if (liveCollapsed && typeof liveCollapsed === 'object') {
@@ -2688,13 +2893,24 @@
                 // against the current visible sets and patch the pools.  On the
                 // first render engine.visible* are empty Sets, so this is a full
                 // create+patch; on a re-render it recycles unchanged views.
+                //
+                // Problem 4: on a dataset switch, destroy the stale pool views
+                // FIRST (freeing their VRAM and pruning them from the visible-id
+                // sets) so the diff below never tries to recycle a view that
+                // belongs to the previous graph, then patch the new scene over
+                // three frames so PixiJS uploads the geometry in three GPU ticks
+                // instead of one ~1s ``bufferSubData`` flush.
+                if (datasetSwitched) {
+                    destroyStalePoolViews(data);
+                }
                 const prev = {
                     groupIds: engine.visibleGroupIds,
                     nodeIds: engine.visibleNodeIds,
                     edgeKeys: engine.visibleEdgeKeys
                 };
                 const next = computeVisibleScene();
-                diffAndPatch(prev, next);
+                await diffAndPatchChunked(prev, next, p);
+                engine.renderedDataRef = data;
             }, {
                 batchSize: 1,
                 phaseStart: 60,

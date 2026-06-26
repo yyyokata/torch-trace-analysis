@@ -1779,10 +1779,22 @@ function enterFocus(gid) {
     if (gid === undefined || gid === null) {
         throw new Error('enterFocus: gid is required');
     }
-    if (!groupMap[gid]) {
+    const g = groupMap[gid];
+    if (!g) {
         throw new Error('enterFocus: unknown group id ' + gid);
     }
     if (focusStack.length > 0 && String(focusStack[focusStack.length - 1]) === String(gid)) {
+        return;
+    }
+    // Problem 2: a *leaf* group (no nested child groups) has nothing to drill
+    // into.  Pushing it onto the focus stack used to relayout its single card to
+    // fill the viewport — the reported vertical-stretch artefact — and, because
+    // the stretched card ends up fully covered by its own child nodes, left no
+    // group box for the user to right-double-click, so focus could not be
+    // exited.  Leaf groups therefore only surface their side panel (acting as a
+    // plain selection); they never push the focus stack or cascade-expand.
+    if (((g.children_group_ids || []).length) === 0) {
+        showGroupPanel(g);
         return;
     }
     cascadeExpandSubtree(gid);
@@ -1816,12 +1828,27 @@ function setFocusToDepth(depth) {
     invokeIncrementalRender({ reason: 'focus-jump', depth: depth });
 }
 
+// ``__focusNowMs()`` is a monotonic-ish millisecond clock used by the right
+// double-click gestures (group-box drill-down and the stage-level focus exit).
+// Falls back to 0 in the degenerate environment where Date is unavailable so
+// the gesture math stays defined.
+function __focusNowMs() {
+    return (typeof Date !== 'undefined' && typeof Date.now === 'function') ? Date.now() : 0;
+}
+// Timestamp of the most recent group-box focus gesture (enter/exit).  The
+// stage-level right-double-click guard consults it to avoid double-handling a
+// gesture the group box already consumed.
+let __lastGroupFocusGestureAt = 0;
+
 if (typeof window !== 'undefined') {
     // Engine callbacks for right-double-click on a group box.  Pure
     // forwarders so render_canvas.js does not need to know about
-    // ``focusStack`` directly.
-    window.__canvasOnEnterFocus = function (gid) { enterFocus(gid); };
-    window.__canvasOnExitFocus = function () { exitFocus(); };
+    // ``focusStack`` directly.  Each gesture also stamps
+    // ``__lastGroupFocusGestureAt`` so the stage-level right-double-click guard
+    // (bindCanvasContextMenuGuard) can tell "the group box already handled this
+    // gesture" apart from "right-double-click on empty / covered canvas".
+    window.__canvasOnEnterFocus = function (gid) { __lastGroupFocusGestureAt = __focusNowMs(); enterFocus(gid); };
+    window.__canvasOnExitFocus = function () { __lastGroupFocusGestureAt = __focusNowMs(); exitFocus(); };
     // Convenience hook for tests + breadcrumb integration tests.
     window.__canvasSetFocusToDepth = function (depth) { setFocusToDepth(depth); };
 }
@@ -2160,11 +2187,43 @@ document.addEventListener('keydown', (e) => {
 // handler cannot always cancel it, so suppress it at the DOM container level
 // too.  This is purely a UX guard (no system menu over the canvas) and never
 // touches trace data.
+//
+// Problem 2: the group box's own right-double-click exits focus, but once a
+// drilled-in subtree fills the viewport its boundary group box can be fully
+// covered by child nodes, leaving the user no box to right-double-click.  We
+// therefore ALSO recognise a right double-click at the *stage* level (two
+// ``contextmenu`` events within RIGHT_DBLCLICK_MS and RIGHT_DBLCLICK_DIST px)
+// and, when a focus is active, pop one level.  A gesture the group box already
+// handled (stamped on ``__lastGroupFocusGestureAt``) is ignored here so we
+// never double-handle the same physical double-click.
 (function bindCanvasContextMenuGuard() {
     const stage = document.getElementById('dag-stage');
     if (!stage || typeof stage.addEventListener !== 'function') { return; }
+    const RIGHT_DBLCLICK_MS = 350;
+    const RIGHT_DBLCLICK_DIST = 6;
+    const GROUP_GESTURE_GUARD_MS = 400;
+    let lastCtxTime = 0;
+    let lastCtxX = 0;
+    let lastCtxY = 0;
     stage.addEventListener('contextmenu', function (e) {
         if (e && typeof e.preventDefault === 'function') { e.preventDefault(); }
+        const now = __focusNowMs();
+        const x = (e && typeof e.clientX === 'number') ? e.clientX : 0;
+        const y = (e && typeof e.clientY === 'number') ? e.clientY : 0;
+        const dt = lastCtxTime > 0 ? (now - lastCtxTime) : Infinity;
+        const dist = Math.abs(x - lastCtxX) + Math.abs(y - lastCtxY);
+        const isDouble = dt <= RIGHT_DBLCLICK_MS && dist <= RIGHT_DBLCLICK_DIST;
+        lastCtxTime = now; lastCtxX = x; lastCtxY = y;
+        if (!isDouble) { return; }
+        // The group box already consumed this exact double-click — don't pop a
+        // second level at the stage level.
+        if (now - __lastGroupFocusGestureAt <= GROUP_GESTURE_GUARD_MS) { return; }
+        if (focusStack.length > 0) {
+            // Reset the recogniser so an immediate third right-click does not
+            // re-trigger off this same gesture.
+            lastCtxTime = 0;
+            exitFocus();
+        }
     });
 })();
 
@@ -2295,19 +2354,31 @@ function refreshTopbarCapsules() {
             modeCap.onclick = null;
         }
     }
-    // L2 (runstep) capsule — only meaningful in multi mode with >1 runstep.
-    if (runCap && hasMulti) {
-        const steps = ALL_TAB_DATA[ACTIVE_L1] || [];
-        const curIdx = ACTIVE_L2[ACTIVE_L1] || 0;
-        const labelOf = (e) => String((e && e.label != null) ? e.label : 'runstep');
-        runCap.textContent = steps.length ? labelOf(steps[curIdx]) : 'runstep';
-        if (steps.length > 1) {
-            runCap.classList.remove('tb-capsule-disabled');
-            runCap.onclick = (ev) => {
-                if (ev && typeof ev.stopPropagation === 'function') { ev.stopPropagation(); }
-                _openTopbarDropdown(runCap, steps.map(labelOf), curIdx, (i) => activateL2(ACTIVE_L1, i));
-            };
+    // L2 (runstep) capsule.  Problem 5 root-cause fix: every branch must set the
+    // disabled state EXPLICITLY so a dataset switch (activateTab / activateL1 /
+    // activateL2 all re-run refreshTopbarCapsules) never leaves the capsule's
+    // ``tb-capsule-disabled`` class in a stale state inherited from the previous
+    // dataset.  Previously only the ``hasMulti`` branch touched runCap, so in
+    // dual / single-runstep mode the class was whatever the prior render left it.
+    if (runCap) {
+        if (hasMulti) {
+            const steps = ALL_TAB_DATA[ACTIVE_L1] || [];
+            const curIdx = ACTIVE_L2[ACTIVE_L1] || 0;
+            const labelOf = (e) => String((e && e.label != null) ? e.label : 'runstep');
+            runCap.textContent = steps.length ? labelOf(steps[curIdx]) : 'runstep';
+            if (steps.length > 1) {
+                runCap.classList.remove('tb-capsule-disabled');
+                runCap.onclick = (ev) => {
+                    if (ev && typeof ev.stopPropagation === 'function') { ev.stopPropagation(); }
+                    _openTopbarDropdown(runCap, steps.map(labelOf), curIdx, (i) => activateL2(ACTIVE_L1, i));
+                };
+            } else {
+                runCap.classList.add('tb-capsule-disabled');
+                runCap.onclick = null;
+            }
         } else {
+            // dual (Training/Inference only) and single-runstep base page: there
+            // is no runstep switcher, so the capsule is always disabled and inert.
             runCap.classList.add('tb-capsule-disabled');
             runCap.onclick = null;
         }
