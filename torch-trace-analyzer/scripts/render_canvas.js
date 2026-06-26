@@ -566,11 +566,6 @@
     function eventButton(e) {
         if (!e) { return null; }
         if (typeof e.button === 'number') { return e.button; }
-        if (e.nativeEvent && typeof e.nativeEvent.button === 'number') { return e.nativeEvent.button; }
-        if (e.originalEvent && typeof e.originalEvent.button === 'number') { return e.originalEvent.button; }
-        if (e.data && e.data.originalEvent && typeof e.data.originalEvent.button === 'number') {
-            return e.data.originalEvent.button;
-        }
         return null;
     }
 
