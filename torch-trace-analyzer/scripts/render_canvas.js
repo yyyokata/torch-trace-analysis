@@ -563,6 +563,17 @@
         return Number.isFinite(n) ? n : null;
     }
 
+    function eventButton(e) {
+        if (!e) { return null; }
+        if (typeof e.button === 'number') { return e.button; }
+        if (e.nativeEvent && typeof e.nativeEvent.button === 'number') { return e.nativeEvent.button; }
+        if (e.originalEvent && typeof e.originalEvent.button === 'number') { return e.originalEvent.button; }
+        if (e.data && e.data.originalEvent && typeof e.data.originalEvent.button === 'number') {
+            return e.data.originalEvent.button;
+        }
+        return null;
+    }
+
     function getContainerWidth(container) {
         if (!container) { return null; }
         return numericOrNull(container.clientWidth || container.offsetWidth || container.width);
@@ -841,41 +852,80 @@
     // the recognition handler and the body is a placeholder.  ``rightclick``
     // is intercepted purely to suppress the browser context menu (Pixi v8
     // emits ``rightclick`` synthetically on right-mouse-up).
-    function bindDoubleClickToggle(target, onSingleClick, onDoubleClick, clickDelayMs) {
+    function suppressPointerDefault(e) {
+        if (e && typeof e.stopPropagation === 'function') { e.stopPropagation(); }
+        if (e && e.nativeEvent && typeof e.nativeEvent.preventDefault === 'function') { e.nativeEvent.preventDefault(); }
+        if (e && typeof e.preventDefault === 'function') { e.preventDefault(); }
+    }
+
+    function bindPointerGestures(target, handlers) {
         if (!target) {
-            throw new Error('render_canvas.js: bindDoubleClickToggle missing target');
+            throw new Error('render_canvas.js: bindPointerGestures missing target');
         }
-        if (typeof onDoubleClick !== 'function') {
-            throw new Error('render_canvas.js: bindDoubleClickToggle requires onDoubleClick');
+        if (!handlers || typeof handlers !== 'object') {
+            throw new Error('render_canvas.js: bindPointerGestures requires handlers object');
         }
-        const delay = numericOrNull(clickDelayMs);
-        const effectiveDelay = (delay !== null && delay > 0) ? delay : 200;
+        const leftClick = handlers.leftClick;
+        const leftDblClick = handlers.leftDblClick;
+        const rightClick = handlers.rightClick;
+        const rightDblClick = handlers.rightDblClick;
+        if (leftClick !== null && leftClick !== undefined && typeof leftClick !== 'function') {
+            throw new Error('render_canvas.js: bindPointerGestures leftClick must be function/null');
+        }
+        if (leftDblClick !== null && leftDblClick !== undefined && typeof leftDblClick !== 'function') {
+            throw new Error('render_canvas.js: bindPointerGestures leftDblClick must be function/null');
+        }
+        if (rightClick !== null && rightClick !== undefined && typeof rightClick !== 'function') {
+            throw new Error('render_canvas.js: bindPointerGestures rightClick must be function/null');
+        }
+        if (rightDblClick !== null && rightDblClick !== undefined && typeof rightDblClick !== 'function') {
+            throw new Error('render_canvas.js: bindPointerGestures rightDblClick must be function/null');
+        }
+        const leftDelay = numericOrNull(handlers.leftDblClickDelayMs);
+        const leftDblClickDelayMs = (leftDelay !== null && leftDelay > 0) ? leftDelay : 200;
+        const rightDelay = numericOrNull(handlers.rightDblClickDelayMs);
+        const rightDblClickDelayMs = (rightDelay !== null && rightDelay > 0) ? rightDelay : 250;
         target.eventMode = 'static';
         target.cursor = 'pointer';
-        const state = { clickTimer: null, lastClickTime: 0 };
+        const state = { leftClickTimer: null, leftLastClickTime: 0, rightLastDown: 0 };
         target.on('click', function (e) {
-            if (e && typeof e.stopPropagation === 'function') { e.stopPropagation(); }
+            const btn = eventButton(e);
+            if (btn !== null && btn !== 0) { return; }
+            suppressPointerDefault(e);
             const now = (typeof Date !== 'undefined' && typeof Date.now === 'function') ? Date.now() : 0;
-            const isDoubleClick = state.lastClickTime > 0 && (now - state.lastClickTime) <= effectiveDelay;
-            state.lastClickTime = now;
+            const isDoubleClick = state.leftLastClickTime > 0 && (now - state.leftLastClickTime) <= leftDblClickDelayMs;
+            state.leftLastClickTime = now;
             if (isDoubleClick) {
-                if (state.clickTimer !== null) {
-                    clearTimeout(state.clickTimer);
-                    state.clickTimer = null;
+                if (state.leftClickTimer !== null) {
+                    clearTimeout(state.leftClickTimer);
+                    state.leftClickTimer = null;
                 }
-                onDoubleClick();
+                if (typeof leftDblClick === 'function') { leftDblClick(e); }
                 return;
             }
-            if (state.clickTimer !== null) {
-                clearTimeout(state.clickTimer);
-                state.clickTimer = null;
+            if (state.leftClickTimer !== null) {
+                clearTimeout(state.leftClickTimer);
+                state.leftClickTimer = null;
             }
-            state.clickTimer = setTimeout(function () {
-                state.clickTimer = null;
-                if (typeof onSingleClick === 'function') {
-                    onSingleClick();
-                }
-            }, effectiveDelay);
+            state.leftClickTimer = setTimeout(function () {
+                state.leftClickTimer = null;
+                if (typeof leftClick === 'function') { leftClick(e); }
+            }, leftDblClickDelayMs);
+        });
+        target.on('rightclick', function (e) {
+            suppressPointerDefault(e);
+            if (typeof rightClick === 'function') { rightClick(e); }
+        });
+        target.on('pointerdown', function (e) {
+            if (eventButton(e) !== 2) { return; }
+            suppressPointerDefault(e);
+            const now = (typeof Date !== 'undefined' && typeof Date.now === 'function') ? Date.now() : 0;
+            if (now - state.rightLastDown < rightDblClickDelayMs) {
+                state.rightLastDown = 0;
+                if (typeof rightDblClick === 'function') { rightDblClick(e); }
+            } else {
+                state.rightLastDown = now;
+            }
         });
         return state;
     }
@@ -886,29 +936,12 @@
         }
         if (box.__phase2EventsBound) { return; }
         box.__phase2EventsBound = true;
-        const clickDelayMs = 200;
-        const rightDblIntervalMs = 250;
-        const state = bindDoubleClickToggle(
-            box,
-            function () { engine.onGroupSelect(gid); },
-            function () { engine.onGroupToggle(gid); },
-            clickDelayMs
-        );
-        state.rightLastDown = 0;
-        box.on('rightclick', function (e) {
-            // Suppress the browser context menu for the Semantic-Zoom right
-            // double-click gesture.  Pixi v8 federated events expose the
-            // underlying DOM event via ``nativeEvent``; calling
-            // ``preventDefault`` only on the federated event is not always
-            // enough to stop the OS menu, so we cancel the native event too.
-            if (e && e.nativeEvent && typeof e.nativeEvent.preventDefault === 'function') { e.nativeEvent.preventDefault(); }
-            if (e && typeof e.preventDefault === 'function') { e.preventDefault(); }
-        });
-        box.on('pointerdown', function (e) {
-            if (!e || e.button !== 2) { return; }
-            const now = (typeof Date !== 'undefined' && typeof Date.now === 'function') ? Date.now() : 0;
-            if (now - state.rightLastDown < rightDblIntervalMs) {
-                state.rightLastDown = 0;
+        bindPointerGestures(box, {
+            leftClick: function (e) { void e; engine.onGroupSelect(gid); },
+            leftDblClick: function (e) { void e; engine.onGroupToggle(gid); },
+            rightClick: null,
+            rightDblClick: function (e) {
+                void e;
                 // Step 5: right-button double click on a group box drives the
                 // Semantic Zoom drill-down protocol.  Behaviour:
                 //   - if ``focusStackRef`` already has this gid as its current
@@ -925,8 +958,6 @@
                 } else {
                     engine.onEnterFocus(gid);
                 }
-            } else {
-                state.rightLastDown = now;
             }
         });
     }
@@ -954,9 +985,14 @@
         }
         if (target.__ioGroupToggleBound) { return; }
         target.__ioGroupToggleBound = true;
-        bindDoubleClickToggle(target, null, function () {
-            toggleIOGroup(ioGroupId);
-        }, 200);
+        bindPointerGestures(target, {
+            leftClick: null,
+            leftDblClick: function () {
+                toggleIOGroup(ioGroupId);
+            },
+            rightClick: null,
+            rightDblClick: null
+        });
     }
 
     // ── EdgeRoute (pure geometry) ──────────────────────────────────────────
