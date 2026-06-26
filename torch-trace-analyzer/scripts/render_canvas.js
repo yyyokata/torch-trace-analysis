@@ -2662,7 +2662,7 @@
         // path (including focus exit, where ``lastFocusSubtreeIds`` is null)
         // use the full renderable bounds with the normal 1.0 cap so the graph
         // is never enlarged past native size.
-        const FOCUS_MAX_SCALE = 2.0;
+        const FOCUS_MAX_SCALE = 1.5;
         const focusActive = Array.isArray(engine.focusStackRef) && engine.focusStackRef.length > 0;
         let fitBounds = null;
         let fitMaxScale = 1.0;
