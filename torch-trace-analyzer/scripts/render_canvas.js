@@ -909,17 +909,13 @@
         });
         target.on('rightclick', function (e) {
             suppressPointerDefault(e);
-            if (typeof rightClick === 'function') { rightClick(e); }
-        });
-        target.on('pointerdown', function (e) {
-            if (eventButton(e) !== 2) { return; }
-            suppressPointerDefault(e);
             const now = (typeof Date !== 'undefined' && typeof Date.now === 'function') ? Date.now() : 0;
             if (now - state.rightLastDown < rightDblClickDelayMs) {
                 state.rightLastDown = 0;
                 if (typeof rightDblClick === 'function') { rightDblClick(e); }
             } else {
                 state.rightLastDown = now;
+                if (typeof rightClick === 'function') { rightClick(e); }
             }
         });
         return state;
@@ -2701,7 +2697,10 @@
         engine.contentBounds = fitBounds;
         const containerSize = resolveContainerSize('auto-fit');
         const cw = containerSize.w;
-        const ch = containerSize.h;
+        const viewportH = (typeof global !== 'undefined' && global && typeof global.innerHeight === 'number' && global.innerHeight > 0)
+            ? global.innerHeight
+            : null;
+        const ch = (viewportH !== null) ? viewportH : containerSize.h;
         const FIT_PADDING = 40;
         const vp = engine.viewportController.fitToView(fitBounds, cw, ch, { padding: FIT_PADDING, maxScale: fitMaxScale });
         // Width-only fit: the canvas width fills the container so there is no

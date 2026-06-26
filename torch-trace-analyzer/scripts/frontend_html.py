@@ -2644,12 +2644,20 @@ def _generate_flowchart_html_multi(tabs: dict[str, list[dict]]) -> str:
         "}\n"
         "function activateL1(mode) {\n"
         "    ACTIVE_L1 = mode;\n"
+        "    if (focusStack.length > 0) {\n"
+        "        focusStack.length = 0;\n"
+        "        renderBreadcrumb();\n"
+        "    }\n"
         "    switchDataset(ALL_TAB_DATA[ACTIVE_L1][ACTIVE_L2[ACTIVE_L1]]);\n"
         "    if (typeof refreshTopbarCapsules === 'function') { refreshTopbarCapsules(); }\n"
         "}\n"
         "function activateL2(mode, idx) {\n"
         "    ACTIVE_L2[mode] = idx;\n"
         "    if (mode === ACTIVE_L1) {\n"
+        "        if (focusStack.length > 0) {\n"
+        "            focusStack.length = 0;\n"
+        "            renderBreadcrumb();\n"
+        "        }\n"
         "        switchDataset(ALL_TAB_DATA[ACTIVE_L1][ACTIVE_L2[ACTIVE_L1]]);\n"
         "    }\n"
         "    if (typeof refreshTopbarCapsules === 'function') { refreshTopbarCapsules(); }\n"
@@ -2782,6 +2790,10 @@ def _generate_flowchart_html_dual(data_train, data_infer):
         '  function activateTab(mode){\n'
         '    var nextData = (mode === "infer") ? DATA_INFER : DATA_TRAIN;\n'
         '    if (DATA === nextData) return;\n'
+        '    if (focusStack.length > 0) {\n'
+        '      focusStack.length = 0;\n'
+        '      renderBreadcrumb();\n'
+        '    }\n'
         '    _resetSharedState();\n'
         '    DATA = nextData;\n'
         '    _ensureDagShell();\n'
