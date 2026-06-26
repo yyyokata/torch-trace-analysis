@@ -261,10 +261,10 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
     text-align: center;
 }
 .scale-bar {
-    position: absolute;
-    left: 18px;
-    bottom: 18px;
-    z-index: 12;
+    position: fixed;
+    left: 16px;
+    bottom: 16px;
+    z-index: 9999;
     min-width: 116px;
     padding: 8px 10px;
     border-radius: 9px;
@@ -319,10 +319,6 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
             </div>
         </span>
     </div>
-</div>
-<div id="scale-bar" class="scale-bar" aria-label="Scale Bar">
-    <div class="scale-bar-track" id="scale-bar-track"></div>
-    <div class="scale-bar-value" id="scale-bar-value">100%</div>
 </div>
 <div class="dag-container" id="dag-container">
     <div id="dag-stage" class="dag-stage"></div>
@@ -2304,16 +2300,16 @@ document.addEventListener('keydown', (e) => {
     const panStep = e.shiftKey ? 96 : 48;
     const zoomFactor = 1.12;
     if (e.key === 'w' || e.key === 'W' || e.key === 'ArrowUp') {
-        window.__canvasPan(0, panStep);
+        window.__canvasPan && window.__canvasPan(0, -panStep);
         handled = true;
     } else if (e.key === 's' || e.key === 'S' || e.key === 'ArrowDown') {
-        window.__canvasPan(0, -panStep);
+        window.__canvasPan && window.__canvasPan(0, panStep);
         handled = true;
     } else if (e.key === 'a' || e.key === 'A' || e.key === 'ArrowLeft') {
-        window.__canvasPan(panStep, 0);
+        window.__canvasPan && window.__canvasPan(-panStep, 0);
         handled = true;
     } else if (e.key === 'd' || e.key === 'D' || e.key === 'ArrowRight') {
-        window.__canvasPan(-panStep, 0);
+        window.__canvasPan && window.__canvasPan(panStep, 0);
         handled = true;
     } else if (e.key === 'q' || e.key === 'Q') {
         window.__canvasZoom(1 / zoomFactor, 0.05, 8);
@@ -2590,6 +2586,10 @@ function refreshTopbarCapsules() {
     }
 })();
 </script>
+<div id="scale-bar" class="scale-bar" aria-label="Scale Bar">
+    <div class="scale-bar-track" id="scale-bar-track"></div>
+    <div class="scale-bar-value" id="scale-bar-value">100%</div>
+</div>
 </body>
 </html>"""
 
