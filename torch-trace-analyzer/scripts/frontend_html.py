@@ -106,6 +106,9 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 .side-panel-subtitle { font-size: 10px; color: #8892b0; margin-top: 3px; font-family: monospace; word-break: break-all; }
 .side-panel-close { background: none; border: none; color: #8892b0; font-size: 22px; cursor: pointer; padding: 0 6px; line-height: 1; }
 .side-panel-close:hover { color: #fff; }
+.side-panel-focus { background: rgba(100,181,246,0.15); border: 1px solid rgba(100,181,246,0.4); color: #64b5f6; border-radius: 4px; padding: 3px 8px; font-size: 11px; cursor: pointer; }
+.side-panel-focus:hover { background: rgba(100,181,246,0.3); }
+.side-panel-focus.hidden { display: none; }
 .side-panel-body { flex: 1 1 auto; overflow: auto; padding: 12px 0; }
 .side-panel-section { margin-bottom: 14px; }
 .side-panel-section h4 { font-size: 11px; color: #8892b0; padding: 0 18px 6px; text-transform: uppercase; letter-spacing: 0.5px; }
@@ -254,6 +257,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
             <div class="side-panel-title" id="sp-title">—</div>
             <div class="side-panel-subtitle" id="sp-subtitle"></div>
         </div>
+        <button class="side-panel-focus hidden" id="sp-focus" title="进入 Semantic Zoom">⊕ Focus</button>
         <button class="side-panel-close" id="sp-close" title="Close">×</button>
     </div>
     <div class="side-panel-body" id="sp-body"></div>
@@ -1668,7 +1672,14 @@ if (typeof window !== 'undefined') {
         }
         const engine = (typeof window.__canvasEnginePhase1 === 'function') ? window.__canvasEnginePhase1() : null;
         if (engine) { engine.selectedGroupId = gid; }
-        showGroupPanel(g);
+        showSourcePanel(g);
+    };
+    window.__canvasOnNodeSelect = function (nid) {
+        const n = nodeMap[nid];
+        if (!n) {
+            throw new Error('__canvasOnNodeSelect: unknown node id ' + nid);
+        }
+        showSourcePanel(n);
     };
 }
 
@@ -1794,7 +1805,7 @@ function enterFocus(gid) {
     // exited.  Leaf groups therefore only surface their side panel (acting as a
     // plain selection); they never push the focus stack or cascade-expand.
     if (((g.children_group_ids || []).length) === 0) {
-        showGroupPanel(g);
+        showSourcePanel(g);
         return;
     }
     cascadeExpandSubtree(gid);
@@ -1826,6 +1837,18 @@ function setFocusToDepth(depth) {
     focusStack.length = depth;
     renderBreadcrumb();
     invokeIncrementalRender({ reason: 'focus-jump', depth: depth });
+}
+
+// ``_clearFocusStack()`` resets Semantic Zoom back to the full graph in one
+// step (used by the active-tab capsule click and same-tab re-activation).  A
+// no-op when not focused so the callers stay trivially idempotent.  Routes
+// through the Phase-2 incremental path — never the legacy full ``invokeRender``.
+function _clearFocusStack() {
+    if (focusStack.length > 0) {
+        focusStack.length = 0;
+        renderBreadcrumb();
+        invokeIncrementalRender({ reason: 'focus-clear' });
+    }
 }
 
 // ``__focusNowMs()`` is a monotonic-ish millisecond clock used by the right
@@ -2066,6 +2089,22 @@ function showSourcePanel(g) {
         `).join('');
     }
     body.innerHTML = bodyHtml;
+
+    // Focus button: only a *group* with nested child groups can be drilled into
+    // via Semantic Zoom.  Leaf groups and plain nodes hide the button.  Driven
+    // off ``groupMap`` so a node never shows it.  A missing button element is
+    // tolerated because the panel header is optional chrome.
+    const focusBtn = document.getElementById('sp-focus');
+    if (focusBtn) {
+        const asGroup = (g && g.id != null) ? groupMap[g.id] : null;
+        if (asGroup && ((asGroup.children_group_ids || []).length) > 0) {
+            focusBtn.classList.remove('hidden');
+            focusBtn.onclick = function () { enterFocus(String(asGroup.id)); };
+        } else {
+            focusBtn.classList.add('hidden');
+            focusBtn.onclick = null;
+        }
+    }
     sp.classList.add('open');
 }
 
@@ -2165,6 +2204,8 @@ function showEdgePanel(edge) {
 
 document.getElementById('sp-close').addEventListener('click', () => {
     document.getElementById('side-panel').classList.remove('open');
+    const focusBtn = document.getElementById('sp-focus');
+    if (focusBtn) { focusBtn.classList.add('hidden'); focusBtn.onclick = null; }
 });
 document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
@@ -2349,9 +2390,11 @@ function refreshTopbarCapsules() {
                 });
             };
         } else {
-            // single-runstep base page: nothing to switch.
+            // single-runstep base page: nothing to switch — but clicking the
+            // active capsule still exits Semantic Zoom (resets focusStack) so
+            // the user always has a one-click way back to the full graph.
             modeCap.classList.add('tb-capsule-disabled');
-            modeCap.onclick = null;
+            modeCap.onclick = function () { _clearFocusStack(); };
         }
     }
     // L2 (runstep) capsule.  Problem 5 root-cause fix: every branch must set the
@@ -2378,9 +2421,10 @@ function refreshTopbarCapsules() {
             }
         } else {
             // dual (Training/Inference only) and single-runstep base page: there
-            // is no runstep switcher, so the capsule is always disabled and inert.
+            // is no runstep switcher, so the capsule is inert for switching — but
+            // a click still exits Semantic Zoom (resets focusStack).
             runCap.classList.add('tb-capsule-disabled');
-            runCap.onclick = null;
+            runCap.onclick = function () { _clearFocusStack(); };
         }
     }
 }
@@ -2664,7 +2708,11 @@ def _generate_flowchart_html_multi(tabs: dict[str, list[dict]]) -> str:
         "}\n"
         "function switchDataset(nextTabEntry) {\n"
         "    var nextData = _resolveTabPayload(nextTabEntry);\n"
-        "    if (DATA === nextData) return;\n"
+        "    if (DATA === nextData) {\n"
+        "        // same tab re-selected: keep the data, but exit Semantic Zoom.\n"
+        "        if (typeof _clearFocusStack === 'function') { _clearFocusStack(); }\n"
+        "        return;\n"
+        "    }\n"
         "    _resetSharedState();\n"
         "    DATA = nextData;\n"
         "    if (DATA && DATA.error) {\n"
@@ -2789,7 +2837,11 @@ def _generate_flowchart_html_dual(data_train, data_infer):
         '  }\n'
         '  function activateTab(mode){\n'
         '    var nextData = (mode === "infer") ? DATA_INFER : DATA_TRAIN;\n'
-        '    if (DATA === nextData) return;\n'
+        '    if (DATA === nextData) {\n'
+        '      // same tab re-clicked: keep the data, but exit Semantic Zoom.\n'
+        '      if (typeof _clearFocusStack === "function") { _clearFocusStack(); }\n'
+        '      return;\n'
+        '    }\n'
         '    if (focusStack.length > 0) {\n'
         '      focusStack.length = 0;\n'
         '      renderBreadcrumb();\n'

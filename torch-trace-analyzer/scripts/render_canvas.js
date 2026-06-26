@@ -42,7 +42,6 @@
         nodeSub:     { fontFamily: 'Menlo, Consolas, monospace', fontSize: 10, fill: 0xcfe3ff },
         groupHeader: { fontFamily: 'Menlo, Consolas, monospace', fontSize: 13, fontWeight: '700', fill: 0xffffff },
         groupTiming: { fontFamily: 'Menlo, Consolas, monospace', fontSize: 10, fill: 0xffe08a },
-        info:        { fontFamily: 'Menlo, Consolas, monospace', fontSize: 11, fontWeight: '700', fill: 0xffffff },
         ioTitle:     { fontFamily: 'Menlo, Consolas, monospace', fontSize: 11, fontWeight: '600', fill: 0xffffff },
         ioSub:       { fontFamily: 'Menlo, Consolas, monospace', fontSize: 9, fill: 0xeafff0 }
     };
@@ -323,21 +322,15 @@
             }
             global.__canvasOnGroupSelect(gid);
         };
-        // Step 5: right-button double click on a group box enters Semantic
-        // Zoom (drill-down focus).  The inline runtime owns ``focusStack`` /
-        // ``collapsedState`` and exposes ``window.__canvasOnEnterFocus`` /
-        // ``window.__canvasOnExitFocus`` for the engine to call back into.
-        built.onEnterFocus = function (gid) {
-            if (typeof global.__canvasOnEnterFocus !== 'function') {
-                throw new Error('render_canvas.js: window.__canvasOnEnterFocus is not wired by inline runtime');
+        // Leaf node single click → show the source/evidence panel.  Forwarded to
+        // the inline-runtime ``window.__canvasOnNodeSelect`` at call time (same
+        // late-binding contract as ``onGroupSelect``).  No silent fallback: a
+        // missing global throws hard.
+        built.onNodeSelect = function (nid) {
+            if (typeof global.__canvasOnNodeSelect !== 'function') {
+                throw new Error('render_canvas.js: window.__canvasOnNodeSelect is not wired by inline runtime');
             }
-            global.__canvasOnEnterFocus(gid);
-        };
-        built.onExitFocus = function () {
-            if (typeof global.__canvasOnExitFocus !== 'function') {
-                throw new Error('render_canvas.js: window.__canvasOnExitFocus is not wired by inline runtime');
-            }
-            global.__canvasOnExitFocus();
+            global.__canvasOnNodeSelect(nid);
         };
         built.viewportController = new ViewportController(built);
         built.cullManager = new CullManager();
@@ -882,10 +875,15 @@
         const rightDblClickDelayMs = (rightDelay !== null && rightDelay > 0) ? rightDelay : 250;
         target.eventMode = 'static';
         target.cursor = 'pointer';
-        const state = { leftClickTimer: null, leftLastClickTime: 0, rightLastDown: 0 };
+        const state = { leftClickTimer: null, leftLastClickTime: 0, rightLastDown: 0, lastRightClickAt: 0 };
         target.on('click', function (e) {
             const btn = eventButton(e);
             if (btn !== null && btn !== 0) { return; }
+            // Pixi v8 fires an extra `click` (button=0) on right-mouse-up right after
+            // the `rightclick` event.  Guard against it: if a rightclick fired within
+            // the last 120ms, this click is a Pixi artefact — skip it.
+            const nowMs = (typeof Date !== 'undefined' && typeof Date.now === 'function') ? Date.now() : 0;
+            if (state.lastRightClickAt > 0 && (nowMs - state.lastRightClickAt) < 120) { return; }
             suppressPointerDefault(e);
             const now = (typeof Date !== 'undefined' && typeof Date.now === 'function') ? Date.now() : 0;
             const isDoubleClick = state.leftLastClickTime > 0 && (now - state.leftLastClickTime) <= leftDblClickDelayMs;
@@ -910,6 +908,9 @@
         target.on('rightclick', function (e) {
             suppressPointerDefault(e);
             const now = (typeof Date !== 'undefined' && typeof Date.now === 'function') ? Date.now() : 0;
+            // Always stamp lastRightClickAt so the click-guard above can suppress the
+            // artefact `click(button=0)` that Pixi v8 fires on right-mouse-up.
+            state.lastRightClickAt = now;
             if (now - state.rightLastDown < rightDblClickDelayMs) {
                 state.rightLastDown = 0;
                 if (typeof rightDblClick === 'function') { rightDblClick(e); }
@@ -928,28 +929,36 @@
         if (box.__phase2EventsBound) { return; }
         box.__phase2EventsBound = true;
         bindPointerGestures(box, {
+            // Left single click → show the source/evidence panel.
+            // Left double click → collapse/expand the group.
+            // Right click carries NO business logic any more: Semantic Zoom is
+            // entered via the data-panel "Focus" button and exited via ESC /
+            // breadcrumb / the stage-level contextmenu guard.  The ``rightclick``
+            // handler inside bindPointerGestures still fires to suppress the
+            // browser context menu and to swallow the artefact left-``click``
+            // Pixi v8 emits on right-mouse-up — but it invokes no callback here.
             leftClick: function (e) { void e; engine.onGroupSelect(gid); },
             leftDblClick: function (e) { void e; engine.onGroupToggle(gid); },
             rightClick: null,
-            rightDblClick: function (e) {
-                void e;
-                // Step 5: right-button double click on a group box drives the
-                // Semantic Zoom drill-down protocol.  Behaviour:
-                //   - if ``focusStackRef`` already has this gid as its current
-                //     top, treat the second right-dblclick as "exit one level"
-                //     (per design §6.2: "focus 态下再次右键双击当前层 group →
-                //     弹栈一级").
-                //   - otherwise, push a new focus level via onEnterFocus.
-                const stack = engine.focusStackRef;
-                const topId = (Array.isArray(stack) && stack.length > 0)
-                    ? String(stack[stack.length - 1])
-                    : null;
-                if (topId !== null && topId === String(gid)) {
-                    engine.onExitFocus();
-                } else {
-                    engine.onEnterFocus(gid);
-                }
-            }
+            rightDblClick: null
+        });
+    }
+
+    // Phase 2: bind a *single* left-click handler to a leaf node hit box so a
+    // click opens the source/evidence panel.  Idempotent (second call on the
+    // same box is a no-op).  Nodes have no double-click / right-click gesture —
+    // only ``onNodeSelect``.  Mirrors ``bindGroupBox`` but with just leftClick.
+    function bindNodeBox(nid, box) {
+        if (!box) {
+            throw new Error('render_canvas.js: bindNodeBox missing box for node ' + nid);
+        }
+        if (box.__phase2NodeEventsBound) { return; }
+        box.__phase2NodeEventsBound = true;
+        bindPointerGestures(box, {
+            leftClick: function (e) { void e; engine.onNodeSelect(nid); },
+            leftDblClick: null,
+            rightClick: null,
+            rightDblClick: null
         });
     }
 
@@ -1470,7 +1479,7 @@
     // hand in fully-populated snapshots and ``diffAndPatch()`` will throw if
     // any field is missing (no silent default fill, no fallback).
     const NODE_SNAPSHOT_FIELDS  = ['x', 'y', 'w', 'h', 'label', 'sublabel', 'fill', 'stroke', 'alpha'];
-    const GROUP_SNAPSHOT_FIELDS = ['x', 'y', 'w', 'h', 'label', 'collapsed', 'fill', 'alpha', 'hasInfo', 'hasTiming', 'timingText'];
+    const GROUP_SNAPSHOT_FIELDS = ['x', 'y', 'w', 'h', 'label', 'collapsed', 'fill', 'alpha', 'hasTiming', 'timingText'];
     const EDGE_SNAPSHOT_FIELDS  = ['srcId', 'dstId', 'stroke', 'strokeWidth', 'alpha', 'dashed', 'arrowAlpha'];
 
     function requireSnapshotFields(kind, id, snapshot, fields) {
@@ -1490,8 +1499,13 @@
         root.name = 'node-view:' + id;
         root.visible = false;
         const box = makeGraphics('node-box:' + id);
+        // Phase 2: leaf nodes are clickable — a left click opens the
+        // source/evidence panel via ``engine.onNodeSelect``.  ``bindNodeBox``
+        // flips ``eventMode='static'`` and idempotently registers the listener.
+        box.eventMode = 'static';
         root.addChild(box);
         engine.layers.l3.addChild(root);
+        bindNodeBox(id, box);
         return {
             id: String(id),
             root: root,
@@ -1524,8 +1538,6 @@
             box: box,
             headerText: null,
             timingTextNode: null,
-            infoGfx: null,
-            infoText: null,
             visible: false,
             interactionEnabled: false,
             snapshot: null
@@ -1631,16 +1643,15 @@
             });
             view.box.roundRect(0, 0, snapshot.w, 26, 8).fill({ color: gc, alpha: 0.35 }); // header bar
         }
-        // Header / info-'i' / timing glyphs are culled (the box + the info circle
-        // graphic are always drawn).  Mirrors the legacy draw path which always
-        // painted the container chrome but only created the text labels for
-        // on-screen groups.
+        // Header / timing glyphs are culled (the box chrome is always drawn).
+        // Mirrors the legacy draw path which always painted the container chrome
+        // but only created the text labels for on-screen groups.
         const showLabels = shouldCreateLabel({ x: snapshot.x, y: snapshot.y, w: snapshot.w, h: snapshot.h });
         // header text (lazily created, parented to view.root)
         const arrow = snapshot.collapsed ? '\u25B6 ' : '\u25BC ';
         const rightReserve = snapshot.collapsed
-            ? (snapshot.hasInfo ? 26 : 10)
-            : ((snapshot.hasInfo ? 26 : 10) + (snapshot.hasTiming ? 130 : 0));
+            ? 10
+            : (10 + (snapshot.hasTiming ? 130 : 0));
         const headerChars = maxCharsForWidth(snapshot.w - 10 - rightReserve, 7.8, 0) - 2;
         if (showLabels) {
             if (!view.headerText) {
@@ -1656,33 +1667,6 @@
                 snapshot.x + 10, snapshot.y + (snapshot.collapsed ? 15 : 13));
         } else if (view.headerText) {
             view.headerText.visible = false;
-        }
-        // info badge: the circle graphic is always drawn when hasInfo; the 'i'
-        // text glyph is culled like the other labels.
-        if (snapshot.hasInfo) {
-            if (!view.infoGfx) {
-                view.infoGfx = makeGraphics('group-info-hit:' + view.id);
-                view.root.addChild(view.infoGfx);
-            }
-            view.infoGfx.clear();
-            view.infoGfx.circle(snapshot.w - 13, 13, 8).fill({ color: 0x000000, alpha: 0.35 }).stroke({ color: 0xffffff, width: 1, alpha: 0.6 });
-            view.infoGfx.visible = true;
-            if (showLabels) {
-                if (!view.infoText) {
-                    view.infoText = makeText('i', 'group-info:' + view.id, TEXT_STYLE.info);
-                    view.root.addChild(view.infoText);
-                }
-                view.infoText.anchor.set(0.5, 0.5);
-                view.infoText.x = snapshot.w - 13;
-                view.infoText.y = 13;
-                view.infoText.visible = true;
-                registerSceneLabel('group-info:' + view.id, snapshot.x + snapshot.w - 13, snapshot.y + 13);
-            } else if (view.infoText) {
-                view.infoText.visible = false;
-            }
-        } else {
-            if (view.infoGfx) { view.infoGfx.visible = false; }
-            if (view.infoText) { view.infoText.visible = false; }
         }
         // timing text (lazily created, parented to view.root)
         if (snapshot.hasTiming && showLabels) {
@@ -2021,7 +2005,6 @@
         requireFiniteXYWH('group', g.id, groupMeta);
         const groupColor = nodeColorOf(g);
         const hasTiming = !!g.has_timing;
-        const hasInfo = !!g.src_file;
         return {
             id: g.id,
             x: groupMeta.x, y: groupMeta.y, w: groupMeta.w, h: groupMeta.h,
@@ -2029,7 +2012,6 @@
             collapsed: collapsed[g.id] === true,
             fill: groupColor,
             alpha: 1.0,
-            hasInfo: hasInfo,
             hasTiming: hasTiming,
             timingText: hasTiming ? ('Kernel ' + g.pct.toFixed(1) + '% \u00B7 ' + formatDurOf(g.dur_us)) : ''
         };
@@ -3071,7 +3053,7 @@
             const s = view.snapshot;
             groups.push({
                 id: s.id, collapsed: s.collapsed, x: s.x, y: s.y, w: s.w, h: s.h,
-                has_header: !s.collapsed, has_info: s.hasInfo, has_timing: s.hasTiming
+                has_header: !s.collapsed, has_timing: s.hasTiming
             });
         });
         const edges = [];
@@ -3112,7 +3094,7 @@
                 return { id: n.id, x: n.x, y: n.y, w: n.w, h: n.h, color: n.color, label: n.label, sublabel: n.sublabel, visible: n.visible };
             }),
             groups: (engine.groups || []).map(function (g) {
-                return { id: g.id, collapsed: g.collapsed, x: g.x, y: g.y, w: g.w, h: g.h, has_header: g.has_header, has_info: g.has_info, has_timing: g.has_timing };
+                return { id: g.id, collapsed: g.collapsed, x: g.x, y: g.y, w: g.w, h: g.h, has_header: g.has_header, has_timing: g.has_timing };
             }),
             edges: (engine.edges || []).map(function (e) {
                 return {
