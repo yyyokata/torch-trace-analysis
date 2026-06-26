@@ -613,6 +613,9 @@
         engine.world.scale.y = engine.viewport.scale;
         engine.world.x = engine.viewport.x;
         engine.world.y = engine.viewport.y;
+        if (typeof global.__onViewportUpdate === 'function') {
+            global.__onViewportUpdate(engine.viewport.scale);
+        }
     }
 
     function normalizeWorldBounds(worldBounds) {
@@ -3160,6 +3163,26 @@
     global.__canvasInvokeIncrementalRender = function () {
         ensureEngine();
         invokeIncrementalRender();
+    };
+    global.__canvasPan = function (dx, dy) {
+        ensureEngine();
+        engine.viewport.x += dx;
+        engine.viewport.y += dy;
+        applyViewport();
+    };
+    global.__canvasZoom = function (factor, minScale, maxScale) {
+        ensureEngine();
+        const cw = (engine.lastKnownContainerW || 800);
+        const ch = (engine.lastKnownContainerH || 600);
+        const newScale = Math.max(minScale, Math.min(maxScale, engine.viewport.scale * factor));
+        // zoom anchored at viewport center
+        const cx = cw / 2;
+        const cy = ch / 2;
+        const ratio = newScale / engine.viewport.scale;
+        engine.viewport.x = cx - (cx - engine.viewport.x) * ratio;
+        engine.viewport.y = cy - (cy - engine.viewport.y) * ratio;
+        engine.viewport.scale = newScale;
+        applyViewport();
     };
     // Phase 2 step 3: ``__canvasGetGroupBox`` returns the live group hit box
     // (Graphics) for a given gid, regardless of whether the legacy walkGroup

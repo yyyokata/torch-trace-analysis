@@ -221,6 +221,70 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 .iter14-render-progress-overlay.failed .iter14-render-progress-bar {
     background: linear-gradient(90deg, #ff6b6b, #ff8e53);
 }
+.help-popup-wrap {
+    position: relative;
+    display: inline-flex;
+}
+.help-popup {
+    position: absolute;
+    top: 34px;
+    right: 0;
+    z-index: 40;
+    width: 260px;
+    padding: 12px 14px;
+    border-radius: 10px;
+    border: 1px solid rgba(255,255,255,0.12);
+    background: #16213e;
+    color: #e7eefc;
+    box-shadow: 0 16px 48px rgba(0,0,0,0.38);
+    font-size: 12px;
+    line-height: 1.6;
+    display: none;
+}
+.help-popup.open {
+    display: block;
+}
+.help-popup-title {
+    font-weight: 700;
+    color: #ffffff;
+    margin-bottom: 6px;
+}
+.help-popup kbd {
+    display: inline-block;
+    min-width: 18px;
+    padding: 1px 5px;
+    border-radius: 4px;
+    border: 1px solid rgba(255,255,255,0.18);
+    background: rgba(255,255,255,0.08);
+    color: #ffffff;
+    font-family: Menlo, Consolas, monospace;
+    text-align: center;
+}
+.scale-bar {
+    position: absolute;
+    left: 18px;
+    bottom: 18px;
+    z-index: 12;
+    min-width: 116px;
+    padding: 8px 10px;
+    border-radius: 9px;
+    border: 1px solid rgba(255,255,255,0.12);
+    background: #16213e;
+    color: #dbe8ff;
+    font-size: 11px;
+    box-shadow: 0 10px 28px rgba(0,0,0,0.28);
+    pointer-events: none;
+}
+.scale-bar-track {
+    width: 88px;
+    height: 4px;
+    border-radius: 999px;
+    background: #64b5f6;
+    margin-bottom: 5px;
+}
+.scale-bar-value {
+    font-variant-numeric: tabular-nums;
+}
 </style>
 </head>
 <body>
@@ -245,7 +309,20 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
             <span class="tb-legend-item"><span class="tb-legend-sq" style="background:#c77a3c"></span>Depth3+</span>
             <span class="tb-legend-item"><span class="tb-legend-dep">━▶</span>dep</span>
         </span>
+        <span class="help-popup-wrap">
+            <button id="btn-help" class="tb-btn" type="button" aria-expanded="false" aria-controls="help-popup">⌨ Help</button>
+            <div id="help-popup" class="help-popup" role="dialog" aria-label="Canvas 操作说明">
+                <div class="help-popup-title">Canvas 操作说明</div>
+                <div><kbd>W</kbd>/<kbd>A</kbd>/<kbd>S</kbd>/<kbd>D</kbd> 或方向键：平移视图</div>
+                <div><kbd>Q</kbd>/<kbd>E</kbd>：缩小 / 放大</div>
+                <div><kbd>Esc</kbd>：退出 Semantic Zoom 或关闭侧栏</div>
+            </div>
+        </span>
     </div>
+</div>
+<div id="scale-bar" class="scale-bar" aria-label="Scale Bar">
+    <div class="scale-bar-track" id="scale-bar-track"></div>
+    <div class="scale-bar-value" id="scale-bar-value">100%</div>
 </div>
 <div class="dag-container" id="dag-container">
     <div id="dag-stage" class="dag-stage"></div>
@@ -2219,8 +2296,56 @@ document.addEventListener('keydown', (e) => {
             return;
         }
         document.getElementById('side-panel').classList.remove('open');
+        return;
+    }
+    const tag = e.target && e.target.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') { return; }
+    let handled = false;
+    const panStep = e.shiftKey ? 96 : 48;
+    const zoomFactor = 1.12;
+    if (e.key === 'w' || e.key === 'W' || e.key === 'ArrowUp') {
+        window.__canvasPan(0, panStep);
+        handled = true;
+    } else if (e.key === 's' || e.key === 'S' || e.key === 'ArrowDown') {
+        window.__canvasPan(0, -panStep);
+        handled = true;
+    } else if (e.key === 'a' || e.key === 'A' || e.key === 'ArrowLeft') {
+        window.__canvasPan(panStep, 0);
+        handled = true;
+    } else if (e.key === 'd' || e.key === 'D' || e.key === 'ArrowRight') {
+        window.__canvasPan(-panStep, 0);
+        handled = true;
+    } else if (e.key === 'q' || e.key === 'Q') {
+        window.__canvasZoom(1 / zoomFactor, 0.05, 8);
+        handled = true;
+    } else if (e.key === 'e' || e.key === 'E') {
+        window.__canvasZoom(zoomFactor, 0.05, 8);
+        handled = true;
+    }
+    if (handled) {
+        e.preventDefault();
     }
 });
+(function bindHelpPopupAndScaleBar() {
+    const btn = document.getElementById('btn-help');
+    const popup = document.getElementById('help-popup');
+    if (!btn || !popup) { return; }
+    btn.addEventListener('click', function () {
+        const open = !popup.classList.contains('open');
+        popup.classList.toggle('open', open);
+        btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+    });
+    function updateScaleBar(scale) {
+        const val = document.getElementById('scale-bar-value');
+        const fill = document.getElementById('scale-bar-track');
+        if (!val || !fill) { return; }
+        const pct = Math.round(scale * 100);
+        val.textContent = pct + '%';
+        fill.style.width = Math.max(24, Math.min(140, 88 * scale)) + 'px';
+    }
+    window.__onViewportUpdate = updateScaleBar;
+    updateScaleBar(1);
+})();
 
 // Phase 2 step 5 — Semantic Zoom: the right double-click drill-down gesture
 // happens on the Pixi canvas, which lives inside #dag-stage.  Browsers fire a
