@@ -61,7 +61,7 @@ def _normalize_containers_recursive(
         node = registry[node_id]
         if not isinstance(node, ModuleNode) or node.inner_dag is None:
             continue
-        if node.metadata.get("is_synthetic"):
+        if node.metadata.get("synthetic_type") == "function_group":
             continue
         child_scope_frames_prefix = ("forward",)
         _skip_grouping = node.metadata.get("is_container", False) or node.is_native
@@ -152,10 +152,10 @@ def _normalize_single_dag(
         dag, registry, owner_node_id=owner_node_id, global_edges=global_edges
     )
 
-    if allow_function_grouping:
-        _apply_function_grouping_a(dag, registry, scope_frames_prefix=scope_frames_prefix)
     if allow_callloc_grouping:
         _apply_function_grouping_b(dag, registry, parent_func=scope_frames_prefix[-1])
+    if allow_function_grouping:
+        _apply_function_grouping_a(dag, registry, scope_frames_prefix=scope_frames_prefix)
 
 
 def _is_container_node(node: DagNode) -> bool:
