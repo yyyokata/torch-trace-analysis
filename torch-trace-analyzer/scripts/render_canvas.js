@@ -1396,6 +1396,28 @@
         g.stroke({ width: IO_EDGE_DOT_RING_WIDTH, color: IO_EDGE_DOT_RING_COLOR, alpha: 1 });
     }
 
+    function edgeDrawStyle(snapshot) {
+        return {
+            color: snapshot.stroke,
+            width: snapshot.strokeWidth,
+            alpha: snapshot.alpha,
+            arrowAlpha: snapshot.arrowAlpha,
+            dashed: snapshot.dashed
+        };
+    }
+
+    function drawTruncatedEdgePath(g, routePoints, style, isIO) {
+        const head = takeHeadByLength(routePoints, EDGE_TRUNCATE_HEAD);
+        const tail = takeTailByLength(routePoints, EDGE_TRUNCATE_TAIL);
+        strokePolyline(g, head, style);
+        strokePolyline(g, tail, style);
+        drawArrowHead(g, tail, style);
+        if (isIO === true) {
+            drawIOEdgeDot(g, head[head.length - 1], style);
+            drawIOEdgeDot(g, tail[0], style);
+        }
+    }
+
     function drawEdgeHitBands(g, points, width) {
         if (!points || points.length < 2) {
             throw new Error('render_canvas.js: drawEdgeHitBands requires at least 2 points');
@@ -1926,13 +1948,7 @@
         // route is null only for a degenerate span; computeVisibleScene already
         // drops such edges, so this is defensive: clear-only, never draw garbage.
         if (route) {
-            const style = {
-                color: snapshot.stroke,
-                width: snapshot.strokeWidth,
-                alpha: snapshot.alpha,
-                arrowAlpha: snapshot.arrowAlpha,
-                dashed: snapshot.dashed
-            };
+            const style = edgeDrawStyle(snapshot);
             if (interactive) {
                 drawEdgeHitBands(view.hitArea, route.points, EDGE_HIT_WIDTH);
             }
@@ -1944,17 +1960,7 @@
             const hovered = interactive && engine.hoveredEdgeKey === view.key;
             const truncate = snapshot.dashed === true && !hovered;
             if (truncate) {
-                const head = takeHeadByLength(route.points, EDGE_TRUNCATE_HEAD);
-                const tail = takeTailByLength(route.points, EDGE_TRUNCATE_TAIL);
-                strokePolyline(view.path, head, style);
-                strokePolyline(view.path, tail, style);
-                drawArrowHead(view.path, tail, style);
-                // IO-edge dots (Version B) sit at the stub ends: the head-stub end
-                // and the tail-stub start (both are the hidden-middle boundary).
-                if (snapshot.isIO === true) {
-                    drawIOEdgeDot(view.path, head[head.length - 1], style);
-                    drawIOEdgeDot(view.path, tail[0], style);
-                }
+                drawTruncatedEdgePath(view.path, route.points, style, snapshot.isIO === true);
             } else {
                 strokePolyline(view.path, route.points, style);
                 drawArrowHead(view.path, route.points, style);
