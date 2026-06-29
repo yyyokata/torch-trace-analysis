@@ -1870,17 +1870,6 @@ function enterFocus(gid) {
     if (focusStack.length > 0 && String(focusStack[focusStack.length - 1]) === String(gid)) {
         return;
     }
-    // Problem 2: a *leaf* group (no nested child groups) has nothing to drill
-    // into.  Pushing it onto the focus stack used to relayout its single card to
-    // fill the viewport — the reported vertical-stretch artefact — and, because
-    // the stretched card ends up fully covered by its own child nodes, left no
-    // group box for the user to right-double-click, so focus could not be
-    // exited.  Leaf groups therefore only surface their side panel (acting as a
-    // plain selection); they never push the focus stack or cascade-expand.
-    if (((g.children_group_ids || []).length) === 0) {
-        showSourcePanel(g);
-        return;
-    }
     cascadeExpandSubtree(gid);
     focusStack.push(String(gid));
     renderBreadcrumb();
@@ -2163,14 +2152,14 @@ function showSourcePanel(g) {
     }
     body.innerHTML = bodyHtml;
 
-    // Focus button: only a *group* with nested child groups can be drilled into
-    // via Semantic Zoom.  Leaf groups and plain nodes hide the button.  Driven
-    // off ``groupMap`` so a node never shows it.  A missing button element is
-    // tolerated because the panel header is optional chrome.
+    // Focus button: any existing group can be entered via Semantic Zoom,
+    // including leaf-only groups.  Driven off ``groupMap`` so a plain node never
+    // shows the button.  A missing button element is tolerated because the panel
+    // header is optional chrome.
     const focusBtn = document.getElementById('sp-focus');
     if (focusBtn) {
         const asGroup = (g && g.id != null) ? groupMap[g.id] : null;
-        if (asGroup && ((asGroup.children_group_ids || []).length) > 0) {
+        if (asGroup) {
             focusBtn.classList.remove('hidden');
             focusBtn.onclick = function () { enterFocus(String(asGroup.id)); };
         } else {
