@@ -361,6 +361,45 @@ def _absorb_into_container(
     _rebuild_adjacency(inner_dag)
 
 
+def _split_into_connected_components(
+    member_ids: list[int],
+    dag_edges,
+) -> list[list[int]]:
+    if not member_ids:
+        raise RuntimeError("member_ids must not be empty")
+    if len(set(member_ids)) != len(member_ids):
+        raise RuntimeError(f"member_ids contains duplicates: {member_ids}")
+
+    member_id_set = set(member_ids)
+    adjacency: dict[int, list[int]] = {member_id: [] for member_id in member_ids}
+    for edge in dag_edges:
+        if edge.src_id is None or edge.dst_id is None:
+            raise RuntimeError(f"edge endpoint must not be None: {edge}")
+        if edge.src_id not in member_id_set or edge.dst_id not in member_id_set:
+            continue
+        adjacency[edge.src_id].append(edge.dst_id)
+        adjacency[edge.dst_id].append(edge.src_id)
+
+    visited: set[int] = set()
+    components: list[list[int]] = []
+    for seed_id in member_ids:
+        if seed_id in visited:
+            continue
+        queue = [seed_id]
+        visited.add(seed_id)
+        component_set = {seed_id}
+        while queue:
+            current_id = queue.pop(0)
+            for next_id in adjacency[current_id]:
+                if next_id in visited:
+                    continue
+                visited.add(next_id)
+                component_set.add(next_id)
+                queue.append(next_id)
+        components.append([member_id for member_id in member_ids if member_id in component_set])
+    return components
+
+
 def _apply_function_grouping_a(
     dag: DAG,
     registry: dict[int, DagNode],
@@ -389,19 +428,24 @@ def _apply_function_grouping_a(
             for node_id in member_ids
         ):
             continue
-        new_node = _build_function_group_node(
-            dag=dag,
-            registry=registry,
-            member_ids=member_ids,
-            helper_name=helper_name,
-        )
-        dag.nodes.append(new_node.node_id)
-        dag.direct_nodes = _replace_direct_nodes_with_group(
-            dag.direct_nodes,
-            member_ids=set(member_ids),
-            group_node_id=new_node.node_id,
-        )
-        registry[new_node.node_id] = new_node
+        components = _split_into_connected_components(member_ids, dag.edges)
+        component_count = len(components)
+        for idx, component_member_ids in enumerate(components):
+            group_name = helper_name if component_count == 1 else f"{helper_name}#{idx}"
+            new_node = _build_function_group_node(
+                dag=dag,
+                registry=registry,
+                member_ids=component_member_ids,
+                helper_name=helper_name,
+                group_name=group_name,
+            )
+            dag.nodes.append(new_node.node_id)
+            dag.direct_nodes = _replace_direct_nodes_with_group(
+                dag.direct_nodes,
+                member_ids=set(component_member_ids),
+                group_node_id=new_node.node_id,
+            )
+            registry[new_node.node_id] = new_node
 
 
 def _find_a_group_helper_frame(frames: tuple) -> object | None:
@@ -425,7 +469,10 @@ def _build_function_group_node(
     registry: dict[int, DagNode],
     member_ids: list[int],
     helper_name: str,
+    group_name: str | None = None,
 ) -> ModuleNode:
+    if group_name is None:
+        group_name = helper_name
     representative_node = registry[member_ids[0]]
     frames = representative_node.call_loc.frames
     if not frames:
@@ -454,8 +501,8 @@ def _build_function_group_node(
         node_id=_next_node_id(registry),
         call_loc=representative_node.call_loc,
         attr=ModuleAttr(
-            attr_name=helper_name,
-            class_name=helper_name,
+            attr_name=group_name,
+            class_name=group_name,
             def_loc=CallLoc(file=helper_frame.file, line=helper_frame.line, col=0),
         ),
         metadata={"is_synthetic": True, "synthetic_type": "function_group"},
