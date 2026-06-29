@@ -524,116 +524,104 @@ def _apply_function_grouping_b(
     registry: dict[int, DagNode],
     parent_func: str,
 ) -> None:
-    segments: list[list[int]] = []
-    current_seg: list[int] = []
-    current_key: tuple[str, str] | None = None
-    order = list(getattr(dag, "call_order", None) or [])
-    has_functional_direct = any(
-        isinstance(registry[node_id].attr, FunctionalAttr)
-        or (isinstance(registry[node_id], ModuleNode) and registry[node_id].is_native)
+    del parent_func
+    candidate_ids = [
+        node_id
         for node_id in dag.direct_nodes
-    )
-    has_nonfunctional_direct = any(
-        not isinstance(registry[node_id].attr, FunctionalAttr)
-        and not (isinstance(registry[node_id], ModuleNode) and registry[node_id].is_native)
-        for node_id in dag.direct_nodes
-    )
-    if not order and has_functional_direct and has_nonfunctional_direct:
-        local_node_ids: set[int] = set(dag.direct_nodes)
-        seed_order: list[int] = list(dag.direct_nodes)
+        if (
+            isinstance(registry[node_id].attr, FunctionalAttr)
+            or (isinstance(registry[node_id], ModuleNode) and registry[node_id].is_native is True)
+            or registry[node_id].metadata.get("synthetic_type") == "function_group"
+        )
+    ]
+    if len(candidate_ids) < 2:
+        return
+
+    components = _split_into_connected_components(candidate_ids, dag.edges)
+    component_member_lists = [component for component in components if len(component) >= 2]
+    if not component_member_lists:
+        return
+
+    pattern_registry: dict[tuple[tuple[str, ...], tuple[tuple[int, int], ...]], str] = {}
+    pattern_counter: dict[str, int] = {}
+    original_direct_node_count = len(dag.direct_nodes)
+
+    for component_member_ids in component_member_lists:
+        if len(component_member_ids) == original_direct_node_count:
+            continue
+
+        component_member_id_set = set(component_member_ids)
+        indegree = {node_id: 0 for node_id in component_member_ids}
+        outgoing: dict[int, list[int]] = {node_id: [] for node_id in component_member_ids}
+        internal_edges: list[DataFlowEdge] = []
         for edge in dag.edges:
-            if edge.src_id not in local_node_ids:
-                local_node_ids.add(edge.src_id)
-                seed_order.append(edge.src_id)
-            if edge.dst_id not in local_node_ids:
-                local_node_ids.add(edge.dst_id)
-                seed_order.append(edge.dst_id)
-        indegree = {node_id: 0 for node_id in local_node_ids}
-        outgoing: dict[int, list[int]] = {node_id: [] for node_id in local_node_ids}
-        for edge in dag.edges:
-            if edge.src_id not in local_node_ids or edge.dst_id not in local_node_ids:
+            if edge.src_id not in component_member_id_set or edge.dst_id not in component_member_id_set:
                 continue
             outgoing[edge.src_id].append(edge.dst_id)
             indegree[edge.dst_id] += 1
-        zero_indegree = [node_id for node_id in seed_order if indegree[node_id] == 0]
+            internal_edges.append(edge)
+
+        queue = [node_id for node_id in component_member_ids if indegree[node_id] == 0]
         topo_order: list[int] = []
-        while zero_indegree:
-            node_id = zero_indegree.pop(0)
+        while queue:
+            node_id = queue.pop(0)
             topo_order.append(node_id)
             for dst_id in outgoing[node_id]:
                 indegree[dst_id] -= 1
                 if indegree[dst_id] == 0:
-                    zero_indegree.append(dst_id)
-        order = topo_order or list(dag.direct_nodes)
-    if not order:
-        order = list(dag.direct_nodes)
+                    queue.append(dst_id)
+        if len(topo_order) != len(component_member_ids):
+            raise RuntimeError(f"B-group 内发现环: component={component_member_ids}")
 
-    for node_id in order:
-        node = registry[node_id]
-        frames = node.call_loc.frames if node.call_loc is not None else ()
-        if (
-            (
-                isinstance(node.attr, FunctionalAttr)
-                or (isinstance(node, ModuleNode) and node.is_native)
-            )
-            and node.call_loc is not None
-            and frames
-        ):
-            function_name = frames[-1].function_name
-            key = (node.call_loc.file, function_name)
-            if key == current_key:
-                current_seg.append(node_id)
-            else:
-                if len(current_seg) >= 2:
-                    segments.append(current_seg)
-                current_seg = [node_id]
-                current_key = key
-        else:
-            if len(current_seg) >= 2:
-                segments.append(current_seg)
-            current_seg = []
-            current_key = None
-
-    if len(current_seg) >= 2:
-        segments.append(current_seg)
-
-    original_direct_node_count = len(dag.direct_nodes)
-    for member_ids in segments:
-        if len(member_ids) == original_direct_node_count:
-            continue
-        representative_node = registry[member_ids[0]]
-        member_id_set = set(member_ids)
-        function_name = representative_node.call_loc.frames[-1].function_name
-        lines = [registry[node_id].call_loc.line for node_id in member_ids]
-        min_line = min(lines)
-        max_line = max(lines)
-        group_name = f"{function_name}:{min_line}~{max_line}"
-        group_node = ModuleNode(
-            node_id=_next_node_id(registry),
-            call_loc=representative_node.call_loc,
-            attr=ModuleAttr(
-                attr_name=group_name,
-                class_name=group_name,
-            ),
-            metadata={"is_synthetic": True, "synthetic_type": "callloc_group"},
-            inner_dag=DAG(
-                inputs=[],
-                outputs=[],
-                nodes=member_ids.copy(),
-                edges=[
-                    edge for edge in dag.edges if edge.src_id in member_id_set and edge.dst_id in member_id_set
-                ],
-                direct_nodes=member_ids.copy(),
-            ),
-            is_native=False,
+        topo_index = {node_id: idx for idx, node_id in enumerate(topo_order)}
+        class_name_tuple = tuple(registry[node_id].attr.class_name for node_id in topo_order)
+        edge_index_tuple = tuple(
+            sorted((topo_index[edge.src_id], topo_index[edge.dst_id]) for edge in internal_edges)
         )
+        pattern_key = (class_name_tuple, edge_index_tuple)
+        if pattern_key not in pattern_registry:
+            pattern_registry[pattern_key] = chr(ord("A") + len(pattern_registry))
+        pattern_letter = pattern_registry[pattern_key]
+        pattern_index = pattern_counter.get(pattern_letter, 0)
+        group_name = f"Pattern{pattern_letter}#{pattern_index}"
+        pattern_counter[pattern_letter] = pattern_index + 1
+
+        group_node = _build_b_group_node(group_name, topo_order, dag, registry)
         dag.nodes.append(group_node.node_id)
         dag.direct_nodes = _replace_direct_nodes_with_group(
             dag.direct_nodes,
-            member_ids=member_id_set,
+            member_ids=component_member_id_set,
             group_node_id=group_node.node_id,
         )
         registry[group_node.node_id] = group_node
+
+
+
+def _build_b_group_node(
+    group_name: str,
+    member_ids: list[int],
+    dag: DAG,
+    registry: dict[int, DagNode],
+) -> ModuleNode:
+    representative_node = registry[member_ids[0]]
+    member_id_set = set(member_ids)
+    return ModuleNode(
+        node_id=_next_node_id(registry),
+        call_loc=representative_node.call_loc,
+        attr=ModuleAttr(
+            attr_name=group_name,
+            class_name=group_name,
+        ),
+        metadata={"is_synthetic": True, "synthetic_type": "callloc_group"},
+        inner_dag=DAG(
+            inputs=[],
+            outputs=[],
+            nodes=member_ids.copy(),
+            edges=[edge for edge in dag.edges if edge.src_id in member_id_set and edge.dst_id in member_id_set],
+            direct_nodes=member_ids.copy(),
+        ),
+        is_native=False,
+    )
 
 
 def _replace_direct_nodes_with_group(
