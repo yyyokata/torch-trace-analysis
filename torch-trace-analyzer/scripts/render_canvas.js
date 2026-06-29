@@ -301,7 +301,11 @@
             // ``rendererResizeCallCount`` stays put — proving the pool-first
             // incremental path ran instead of a full re-render.
             incrementalRenderCount: 0,
-            isIncrementalPatching: false
+            isIncrementalPatching: false,
+            // Phase 2 step 6 (edge style): key of the currently hovered edge, or
+            // null.  Only non-IO edges set it (IO edges suppress hover); when set,
+            // patchEdgeView reveals that edge's full polyline instead of the stubs.
+            hoveredEdgeKey: null
         };
         // Phase 2 step 3: ``engine.onGroupToggle`` / ``engine.onGroupSelect``
         // are the *engine-side* interaction hooks fired by ``bindGroupBox()``.
@@ -1001,6 +1005,15 @@
     // ── EdgeRoute (pure geometry) ──────────────────────────────────────────
     const EDGE_SAMPLE_STEPS = 24;
     const LONG_EDGE_MIN_SPAN = 260;
+    // Long edges keep only a ``head`` stub at the src side and a ``tail`` stub
+    // at the dst side; the middle is hidden.  Both measured by arc length.
+    const EDGE_TRUNCATE_HEAD = 40;
+    const EDGE_TRUNCATE_TAIL = 40;
+    // IO-edge endpoint dot (Version B): a filled disc in the edge colour with a
+    // 1px white ring, drawn at the head-stub end and the tail-stub start.
+    const IO_EDGE_DOT_RADIUS = 4;
+    const IO_EDGE_DOT_RING_WIDTH = 1;
+    const IO_EDGE_DOT_RING_COLOR = 0xffffff;
     const EDGE_STYLE = {
         dep:      { color: 0x2ecc71, width: 1.9,  alpha: 0.62, arrowAlpha: 0.6 },
         internal: { color: 0x64b5f6, width: 1.35, alpha: 0.46, arrowAlpha: 0.5 },
@@ -1052,6 +1065,61 @@
             total += Math.hypot(points[i].x - points[i - 1].x, points[i].y - points[i - 1].y);
         }
         return total;
+    }
+
+    // ── long-edge truncation (arc-length) ──────────────────────────────────
+    // The middle of a long edge is hidden; only a ``headLen`` stub at the src
+    // side and a ``tailLen`` stub at the dst side are drawn.  Both stubs are cut
+    // by *arc length* along the real sampled polyline (cubic/quad), with the
+    // boundary point interpolated on the straddling segment — never a straight
+    // chord approximation.  Contract: the returned head sub-polyline measures
+    // exactly ``headLen`` (and the tail exactly ``tailLen``) unless the whole
+    // polyline is shorter than the requested length, in which case the entire
+    // polyline is returned (callers gate truncation behind the long-edge test
+    // ``polylineLength >= LONG_EDGE_MIN_SPAN`` so the stubs never overlap).
+    function takeHeadByLength(points, headLen) {
+        if (!points || points.length < 2) {
+            throw new Error('takeHeadByLength: need at least 2 points');
+        }
+        const out = [{ x: points[0].x, y: points[0].y }];
+        let acc = 0;
+        for (let i = 1; i < points.length; i++) {
+            const dx = points[i].x - points[i - 1].x;
+            const dy = points[i].y - points[i - 1].y;
+            const segLen = Math.hypot(dx, dy);
+            if (acc + segLen >= headLen) {
+                const t = segLen === 0 ? 0 : (headLen - acc) / segLen;
+                out.push({ x: points[i - 1].x + dx * t, y: points[i - 1].y + dy * t });
+                return out;
+            }
+            acc += segLen;
+            out.push({ x: points[i].x, y: points[i].y });
+        }
+        return out;
+    }
+
+    function takeTailByLength(points, tailLen) {
+        if (!points || points.length < 2) {
+            throw new Error('takeTailByLength: need at least 2 points');
+        }
+        const n = points.length;
+        const out = [{ x: points[n - 1].x, y: points[n - 1].y }];
+        let acc = 0;
+        for (let i = n - 1; i > 0; i--) {
+            const dx = points[i - 1].x - points[i].x;
+            const dy = points[i - 1].y - points[i].y;
+            const segLen = Math.hypot(dx, dy);
+            if (acc + segLen >= tailLen) {
+                const t = segLen === 0 ? 0 : (tailLen - acc) / segLen;
+                out.push({ x: points[i].x + dx * t, y: points[i].y + dy * t });
+                out.reverse();
+                return out;
+            }
+            acc += segLen;
+            out.push({ x: points[i - 1].x, y: points[i - 1].y });
+        }
+        out.reverse();
+        return out;
     }
 
     const EdgeRoute = {
@@ -1154,6 +1222,41 @@
         engine.portNodeIndex = idx;
         engine.portNodeIndexData = engine.dataRef;
         return idx;
+    }
+
+    // IO-edge classification index.  An edge is an *IO edge* when either raw
+    // endpoint (``e.from`` / ``e.to``) is an Input / Param / Const / Result
+    // (output) node, or an io_group id, or a member of an io_group.  Mirrors the
+    // inline-runtime ``isIONodeId`` (input/param/const/output_node_ids) and adds
+    // io_group id + member coverage so collapsed io rows classify too.  Built
+    // once per dataRef (string-keyed set).
+    function ensureIOEdgeIndex() {
+        if (engine.ioEdgeIndex && engine.ioEdgeIndexData === engine.dataRef) {
+            return engine.ioEdgeIndex;
+        }
+        const idx = new Set();
+        const data = engine.dataRef;
+        if (data) {
+            ['input_node_ids', 'param_node_ids', 'const_node_ids', 'output_node_ids']
+                .forEach(function (key) {
+                    (data[key] || []).forEach(function (id) { idx.add(String(id)); });
+                });
+            (data.io_groups || []).forEach(function (ig) {
+                idx.add(String(ig.id));
+                (ig.member_ids || []).forEach(function (mid) { idx.add(String(mid)); });
+            });
+        }
+        engine.ioEdgeIndex = idx;
+        engine.ioEdgeIndexData = engine.dataRef;
+        return idx;
+    }
+
+    function isIOEdge(e) {
+        if (!e) {
+            throw new Error('render_canvas.js: isIOEdge requires an edge record');
+        }
+        const idx = ensureIOEdgeIndex();
+        return idx.has(String(e.from)) || idx.has(String(e.to));
     }
 
     // ── Semantic-Zoom boundary anchor resolution (problem 1) ───────────────
@@ -1276,6 +1379,15 @@
             baseX - px * half, baseY - py * half
         ]);
         g.fill({ color: style.color, alpha: style.arrowAlpha });
+    }
+
+    // Draw a single IO-edge endpoint dot (Version B): a filled disc in the edge
+    // colour with an opaque 1px white ring so the dot reads cleanly against any
+    // edge / background colour.  ``pt`` is the stub end-point.
+    function drawIOEdgeDot(g, pt, style) {
+        g.circle(pt.x, pt.y, IO_EDGE_DOT_RADIUS);
+        g.fill({ color: style.color, alpha: 1 });
+        g.stroke({ width: IO_EDGE_DOT_RING_WIDTH, color: IO_EDGE_DOT_RING_COLOR, alpha: 1 });
     }
 
     // ── IO layer (L5) ──────────────────────────────────────────────────────
@@ -1483,7 +1595,7 @@
     // any field is missing (no silent default fill, no fallback).
     const NODE_SNAPSHOT_FIELDS  = ['x', 'y', 'w', 'h', 'label', 'sublabel', 'fill', 'stroke', 'alpha'];
     const GROUP_SNAPSHOT_FIELDS = ['x', 'y', 'w', 'h', 'label', 'collapsed', 'fill', 'alpha', 'hasTiming', 'timingText'];
-    const EDGE_SNAPSHOT_FIELDS  = ['srcId', 'dstId', 'stroke', 'strokeWidth', 'alpha', 'dashed', 'arrowAlpha'];
+    const EDGE_SNAPSHOT_FIELDS  = ['srcId', 'dstId', 'stroke', 'strokeWidth', 'alpha', 'dashed', 'arrowAlpha', 'isIO'];
 
     function requireSnapshotFields(kind, id, snapshot, fields) {
         if (!snapshot || typeof snapshot !== 'object') {
@@ -1554,14 +1666,57 @@
         const path = makeGraphics('edge-path:' + key);
         root.addChild(path);
         engine.layers.l1.addChild(root);
-        return {
+        const view = {
             key: String(key),
             root: root,
             path: path,
             arrow: null,
             visible: false,
+            // ``interactive`` gates hover participation: normal edges hover to
+            // reveal the full (un-truncated) polyline; IO edges are suppressed
+            // (set false in patchEdgeView from ``snapshot.isIO``).  Defaults
+            // false until the first patch resolves the snapshot's IO flag.
+            interactive: false,
             snapshot: null
         };
+        bindEdgeHover(view);
+        return view;
+    }
+
+    // Idempotent hover wiring for an edge path.  ``pointerover`` / ``pointerout``
+    // forward to ``setEdgeHover`` only when the edge is interactive (non-IO), so
+    // IO edges never trigger the reveal even if the runtime dispatches an event.
+    // Whether the thin stroke actually receives pointer events (hit-area
+    // precision) is a browser-only concern validated by manual testing.
+    function bindEdgeHover(view) {
+        if (view.path.__edgeHoverBound === true) { return; }
+        view.path.__edgeHoverBound = true;
+        view.path.on('pointerover', function () {
+            if (view.interactive === true) { setEdgeHover(view.key); }
+        });
+        view.path.on('pointerout', function () {
+            if (view.interactive === true && engine.hoveredEdgeKey === view.key) {
+                setEdgeHover(null);
+            }
+        });
+    }
+
+    // Set (or clear, with ``null``) the hovered edge and re-patch only the
+    // affected edge views so the previously-hovered edge collapses back to its
+    // truncated stubs and the newly-hovered one reveals its full polyline.  IO
+    // edges are inert: patchEdgeView ignores hover for them.
+    function setEdgeHover(key) {
+        const newKey = (key === null || key === undefined) ? null : String(key);
+        if (engine.hoveredEdgeKey === newKey) { return; }
+        const prevKey = engine.hoveredEdgeKey;
+        engine.hoveredEdgeKey = newKey;
+        [prevKey, newKey].forEach(function (k) {
+            if (k === null) { return; }
+            const view = engine.edgePool.get(k);
+            if (view && view.visible === true && view.snapshot) {
+                patchEdgeView(view, view.snapshot);
+            }
+        });
     }
 
     function patchNodeView(view, snapshot) {
@@ -1720,6 +1875,12 @@
             throw new Error('patchEdgeView: dst view missing from pools/io: ' + snapshot.dstId);
         }
         const route = EdgeRoute.compute('direct', fromPort.cx, fromPort.cy, toPort.cx, toPort.cy, snapshot.routeMeta || null);
+        // ``interactive`` mirrors the IO flag: IO edges are inert (no hover
+        // reveal, ``eventMode='none'``); normal edges are hoverable.  Kept on the
+        // view so ``bindEdgeHover`` listeners read the current classification.
+        const interactive = snapshot.isIO !== true;
+        view.interactive = interactive;
+        view.path.eventMode = interactive ? 'static' : 'none';
         // route is null only for a degenerate span; computeVisibleScene already
         // drops such edges, so this is defensive: clear-only, never draw garbage.
         if (route) {
@@ -1730,8 +1891,29 @@
                 arrowAlpha: snapshot.arrowAlpha,
                 dashed: snapshot.dashed
             };
-            strokePolyline(view.path, route.points, style);
-            drawArrowHead(view.path, route.points, style);
+            // ``dashed`` marks a long edge (polyline length >= LONG_EDGE_MIN_SPAN).
+            // Long edges are truncated to head + tail stubs (middle hidden, arrow
+            // only at the dst stub) unless a normal edge is being hovered, in
+            // which case the full polyline is revealed.  IO edges never reveal on
+            // hover (``interactive`` is false), so they stay truncated.
+            const hovered = interactive && engine.hoveredEdgeKey === view.key;
+            const truncate = snapshot.dashed === true && !hovered;
+            if (truncate) {
+                const head = takeHeadByLength(route.points, EDGE_TRUNCATE_HEAD);
+                const tail = takeTailByLength(route.points, EDGE_TRUNCATE_TAIL);
+                strokePolyline(view.path, head, style);
+                strokePolyline(view.path, tail, style);
+                drawArrowHead(view.path, tail, style);
+                // IO-edge dots (Version B) sit at the stub ends: the head-stub end
+                // and the tail-stub start (both are the hidden-middle boundary).
+                if (snapshot.isIO === true) {
+                    drawIOEdgeDot(view.path, head[head.length - 1], style);
+                    drawIOEdgeDot(view.path, tail[0], style);
+                }
+            } else {
+                strokePolyline(view.path, route.points, style);
+                drawArrowHead(view.path, route.points, style);
+            }
         }
         view.snapshot = snapshot;
     }
@@ -2056,6 +2238,10 @@
             alpha: edgeMeta.alpha,
             dashed: edgeMeta.dashed,
             arrowAlpha: edgeMeta.arrowAlpha,
+            // IO-edge classification (drives dot drawing + hover suppression in
+            // patchEdgeView).  Resolved from the *raw* endpoint ids in
+            // computeVisibleScene via isIOEdge.
+            isIO: edgeMeta.isIO,
             // Legacy edge-record fields consumed by rebuildLegacyArraysFromPool
             // (from/to are the *original* endpoint ids; start/end are recomputed
             // there from the live boxes addressed by srcId/dstId).
@@ -2591,7 +2777,11 @@
                 type: type,
                 colorKey: colorKey,
                 branch: route.branch,
-                arrow: true
+                arrow: true,
+                // IO classification uses the *raw* endpoint ids (e.from / e.to),
+                // independent of focus/collapse redirection, so an edge touching
+                // an Input/Param/Const/Result node or io_group is always an IO edge.
+                isIO: isIOEdge(e)
             });
         });
 
@@ -3076,7 +3266,7 @@
                 from: s.from, to: s.to, type: s.type, colorKey: s.colorKey,
                 start: { cx: fromPort.cx, cy: fromPort.cy },
                 end: { cx: toPort.cx, cy: toPort.cy },
-                branch: s.branch, dashed: s.dashed, arrow: s.arrow
+                branch: s.branch, dashed: s.dashed, arrow: s.arrow, isIO: s.isIO
             });
         });
         engine.nodes = nodes;
@@ -3104,7 +3294,7 @@
                     from: e.from, to: e.to, type: e.type, colorKey: e.colorKey,
                     start: { cx: e.start.cx, cy: e.start.cy },
                     end: { cx: e.end.cx, cy: e.end.cy },
-                    branch: e.branch, dashed: e.dashed, arrow: e.arrow
+                    branch: e.branch, dashed: e.dashed, arrow: e.arrow, isIO: e.isIO
                 };
             }),
             io_pills: (engine.io_pills || []).map(function (p) {
@@ -3195,6 +3385,24 @@
     };
     global.__EdgeRoute = EdgeRoute;
     global.__EDGE_STYLE = EDGE_STYLE;
+    // Edge-style (Phase 2 step 6) test surface: arc-length truncation helpers,
+    // IO-edge classifier, truncation/dot constants, and the hover setter.
+    global.__EdgeStyle = {
+        takeHeadByLength: takeHeadByLength,
+        takeTailByLength: takeTailByLength,
+        polylineLength: polylineLength,
+        isIOEdge: function (e) { ensureEngine(); return isIOEdge(e); },
+        setEdgeHover: function (key) { ensureEngine(); return setEdgeHover(key); },
+        constants: {
+            LONG_EDGE_MIN_SPAN: LONG_EDGE_MIN_SPAN,
+            EDGE_TRUNCATE_HEAD: EDGE_TRUNCATE_HEAD,
+            EDGE_TRUNCATE_TAIL: EDGE_TRUNCATE_TAIL,
+            IO_EDGE_DOT_RADIUS: IO_EDGE_DOT_RADIUS,
+            IO_EDGE_DOT_RING_WIDTH: IO_EDGE_DOT_RING_WIDTH,
+            IO_EDGE_DOT_RING_COLOR: IO_EDGE_DOT_RING_COLOR
+        }
+    };
+    global.__canvasSetEdgeHover = function (key) { ensureEngine(); return setEdgeHover(key); };
     global.__renderSnapshot = function () {
         ensureEngine();
         return buildSnapshot();
