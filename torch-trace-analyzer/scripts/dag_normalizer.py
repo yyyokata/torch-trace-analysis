@@ -16,6 +16,8 @@ def normalize_containers_recursive(
     # 如 result/head 的边）。各 inner_dag.edges 只含自身节点内部边，不足以判定，
     # 因此在任何分组/重写发生前快照顶层全局边集合，向下层层传递。
     global_edges = list(dag.edges)
+    pattern_registry: dict[tuple[tuple[str, ...], tuple[tuple[int, int], ...]], str] = {}
+    pattern_counter: dict[str, int] = {}
     _normalize_containers_recursive(
         dag,
         registry,
@@ -26,6 +28,8 @@ def normalize_containers_recursive(
         allow_function_grouping=True,
         allow_callloc_grouping=True,
         global_edges=global_edges,
+        pattern_registry=pattern_registry,
+        pattern_counter=pattern_counter,
     )
 
 
@@ -39,6 +43,8 @@ def _normalize_containers_recursive(
     allow_function_grouping: bool,
     allow_callloc_grouping: bool,
     global_edges: list[DataFlowEdge],
+    pattern_registry: dict[tuple[tuple[str, ...], tuple[tuple[int, int], ...]], str],
+    pattern_counter: dict[str, int],
 ) -> None:
     dag_object_id = id(dag)
     if dag_object_id in visited_dag_ids:
@@ -53,6 +59,8 @@ def _normalize_containers_recursive(
         allow_function_grouping=allow_function_grouping,
         allow_callloc_grouping=allow_callloc_grouping,
         global_edges=global_edges,
+        pattern_registry=pattern_registry,
+        pattern_counter=pattern_counter,
     )
     _rebuild_adjacency(dag)
     for node_id in list(dag.nodes):
@@ -77,6 +85,8 @@ def _normalize_containers_recursive(
             allow_function_grouping=child_allow_function_grouping,
             allow_callloc_grouping=child_allow_callloc_grouping,
             global_edges=global_edges,
+            pattern_registry=pattern_registry,
+            pattern_counter=pattern_counter,
         )
 
 
@@ -89,6 +99,8 @@ def _normalize_single_dag(
     allow_function_grouping: bool,
     allow_callloc_grouping: bool,
     global_edges: list[DataFlowEdge],
+    pattern_registry: dict[tuple[tuple[str, ...], tuple[tuple[int, int], ...]], str],
+    pattern_counter: dict[str, int],
 ) -> None:
     container_node_ids = _collect_relevant_container_node_ids(
         dag=dag,
@@ -153,7 +165,13 @@ def _normalize_single_dag(
     )
 
     if allow_callloc_grouping:
-        _apply_function_grouping_b(dag, registry, parent_func=scope_frames_prefix[-1])
+        _apply_function_grouping_b(
+            dag,
+            registry,
+            parent_func=scope_frames_prefix[-1],
+            pattern_registry=pattern_registry,
+            pattern_counter=pattern_counter,
+        )
     if allow_function_grouping:
         _apply_function_grouping_a(dag, registry, scope_frames_prefix=scope_frames_prefix)
 
@@ -429,9 +447,8 @@ def _apply_function_grouping_a(
         ):
             continue
         components = _split_into_connected_components(member_ids, dag.edges)
-        component_count = len(components)
         for idx, component_member_ids in enumerate(components):
-            group_name = helper_name if component_count == 1 else f"{helper_name}#{idx}"
+            group_name = helper_name if idx == 0 else f"{helper_name}#{idx}"
             new_node = _build_function_group_node(
                 dag=dag,
                 registry=registry,
@@ -523,6 +540,8 @@ def _apply_function_grouping_b(
     dag: DAG,
     registry: dict[int, DagNode],
     parent_func: str,
+    pattern_registry: dict[tuple[tuple[str, ...], tuple[tuple[int, int], ...]], str],
+    pattern_counter: dict[str, int],
 ) -> None:
     del parent_func
     candidate_ids = [
@@ -542,8 +561,6 @@ def _apply_function_grouping_b(
     if not component_member_lists:
         return
 
-    pattern_registry: dict[tuple[tuple[str, ...], tuple[tuple[int, int], ...]], str] = {}
-    pattern_counter: dict[str, int] = {}
     original_direct_node_count = len(dag.direct_nodes)
 
     for component_member_ids in component_member_lists:
@@ -583,7 +600,7 @@ def _apply_function_grouping_b(
             pattern_registry[pattern_key] = chr(ord("A") + len(pattern_registry))
         pattern_letter = pattern_registry[pattern_key]
         pattern_index = pattern_counter.get(pattern_letter, 0)
-        group_name = f"Pattern{pattern_letter}#{pattern_index}"
+        group_name = f"Pattern{pattern_letter}" if pattern_index == 0 else f"Pattern{pattern_letter}#{pattern_index}"
         pattern_counter[pattern_letter] = pattern_index + 1
 
         group_node = _build_b_group_node(group_name, topo_order, dag, registry)
