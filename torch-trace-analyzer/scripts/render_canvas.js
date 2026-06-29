@@ -1009,6 +1009,7 @@
     // at the dst side; the middle is hidden.  Both measured by arc length.
     const EDGE_TRUNCATE_HEAD = 40;
     const EDGE_TRUNCATE_TAIL = 40;
+    const EDGE_HIT_WIDTH = 20;
     // IO-edge endpoint dot (Version B): a filled disc in the edge colour with a
     // 1px white ring, drawn at the head-stub end and the tail-stub start.
     const IO_EDGE_DOT_RADIUS = 4;
@@ -1390,6 +1391,32 @@
         g.stroke({ width: IO_EDGE_DOT_RING_WIDTH, color: IO_EDGE_DOT_RING_COLOR, alpha: 1 });
     }
 
+    function drawEdgeHitBands(g, points, width) {
+        if (!points || points.length < 2) {
+            throw new Error('render_canvas.js: drawEdgeHitBands requires at least 2 points');
+        }
+        const half = width / 2;
+        for (let i = 1; i < points.length; i++) {
+            const a = points[i - 1];
+            const b = points[i];
+            const dx = b.x - a.x;
+            const dy = b.y - a.y;
+            const len = Math.hypot(dx, dy);
+            if (len < 1e-6) {
+                continue;
+            }
+            const nx = -dy / len;
+            const ny = dx / len;
+            g.poly([
+                a.x + nx * half, a.y + ny * half,
+                b.x + nx * half, b.y + ny * half,
+                b.x - nx * half, b.y - ny * half,
+                a.x - nx * half, a.y - ny * half
+            ]);
+            g.fill({ color: 0xffffff, alpha: 0 });
+        }
+    }
+
     // ── IO layer (L5) ──────────────────────────────────────────────────────
     function IOLayer() {
         this.layer = engine.layers.l5;
@@ -1664,12 +1691,18 @@
         root.name = 'edge-view:' + key;
         root.visible = false;
         const path = makeGraphics('edge-path:' + key);
+        path.eventMode = 'none';
+        const hitArea = makeGraphics('edge-hit:' + key);
+        hitArea.alpha = 0;
+        hitArea.eventMode = 'none';
         root.addChild(path);
+        root.addChild(hitArea);
         engine.layers.l1.addChild(root);
         const view = {
             key: String(key),
             root: root,
             path: path,
+            hitArea: hitArea,
             arrow: null,
             visible: false,
             // ``interactive`` gates hover participation: normal edges hover to
@@ -1683,18 +1716,18 @@
         return view;
     }
 
-    // Idempotent hover wiring for an edge path.  ``pointerover`` / ``pointerout``
-    // forward to ``setEdgeHover`` only when the edge is interactive (non-IO), so
-    // IO edges never trigger the reveal even if the runtime dispatches an event.
-    // Whether the thin stroke actually receives pointer events (hit-area
-    // precision) is a browser-only concern validated by manual testing.
+    // Idempotent hover wiring for an edge hit-area.  ``pointerover`` /
+    // ``pointerout`` forward to ``setEdgeHover`` only when the edge is
+    // interactive (non-IO), so IO edges never trigger the reveal even if the
+    // runtime dispatches an event.  The visible stroke itself is inert; only the
+    // transparent hit-area participates in picking.
     function bindEdgeHover(view) {
-        if (view.path.__edgeHoverBound === true) { return; }
-        view.path.__edgeHoverBound = true;
-        view.path.on('pointerover', function () {
+        if (view.hitArea.__edgeHoverBound === true) { return; }
+        view.hitArea.__edgeHoverBound = true;
+        view.hitArea.on('pointerover', function () {
             if (view.interactive === true) { setEdgeHover(view.key); }
         });
-        view.path.on('pointerout', function () {
+        view.hitArea.on('pointerout', function () {
             if (view.interactive === true && engine.hoveredEdgeKey === view.key) {
                 setEdgeHover(null);
             }
@@ -1860,6 +1893,8 @@
         requireSnapshotFields('edge', view.key, snapshot, EDGE_SNAPSHOT_FIELDS);
         view.root.alpha = snapshot.alpha;
         view.path.clear();
+        view.hitArea.clear();
+        view.hitArea.alpha = 0;
         // Derive both endpoints from the LIVE boxes of whatever drew them.  By the
         // time patchEdges runs, patchGroups + patchNodes (and drawIOTasks before
         // that) have already populated the pool views / io pill index for this
@@ -1876,11 +1911,12 @@
         }
         const route = EdgeRoute.compute('direct', fromPort.cx, fromPort.cy, toPort.cx, toPort.cy, snapshot.routeMeta || null);
         // ``interactive`` mirrors the IO flag: IO edges are inert (no hover
-        // reveal, ``eventMode='none'``); normal edges are hoverable.  Kept on the
-        // view so ``bindEdgeHover`` listeners read the current classification.
+        // reveal, hit-area ``eventMode='none'``); normal edges route hover through
+        // the transparent hit-area while the visible stroke stays inert.
         const interactive = snapshot.isIO !== true;
         view.interactive = interactive;
-        view.path.eventMode = interactive ? 'static' : 'none';
+        view.path.eventMode = 'none';
+        view.hitArea.eventMode = interactive ? 'static' : 'none';
         // route is null only for a degenerate span; computeVisibleScene already
         // drops such edges, so this is defensive: clear-only, never draw garbage.
         if (route) {
@@ -1891,6 +1927,9 @@
                 arrowAlpha: snapshot.arrowAlpha,
                 dashed: snapshot.dashed
             };
+            if (interactive) {
+                drawEdgeHitBands(view.hitArea, route.points, EDGE_HIT_WIDTH);
+            }
             // ``dashed`` marks a long edge (polyline length >= LONG_EDGE_MIN_SPAN).
             // Long edges are truncated to head + tail stubs (middle hidden, arrow
             // only at the dst stub) unless a normal edge is being hovered, in
