@@ -1396,14 +1396,20 @@
         g.stroke({ width: IO_EDGE_DOT_RING_WIDTH, color: IO_EDGE_DOT_RING_COLOR, alpha: 1 });
     }
 
-    function edgeDrawStyle(snapshot) {
-        return {
+    function edgeDrawStyle(snapshot, hovered) {
+        const style = {
             color: snapshot.stroke,
             width: snapshot.strokeWidth,
             alpha: snapshot.alpha,
             arrowAlpha: snapshot.arrowAlpha,
             dashed: snapshot.dashed
         };
+        if (hovered === true) {
+            style.width += 0.9;
+            style.alpha = 0.92;
+            style.arrowAlpha = 1.0;
+        }
+        return style;
     }
 
     function drawTruncatedEdgePath(g, routePoints, style, isIO) {
@@ -1948,16 +1954,16 @@
         // route is null only for a degenerate span; computeVisibleScene already
         // drops such edges, so this is defensive: clear-only, never draw garbage.
         if (route) {
-            const style = edgeDrawStyle(snapshot);
-            if (interactive) {
-                drawEdgeHitBands(view.hitArea, route.points, EDGE_HIT_WIDTH);
-            }
             // ``dashed`` marks a long edge (polyline length >= LONG_EDGE_MIN_SPAN).
             // Long edges are truncated to head + tail stubs (middle hidden, arrow
             // only at the dst stub) unless a normal edge is being hovered, in
             // which case the full polyline is revealed.  IO edges never reveal on
             // hover (``interactive`` is false), so they stay truncated.
             const hovered = interactive && engine.hoveredEdgeKey === view.key;
+            const style = edgeDrawStyle(snapshot, hovered);
+            if (interactive) {
+                drawEdgeHitBands(view.hitArea, route.points, EDGE_HIT_WIDTH);
+            }
             const truncate = snapshot.dashed === true && !hovered;
             if (truncate) {
                 drawTruncatedEdgePath(view.path, route.points, style, snapshot.isIO === true);
