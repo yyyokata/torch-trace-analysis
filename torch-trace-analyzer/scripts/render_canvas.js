@@ -219,6 +219,9 @@
         LAYER_KEYS.forEach(function (key) {
             const layer = new PIXI.Container();
             layer.name = key;
+            if (key === 'l1') {
+                layer.eventMode = 'static';
+            }
             world.addChild(layer);
             layers[key] = layer;
         });
@@ -1690,6 +1693,7 @@
         const root = new engine.pixi.Container();
         root.name = 'edge-view:' + key;
         root.visible = false;
+        root.eventMode = 'static';
         const path = makeGraphics('edge-path:' + key);
         path.eventMode = 'none';
         const hitArea = makeGraphics('edge-hit:' + key);
