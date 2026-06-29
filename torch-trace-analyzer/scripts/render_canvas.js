@@ -222,8 +222,10 @@
             if (key === 'l1') {
                 layer.eventMode = 'static';
             }
-            world.addChild(layer);
             layers[key] = layer;
+        });
+        ['l0', 'l2', 'l3', 'l4', 'l5', 'l1'].forEach(function (key) {
+            world.addChild(layers[key]);
         });
 
         const built = {
