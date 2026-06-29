@@ -2531,7 +2531,7 @@ function refreshTopbarCapsules() {
                 };
             } else {
                 runCap.classList.add('tb-capsule-disabled');
-                runCap.onclick = null;
+                runCap.onclick = function () { _clearFocusStack(); };
             }
         } else {
             // dual (Training/Inference only) and single-runstep base page: there
