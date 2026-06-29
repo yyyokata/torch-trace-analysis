@@ -2534,6 +2534,10 @@ function refreshTopbarCapsules() {
                 runCap.classList.remove('tb-capsule-disabled');
                 runCap.onclick = (ev) => {
                     if (ev && typeof ev.stopPropagation === 'function') { ev.stopPropagation(); }
+                    // Clicking the active runstep capsule still exits Semantic Zoom so the
+                    // user always has a one-click way back to the full graph, even in
+                    // multi-runstep mode.
+                    _clearFocusStack();
                     _openTopbarDropdown(runCap, steps.map(labelOf), curIdx, (i) => activateL2(ACTIVE_L1, i));
                 };
             } else {
