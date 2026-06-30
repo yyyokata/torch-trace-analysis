@@ -2958,7 +2958,12 @@
         const rawContentHeight = Math.ceil(fitBounds.h * vp.scale + 2 * FIT_PADDING);
         // Focus 模式：canvas 高度 clamp 到 4x viewport 高（保留纵向 scroll，避免 renderer 爆到十万像素量级导致渲染模糊）
         const MAX_FOCUS_CANVAS_H = Math.max(ch * 4, 3200);
-        const canvasHeight = focusActive ? Math.min(rawContentHeight, MAX_FOCUS_CANVAS_H) : rawContentHeight;
+        const dpr = (typeof global !== 'undefined' && global && global.devicePixelRatio) || 1;
+        const MAX_SAFE_CANVAS_H = Math.floor(16384 / dpr);
+        const canvasHeight = Math.min(
+            focusActive ? Math.min(rawContentHeight, MAX_FOCUS_CANVAS_H) : rawContentHeight,
+            MAX_SAFE_CANVAS_H
+        );
         if (engine.app && engine.app.renderer && typeof engine.app.renderer.resize === 'function') {
             engine.rendererResizeCallCount = (engine.rendererResizeCallCount || 0) + 1;
             engine.app.renderer.resize(Math.ceil(cw), Math.ceil(canvasHeight));
