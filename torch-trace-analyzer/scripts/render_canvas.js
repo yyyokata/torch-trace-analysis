@@ -2027,6 +2027,9 @@
             }
             view.root.visible = true;
             view.visible = true;
+            // Re-enable hit-testing in case this view was previously recycled
+            // (recycle sets box.eventMode='none'; mirrors patchGroups activate path).
+            view.box.eventMode = 'static';
             patchNodeView(view, getSnapshotEntry(snapshotMap, nid));
         });
         prevSet.forEach(function (nid) {
@@ -2038,6 +2041,9 @@
             }
             view.root.visible = false;
             view.visible = false;
+            // Disable hit-testing on the recycled box so the ghost view cannot
+            // intercept pointer events while invisible (mirrors patchGroups).
+            view.box.eventMode = 'none';
         });
     }
 
