@@ -2858,7 +2858,7 @@
         };
     }
 
-    function invokeIncrementalRender() {
+    function invokeIncrementalRender(opts) {
         ensureEngine();
         engine.incrementalRenderCount = (engine.incrementalRenderCount || 0) + 1;
         const prev = {
@@ -2885,6 +2885,16 @@
             engine.isIncrementalPatching = false;
         }
         performAutoFit();
+        // scroll anchor: after expand/collapse, scroll so the toggled group appears near top of viewport
+        if (opts && opts.anchorGid) {
+            const _anchorSnap = engine.snapshotById && engine.snapshotById[opts.anchorGid];
+            const _vp = engine.viewport;
+            if (_anchorSnap && _vp && typeof global.window !== 'undefined' && typeof global.window.scrollTo === 'function') {
+                const _canvasY = _vp.y + _anchorSnap.y * _vp.scale;
+                const _targetScrollY = Math.max(0, Math.round(_canvasY - global.window.innerHeight / 4));
+                global.window.scrollTo(0, _targetScrollY);
+            }
+        }
         // Phase 2 step 4 invariant: this path still stays pool-first — it
         // reflows layout, refreshes canvas size, patches visible objects in
         // place, and then re-applies auto-fit without ever resetting the scene.
@@ -3415,9 +3425,9 @@
         ensureEngine();
         return computeVisibleScene();
     };
-    global.__canvasInvokeIncrementalRender = function () {
+    global.__canvasInvokeIncrementalRender = function (opts) {
         ensureEngine();
-        invokeIncrementalRender();
+        invokeIncrementalRender(opts);
     };
     global.__canvasPan = function (dx, dy) {
         ensureEngine();

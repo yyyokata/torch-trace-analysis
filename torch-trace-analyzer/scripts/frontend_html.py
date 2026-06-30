@@ -1736,7 +1736,7 @@ if (typeof window !== 'undefined') {
             throw new Error('__canvasOnGroupToggle: unknown group id ' + gid);
         }
         collapsedState[gid] = !collapsedState[gid];
-        invokeIncrementalRender({ reason: 'toggle', gid: gid });
+        invokeIncrementalRender({ reason: 'toggle', gid: gid, anchorGid: gid });
     };
     window.__canvasOnGroupSelect = function (gid) {
         const g = groupMap[gid];
