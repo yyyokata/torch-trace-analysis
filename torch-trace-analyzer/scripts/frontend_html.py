@@ -1151,7 +1151,7 @@ function layoutGroup(gid, containerWidth) {
     if (!containerWidth || containerWidth <= 0) {
         throw new Error('layoutGroup: containerWidth must be a positive number');
     }
-    const effectiveMaxRowWidth = Math.max(containerWidth - 100, 400);
+    const effectiveMaxRowWidth = Math.min(Math.max(containerWidth - 100, 400), LAYOUT.maxRowWidth);
     const g = groupMap[gid];
     if (!g) return { w: LAYOUT.nodeW, h: LAYOUT.nodeH };
 
