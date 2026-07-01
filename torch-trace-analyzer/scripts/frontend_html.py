@@ -931,6 +931,13 @@ function indexGroupAncestors(groups, ancestors = []) {
 
 DATA.groups.forEach(g => groupMap[g.id] = g);
 DATA.nodes.forEach(n => nodeMap[n.id] = n);
+const nodeToGroup = new Map();
+for (const g of DATA.groups) {
+    if (!g.call_order) continue;
+    for (const nid of g.call_order) {
+        nodeToGroup.set(String(nid), String(g.id));
+    }
+}
 indexGroupAncestors(DATA.root_groups.map(rid => groupMap[rid]).filter(Boolean));
 (DATA.io_groups || []).forEach(g => {
     (g.member_ids || []).forEach(nid => nodeAncestorGroups.set(nid, [g.id]));
@@ -2152,16 +2159,20 @@ function showSourcePanel(g) {
     }
     body.innerHTML = bodyHtml;
 
-    // Focus button: any existing group can be entered via Semantic Zoom,
-    // including leaf-only groups.  Driven off ``groupMap`` so a plain node never
-    // shows the button.  A missing button element is tolerated because the panel
-    // header is optional chrome.
+    // Focus button: groups drill into themselves; leaf nodes drill into their
+    // parent group resolved from DATA.groups[*].call_order.  Nodes without a
+    // parent-group mapping keep the button hidden.  Missing button chrome is
+    // tolerated because the panel header is optional.
     const focusBtn = document.getElementById('sp-focus');
     if (focusBtn) {
         const asGroup = (g && g.id != null) ? groupMap[g.id] : null;
+        const parentGroupId = (!asGroup && g && g.id != null) ? nodeToGroup.get(String(g.id)) : null;
         if (asGroup) {
             focusBtn.classList.remove('hidden');
             focusBtn.onclick = function () { enterFocus(String(asGroup.id)); };
+        } else if (parentGroupId != null) {
+            focusBtn.classList.remove('hidden');
+            focusBtn.onclick = function () { enterFocus(String(parentGroupId)); };
         } else {
             focusBtn.classList.add('hidden');
             focusBtn.onclick = null;
