@@ -483,6 +483,26 @@ def _find_a_group_helper_frame(frames: tuple) -> object | None:
     return frames[helper_idx]
 
 
+def _find_a_group_callsite_frame(
+    frames: tuple,
+) -> "CallLocFrame | None":
+    """Return the frame that called the A-group helper function.
+
+    The helper frame sits at frames[last_forward_idx + 1].
+    Its caller is frames[last_forward_idx] (the forward frame itself,
+    which contains the line that invokes the helper).
+    """
+    last_forward_idx: int | None = None
+    for idx in range(len(frames) - 1, -1, -1):
+        if frames[idx].function_name == "forward":
+            last_forward_idx = idx
+            break
+    if last_forward_idx is None:
+        return None
+    callsite_idx = last_forward_idx  # forward frame = the line calling the helper
+    return frames[callsite_idx] if 0 <= callsite_idx < len(frames) else None
+
+
 def _build_function_group_node(
     dag: DAG,
     registry: dict[int, DagNode],
@@ -514,10 +534,22 @@ def _build_function_group_node(
         raise RuntimeError(
             f"A-group {helper_name} representative node {representative_node.node_id} helper function {helper_frame.function_name} mismatches helper name"
         )
+    callsite_frame = _find_a_group_callsite_frame(frames)
+    if callsite_frame is None:
+        raise RuntimeError(f"A-group {helper_name!r}: no callsite frame found in representative node frames")
+    if not callsite_frame.file:
+        raise RuntimeError(f"A-group {helper_name!r}: callsite frame has empty file")
+    if callsite_frame.line <= 0:
+        raise RuntimeError(f"A-group {helper_name!r}: callsite frame has invalid line {callsite_frame.line}")
     member_id_set = set(member_ids)
     return ModuleNode(
         node_id=_next_node_id(registry),
-        call_loc=representative_node.call_loc,
+        call_loc=CallLoc(
+            file=callsite_frame.file,
+            line=callsite_frame.line,
+            col=0,
+            frames=frames,
+        ),
         attr=ModuleAttr(
             attr_name=attr_name,
             class_name=class_name,
