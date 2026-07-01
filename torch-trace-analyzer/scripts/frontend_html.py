@@ -933,9 +933,15 @@ DATA.groups.forEach(g => groupMap[g.id] = g);
 DATA.nodes.forEach(n => nodeMap[n.id] = n);
 const nodeToGroup = new Map();
 for (const g of DATA.groups) {
-    if (!g.call_order) continue;
-    for (const nid of g.call_order) {
+    // children_nodes: plain id array
+    for (const nid of (g.children_nodes || [])) {
         nodeToGroup.set(String(nid), String(g.id));
+    }
+    // call_order: [{id, type}, ...] object array
+    for (const entry of (g.call_order || [])) {
+        if (entry && entry.type === 'node') {
+            nodeToGroup.set(String(entry.id), String(g.id));
+        }
     }
 }
 indexGroupAncestors(DATA.root_groups.map(rid => groupMap[rid]).filter(Boolean));
