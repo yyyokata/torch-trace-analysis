@@ -448,13 +448,15 @@ def _apply_function_grouping_a(
             continue
         components = _split_into_connected_components(member_ids, dag.edges)
         for idx, component_member_ids in enumerate(components):
-            group_name = helper_name if idx == 0 else f"{helper_name}#{idx}"
+            attr_name = helper_name if idx == 0 else f"{helper_name}#{idx}"
+            class_name = helper_name
             new_node = _build_function_group_node(
                 dag=dag,
                 registry=registry,
                 member_ids=component_member_ids,
                 helper_name=helper_name,
-                group_name=group_name,
+                attr_name=attr_name,
+                class_name=class_name,
             )
             dag.nodes.append(new_node.node_id)
             dag.direct_nodes = _replace_direct_nodes_with_group(
@@ -486,10 +488,9 @@ def _build_function_group_node(
     registry: dict[int, DagNode],
     member_ids: list[int],
     helper_name: str,
-    group_name: str | None = None,
+    attr_name: str,
+    class_name: str,
 ) -> ModuleNode:
-    if group_name is None:
-        group_name = helper_name
     representative_node = registry[member_ids[0]]
     frames = representative_node.call_loc.frames
     if not frames:
@@ -518,8 +519,8 @@ def _build_function_group_node(
         node_id=_next_node_id(registry),
         call_loc=representative_node.call_loc,
         attr=ModuleAttr(
-            attr_name=group_name,
-            class_name=group_name,
+            attr_name=attr_name,
+            class_name=class_name,
             def_loc=CallLoc(file=helper_frame.file, line=helper_frame.line, col=0),
         ),
         metadata={"is_synthetic": True, "synthetic_type": "function_group"},
