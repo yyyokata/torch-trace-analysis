@@ -2485,25 +2485,51 @@
         }
         const centerX = (minX + maxX) / 2;
         function placeRow(neighbors, rowY) {
-            const boxes = neighbors.map(boxFor);
-            let total = 0;
-            boxes.forEach(function (b, i) { total += b.w + (i > 0 ? COL_GAP : 0); });
-            let x = centerX - total / 2;
-            let rowMaxBottom = rowY;
-            neighbors.forEach(function (entry, i) {
-                const b = boxes[i];
-                if (entry.kind === 'group') {
-                    groupMeta.set(entry.id, { x: x, y: rowY, w: b.w, h: b.h, collapsed: true });
-                } else if (entry.kind === 'node') {
-                    nodeMeta.set(entry.id, { x: x, y: rowY, w: b.w, h: b.h });
-                } else {
-                    // io boundary: emit an io_pill draw task (cx/cy are centre).
-                    emitIoTask(entry, x + b.w / 2, rowY + b.h / 2, b.w, b.h);
+            const rows = [];
+            let currentRow = [];
+            let currentWidth = 0;
+            neighbors.forEach(function (entry) {
+                const b = boxFor(entry);
+                const nextWidth = currentRow.length ? currentWidth + COL_GAP + b.w : b.w;
+                if (currentRow.length && nextWidth > LAYOUT.maxRowWidth) {
+                    rows.push({ entries: currentRow, total: currentWidth });
+                    currentRow = [];
+                    currentWidth = 0;
                 }
-                rowMaxBottom = Math.max(rowMaxBottom, rowY + b.h);
-                x += b.w + COL_GAP;
+                currentRow.push({ entry: entry, box: b });
+                currentWidth = currentRow.length > 1 ? currentWidth + COL_GAP + b.w : b.w;
             });
-            return { left: centerX - total / 2, right: centerX - total / 2 + total, bottom: rowMaxBottom };
+            if (currentRow.length) {
+                rows.push({ entries: currentRow, total: currentWidth });
+            }
+
+            let boundsLeft = centerX;
+            let boundsRight = centerX;
+            let rowTop = rowY;
+            let maxBottom = rowY;
+            rows.forEach(function (row) {
+                let x = centerX - row.total / 2;
+                boundsLeft = Math.min(boundsLeft, x);
+                boundsRight = Math.max(boundsRight, x + row.total);
+                let rowMaxBottom = rowTop;
+                row.entries.forEach(function (item) {
+                    const entry = item.entry;
+                    const b = item.box;
+                    if (entry.kind === 'group') {
+                        groupMeta.set(entry.id, { x: x, y: rowTop, w: b.w, h: b.h, collapsed: true });
+                    } else if (entry.kind === 'node') {
+                        nodeMeta.set(entry.id, { x: x, y: rowTop, w: b.w, h: b.h });
+                    } else {
+                        // io boundary: emit an io_pill draw task (cx/cy are centre).
+                        emitIoTask(entry, x + b.w / 2, rowTop + b.h / 2, b.w, b.h);
+                    }
+                    rowMaxBottom = Math.max(rowMaxBottom, rowTop + b.h);
+                    x += b.w + COL_GAP;
+                });
+                maxBottom = Math.max(maxBottom, rowMaxBottom);
+                rowTop = rowMaxBottom + LAYOUT.rowGap;
+            });
+            return { left: boundsLeft, right: boundsRight, bottom: maxBottom };
         }
         let worldMinX = minX, worldMaxX = maxX, worldMaxY = maxY;
         if (inNeighbors.length) {
