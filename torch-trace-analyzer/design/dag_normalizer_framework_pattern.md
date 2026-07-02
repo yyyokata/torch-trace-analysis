@@ -85,6 +85,31 @@ B-group 必须显式剔除已被 Framework Pattern 圈走的节点。
 
 这里的剔除是强约束，不是展示层过滤。后续 B-group 的连通分量、同构识别、Pattern 命名都只能在剔除后的候选节点池上运行。
 
+### 2.5 B-group 连通性排除约束
+
+B-group 不仅要在候选节点池中排除 Framework Pattern 节点，还要在连通分量计算时排除边界节点对连通性的影响。
+
+具体要求：传给 `_split_into_connected_components` 的 `member_ids` 必须只包含“普通游离候选节点”；传入或参与计算的 edges 也必须只保留两端都是“普通游离候选节点”的边。以下两类节点当作边界点，不拉进连通分量里：
+
+1. 已被 Framework Pattern 圈走的节点，即归属 group 的 `metadata["synthetic_type"] == "framework_pattern"`；
+2. 当前 scope DAG 的 input/output pill 节点。源码确认当前仓库没有统一的 `IOAttr` 类型，IO pill 在 `scripts/attr_types.py` 中分别由 `InputAttr`、`ForwardArgAttr`、`ReturnValAttr`、`ResultAttr` 表达，此外还有 `ParamAttr` / `ConstantAttr` 对应参数与常量 pill。因此 B-group 中应通过 `isinstance(node.attr, (InputAttr, ForwardArgAttr, ReturnValAttr, ResultAttr, ParamAttr, ConstantAttr))` 识别并排除 IO / 参数 / 常量边界 pill，而不是使用不存在的 `IOAttr`。
+
+含义：如果存在 `普通候选节点 → IO pill → 普通候选节点` 或 `普通候选节点 → Framework Pattern → 普通候选节点`，这条路径不能把两侧普通候选节点合并到同一个 B-group 连通分量中。`_split_into_connected_components` 看到的边必须是 candidate-candidate 的内部边。
+
+### 2.6 B-group 高扇入/扇出节点限制
+
+为避免横向汇聚/广播节点把过多连通分量粘成巨型 Pattern，B-group 候选节点还需要增加直接度数限制。
+
+具体要求：对每个候选节点，统计它在当前 scope DAG 中的直接输入边数与直接输出边数。如果：
+
+```text
+in_degree(node) + out_degree(node) >= 5
+```
+
+则该节点不纳入 B-group 候选池。
+
+该限制只影响 B-group 候选池与 B-group 连通性计算，不删除节点，也不影响它在 DAG 中作为普通节点或边界节点继续展示。被排除的高扇入/扇出节点同样不能通过其 incident edges 把多个普通候选连通分量粘在一起。
+
 ## 3. 关键决策
 
 ### 3.1 路径判断使用 `file` 字段，不使用 `function_name`
@@ -166,16 +191,29 @@ Framework Pattern 的目标是把框架层展开节点从模型业务节点中�
 
 ### 4.3 修改 `_apply_function_grouping_b` 的候选节点池构建
 
-职责：确保 B-group 不会二次吸收 Framework Pattern 节点。
+职责：确保 B-group 不会二次吸收 Framework Pattern 节点，也不会通过 IO pill 或高扇入/扇出节点把多个区域粘成巨型 Pattern。
 
 设计要点：
 
 - 在构建 `candidate_ids` 前，先识别已归入 `metadata["synthetic_type"] == "framework_pattern"` group 的节点；
 - 从 B-group 的 `candidate_ids` 中排除这些节点；
+- 源码确认当前没有 `IOAttr`，IO / 参数 / 常量 pill 由 `InputAttr`、`ForwardArgAttr`、`ReturnValAttr`、`ResultAttr`、`ParamAttr`、`ConstantAttr` 表达；`candidate_ids` 构建时必须排除 `isinstance(node.attr, (InputAttr, ForwardArgAttr, ReturnValAttr, ResultAttr, ParamAttr, ConstantAttr))` 的节点；
+- 统计当前 scope DAG 中每个候选节点的直接输入边数与直接输出边数；若 `in_degree + out_degree >= 5`，该节点不纳入 B-group 候选池；
 - 后续连通分量、同构识别、Pattern group 创建都基于排除后的候选池；
 - 该排除逻辑必须在后端 normalizer 内完成，不得放到前端展示层。
 
-### 4.4 修改 `normalize_containers_recursive`
+### 4.4 修改 `_split_into_connected_components` 的调用方式
+
+职责：确保 B-group 连通分量只由普通游离候选节点之间的内部边决定。
+
+设计要点：
+
+- `_apply_function_grouping_b` 调用 `_split_into_connected_components` 前，构造 `candidate_id_set`；
+- 传入的 edges 必须过滤为 `edge.src_id in candidate_id_set and edge.dst_id in candidate_id_set`；
+- Framework Pattern group、IO / 参数 / 常量 pill、高扇入/扇出节点都只能作为边界点存在，不得通过自身 incident edges 参与 B-group 连通性；
+- 如果后续选择让 `_split_into_connected_components` 内部执行过滤，也必须保留“只用 candidate-candidate 边”的硬约束，并对非 candidate 端点进入计算的情况 raise，而不是静默扩展连通性。
+
+### 4.5 修改 `normalize_containers_recursive`
 
 职责：调整 grouping 调用顺序。
 
