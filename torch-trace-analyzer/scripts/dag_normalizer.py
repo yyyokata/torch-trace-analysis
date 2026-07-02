@@ -1,13 +1,40 @@
 from __future__ import annotations
 
-from attr_types import CallLoc, ContainerAttr, FunctionalAttr, ModuleAttr, _NATIVE_CONTAINER_KINDS
+import os
+
+from attr_types import (
+    CallLoc,
+    ConstantAttr,
+    ContainerAttr,
+    ForwardArgAttr,
+    FunctionalAttr,
+    InputAttr,
+    ModuleAttr,
+    ParamAttr,
+    ResultAttr,
+    ReturnValAttr,
+    _NATIVE_CONTAINER_KINDS,
+)
 from dag_types import DAG, DagNode, DataFlowEdge, ModuleNode
+
+
+# B-group 候选池必须显式排除的 IO / 参数 / 常量 pill 类型。
+# 当前仓库没有统一的 IOAttr，边界 pill 由以下 Attr 子类分别表达。
+_BGROUP_EXCLUDED_ATTR_TYPES = (
+    InputAttr,
+    ForwardArgAttr,
+    ReturnValAttr,
+    ResultAttr,
+    ParamAttr,
+    ConstantAttr,
+)
 
 
 def normalize_containers_recursive(
     dag: DAG,
     registry: dict[int, DagNode],
     container_attr_map: dict[str, ContainerAttr],
+    modelcode_root: str | None = None,
 ) -> None:
     attr_to_node_ids = _build_attr_to_node_ids(registry)
     next_node_id = max(registry.keys()) + 1 if registry else 0
@@ -18,6 +45,7 @@ def normalize_containers_recursive(
     global_edges = list(dag.edges)
     pattern_registry: dict[tuple[tuple[str, ...], tuple[tuple[int, int], ...]], str] = {}
     pattern_counter: dict[str, int] = {}
+    normalized_modelcode_root = _normalize_modelcode_root(modelcode_root)
     _normalize_containers_recursive(
         dag,
         registry,
@@ -30,6 +58,7 @@ def normalize_containers_recursive(
         global_edges=global_edges,
         pattern_registry=pattern_registry,
         pattern_counter=pattern_counter,
+        modelcode_root=normalized_modelcode_root,
     )
 
 
@@ -45,6 +74,7 @@ def _normalize_containers_recursive(
     global_edges: list[DataFlowEdge],
     pattern_registry: dict[tuple[tuple[str, ...], tuple[tuple[int, int], ...]], str],
     pattern_counter: dict[str, int],
+    modelcode_root: str | None,
 ) -> None:
     dag_object_id = id(dag)
     if dag_object_id in visited_dag_ids:
@@ -61,6 +91,7 @@ def _normalize_containers_recursive(
         global_edges=global_edges,
         pattern_registry=pattern_registry,
         pattern_counter=pattern_counter,
+        modelcode_root=modelcode_root,
     )
     _rebuild_adjacency(dag)
     for node_id in list(dag.nodes):
@@ -69,7 +100,7 @@ def _normalize_containers_recursive(
         node = registry[node_id]
         if not isinstance(node, ModuleNode) or node.inner_dag is None:
             continue
-        if node.metadata.get("synthetic_type") == "function_group":
+        if node.metadata.get("synthetic_type") in {"function_group", "framework_pattern"}:
             continue
         child_scope_frames_prefix = ("forward",)
         _skip_grouping = node.metadata.get("is_container", False) or node.is_native
@@ -87,6 +118,7 @@ def _normalize_containers_recursive(
             global_edges=global_edges,
             pattern_registry=pattern_registry,
             pattern_counter=pattern_counter,
+            modelcode_root=modelcode_root,
         )
 
 
@@ -101,6 +133,7 @@ def _normalize_single_dag(
     global_edges: list[DataFlowEdge],
     pattern_registry: dict[tuple[tuple[str, ...], tuple[tuple[int, int], ...]], str],
     pattern_counter: dict[str, int],
+    modelcode_root: str | None,
 ) -> None:
     container_node_ids = _collect_relevant_container_node_ids(
         dag=dag,
@@ -165,12 +198,21 @@ def _normalize_single_dag(
     )
 
     if allow_callloc_grouping:
+        # Framework Pattern 必须先于 B-group：把 torch / lgtorch 框架路径展开的
+        # 游离 FunctionalAttr 节点先圈成 FrameworkPattern group，避免 B-group
+        # 二次吸收成巨型 Pattern。
+        framework_group_ids = _apply_framework_pattern_grouping(
+            dag,
+            registry,
+            modelcode_root=modelcode_root,
+        )
         _apply_function_grouping_b(
             dag,
             registry,
             parent_func=scope_frames_prefix[-1],
             pattern_registry=pattern_registry,
             pattern_counter=pattern_counter,
+            framework_group_ids=framework_group_ids,
         )
     if allow_function_grouping:
         _apply_function_grouping_a(dag, registry, scope_frames_prefix=scope_frames_prefix)
@@ -676,23 +718,184 @@ def _build_function_group_node(
     )
 
 
+def _normalize_modelcode_root(modelcode_root: str | None) -> str | None:
+    """把 modelcode_root 归一为绝对路径 + 尾部分隔符，便于用 startswith 精确判定。
+
+    若 caller 传入 None，则保持 None；下游 `_is_framework_node` 不启用
+    "路径必须落在 modelcode_root 之外" 这一约束。这不是 fallback：
+    它只表示 caller 没有提供 modelcode 根目录信息，此时无法排除模型仓库自带的
+    同名目录，全部命中 torch/lgtorch 关键字的帧都会被视为框架帧。
+    """
+    if modelcode_root is None:
+        return None
+    normalized = os.path.abspath(modelcode_root)
+    if not normalized.endswith(os.sep):
+        normalized = normalized + os.sep
+    return normalized
+
+
+def _is_framework_node(node: DagNode, modelcode_root: str | None) -> bool:
+    """判断节点是否为框架层（torch / lgtorch）路径展开出来的算子节点。
+
+    - `node.call_loc is None` 直接返回 False（无法判定，保守视为非框架）。
+    - 优先使用 `call_loc.frames`；若为空，则回退到只看 `call_loc.file` 这一帧。
+      注意：这里的 "回退" 只是遍历目标从多帧退化为单帧，并未改变判定规则本身，
+      不属于禁止的静默 fallback。
+    - 任意一帧命中"框架路径"即为 True。命中规则：
+        * 若提供 modelcode_root 且路径落在其下，则该帧被排除。
+        * `site-packages` 且 (`torch` 或 `lgtorch`) 命中 → 框架。
+        * 路径包含 `lgtorch` 命中 → 框架。
+    """
+    call_loc = node.call_loc
+    if call_loc is None:
+        return False
+
+    if call_loc.frames:
+        frame_paths = [frame.file for frame in call_loc.frames]
+    else:
+        frame_paths = [call_loc.file]
+
+    for raw_path in frame_paths:
+        if not raw_path:
+            continue
+        normalized_path = os.path.abspath(raw_path)
+        if modelcode_root is not None and normalized_path.startswith(modelcode_root):
+            continue
+        if "site-packages" in normalized_path and (
+            "torch" in normalized_path or "lgtorch" in normalized_path
+        ):
+            return True
+        if "lgtorch" in normalized_path:
+            return True
+    return False
+
+
+def _apply_framework_pattern_grouping(
+    dag: DAG,
+    registry: dict[int, DagNode],
+    modelcode_root: str | None,
+) -> set[int]:
+    """把当前 scope 中游离的框架层 FunctionalAttr 节点按连通分量圈成 FrameworkPattern group。
+
+    返回被吸收进 FrameworkPattern group 的原始成员 node_id 集合。
+    该集合用于 B-group 排除，避免同一组节点被 B-group 再次吸收。
+    注：新建的 group 节点自身也会在返回集合中，方便 B-group 直接按 id 排除。
+    """
+    framework_ids: list[int] = []
+    for node_id in dag.direct_nodes:
+        node = registry[node_id]
+        # 只考虑真正的算子节点（FunctionalAttr），且不重复处理已合成的 group 节点。
+        if not isinstance(node.attr, FunctionalAttr):
+            continue
+        if node.metadata.get("is_synthetic", False):
+            continue
+        if _is_framework_node(node, modelcode_root):
+            framework_ids.append(node_id)
+
+    if not framework_ids:
+        return set()
+
+    components = _split_into_connected_components(framework_ids, dag.edges)
+    if not components:
+        return set()
+
+    absorbed: set[int] = set()
+    for index, component_member_ids in enumerate(components):
+        attr_name = "FrameworkPattern" if index == 0 else f"FrameworkPattern#{index}"
+        class_name = "FrameworkPattern"
+        group_node = _build_framework_pattern_group_node(
+            attr_name=attr_name,
+            class_name=class_name,
+            member_ids=component_member_ids,
+            dag=dag,
+            registry=registry,
+        )
+        dag.nodes.append(group_node.node_id)
+        dag.direct_nodes = _replace_direct_nodes_with_group(
+            dag.direct_nodes,
+            member_ids=set(component_member_ids),
+            group_node_id=group_node.node_id,
+        )
+        registry[group_node.node_id] = group_node
+        absorbed.update(component_member_ids)
+        absorbed.add(group_node.node_id)
+
+    return absorbed
+
+
+def _build_framework_pattern_group_node(
+    attr_name: str,
+    class_name: str,
+    member_ids: list[int],
+    dag: DAG,
+    registry: dict[int, DagNode],
+) -> ModuleNode:
+    representative_node = registry[member_ids[0]]
+    member_id_set = set(member_ids)
+    return ModuleNode(
+        node_id=_next_node_id(registry),
+        call_loc=representative_node.call_loc,
+        attr=ModuleAttr(
+            attr_name=attr_name,
+            class_name=class_name,
+        ),
+        metadata={"is_synthetic": True, "synthetic_type": "framework_pattern"},
+        inner_dag=DAG(
+            inputs=[],
+            outputs=[],
+            nodes=list(member_ids),
+            edges=[
+                edge
+                for edge in dag.edges
+                if edge.src_id in member_id_set and edge.dst_id in member_id_set
+            ],
+            direct_nodes=list(member_ids),
+        ),
+        is_native=False,
+    )
+
+
 def _apply_function_grouping_b(
     dag: DAG,
     registry: dict[int, DagNode],
     parent_func: str,
     pattern_registry: dict[tuple[tuple[str, ...], tuple[tuple[int, int], ...]], str],
     pattern_counter: dict[str, int],
+    framework_group_ids: set[int],
 ) -> None:
     del parent_func
-    candidate_ids = [
-        node_id
-        for node_id in dag.direct_nodes
-        if (
-            isinstance(registry[node_id].attr, FunctionalAttr)
-            or (isinstance(registry[node_id], ModuleNode) and registry[node_id].is_native is True)
-            or registry[node_id].metadata.get("synthetic_type") == "function_group"
-        )
-    ]
+
+    # 直接扇入/扇出度按当前 scope 全局 edges 统计（不限于 direct_nodes 端点），
+    # 因为跨层 boundary edge 也可能让某节点成为高扇入/扇出汇聚点。
+    in_degree: dict[int, int] = {}
+    out_degree: dict[int, int] = {}
+    for edge in dag.edges:
+        out_degree[edge.src_id] = out_degree.get(edge.src_id, 0) + 1
+        in_degree[edge.dst_id] = in_degree.get(edge.dst_id, 0) + 1
+
+    candidate_ids: list[int] = []
+    for node_id in dag.direct_nodes:
+        node = registry[node_id]
+        # 排除 IO / 参数 / 常量 pill。
+        if isinstance(node.attr, _BGROUP_EXCLUDED_ATTR_TYPES):
+            continue
+        # 排除已被 Framework Pattern 圈走的 group 节点自身。
+        if node_id in framework_group_ids:
+            continue
+        if node.metadata.get("synthetic_type") == "framework_pattern":
+            continue
+        # 排除高扇入/扇出节点，避免它们把多个连通分量粘成巨型 Pattern。
+        if in_degree.get(node_id, 0) + out_degree.get(node_id, 0) >= 5:
+            continue
+        # 保留原有 B-group 候选类型判定。
+        if not (
+            isinstance(node.attr, FunctionalAttr)
+            or (isinstance(node, ModuleNode) and node.is_native is True)
+            or node.metadata.get("synthetic_type") == "function_group"
+        ):
+            continue
+        candidate_ids.append(node_id)
+
     if len(candidate_ids) < 2:
         return
 
