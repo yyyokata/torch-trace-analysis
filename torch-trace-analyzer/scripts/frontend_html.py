@@ -1094,7 +1094,16 @@ function computeRanks(group) {
         }
     }
 
-    return { rank, edges, callIndex };
+    // Collect class key for each child (group.class_name / node.class_name),
+    // used later by the class-grouping pass in orderRanks and by the
+    // class-aware wrap logic in layoutGroup.
+    const classKey = {};
+    callOrder.forEach(c => {
+        const grp = groupMap[c.id];
+        const nd  = nodeMap[c.id];
+        classKey[c.id] = (grp && grp.class_name) || (nd && nd.class_name) || '';
+    });
+    return { rank, edges, callIndex, classKey };
 }
 
 // Order children within each rank using the median heuristic to reduce
@@ -1157,7 +1166,88 @@ function orderRanks(rankInfo, childSizes) {
             });
         }
     }
+    // Class grouping pass: consolidate same-class ids into contiguous
+    // sub-sequences within each rank while preserving cross-rank alignment.
+    // Class order = class-average position (from the median heuristic); on tie
+    // the class whose first item appears earlier wins.  Within a class we sort
+    // by posMap so the median-heuristic order is preserved.  We use a
+    // bucket-based reconstruction so items with the same class always end up
+    // adjacent — a plain per-item sort by (classAvg, posMap) would fail when
+    // two classes tie on average because posMap ties are broken per-item, not
+    // per-class.
+    const { classKey } = rankInfo;
+    if (classKey) {
+        for (let r = 0; r <= maxRank; r++) {
+            const layer = layers[r];
+            if (!layer || layer.length <= 1) continue;
+            const posMap = {};
+            layer.forEach((id, i) => { posMap[id] = i; });
+            const classGroups = {};
+            layer.forEach(id => {
+                const ck = classKey[id] || '';
+                (classGroups[ck] = classGroups[ck] || []).push(id);
+            });
+            const classAvg = {};
+            const classFirstPos = {};
+            Object.entries(classGroups).forEach(([ck, ids]) => {
+                classAvg[ck] = ids.reduce((s, id) => s + posMap[id], 0) / ids.length;
+                classFirstPos[ck] = Math.min(...ids.map(id => posMap[id]));
+            });
+            const sortedClasses = Object.keys(classGroups).sort((c1, c2) => {
+                if (classAvg[c1] !== classAvg[c2]) return classAvg[c1] - classAvg[c2];
+                return classFirstPos[c1] - classFirstPos[c2];
+            });
+            const rebuilt = [];
+            for (const ck of sortedClasses) {
+                const sorted = [...classGroups[ck]].sort((a, b) => posMap[a] - posMap[b]);
+                for (const id of sorted) rebuilt.push(id);
+            }
+            layers[r] = rebuilt;
+        }
+    }
     return layers;
+}
+
+// Class-aware uniform wrap:
+//   * segment ``items`` (already class-grouped by orderRanks) into contiguous
+//     same-class runs,
+//   * per segment compute capacity by accumulating actual widths (not
+//     assuming same class == same width, since groups vary),
+//   * distribute segment items evenly across the required rows so rows are
+//     balanced instead of packed left-heavy.
+// Returns an array of rows; each row is an array of items in visual order.
+function wrapByClass(items, maxW, gap, ckMap) {
+    // Step 1: segment by class-key runs.
+    const segments = [];
+    let seg = null;
+    items.forEach(item => {
+        const ck = ckMap[item.id] || '';
+        if (!seg || seg.ck !== ck) { seg = { ck, items: [] }; segments.push(seg); }
+        seg.items.push(item);
+    });
+    // Step 2: for each segment, compute capacity via cumulative width (works
+    // when same-class items have different widths), then split evenly.
+    const rows = [];
+    segments.forEach(({ items: segItems }) => {
+        let cap = 0, testW = 0;
+        for (const item of segItems) {
+            const next = testW + (cap ? gap : 0) + item.w;
+            if (next > maxW && cap > 0) break;
+            testW = next; cap++;
+        }
+        cap = Math.max(1, cap);
+        const n = segItems.length;
+        const nRows = Math.ceil(n / cap);
+        const baseCount = Math.floor(n / nRows);
+        const extra = n - baseCount * nRows; // first `extra` rows get baseCount+1
+        let idx = 0;
+        for (let ri = 0; ri < nRows; ri++) {
+            const cnt = ri < extra ? baseCount + 1 : baseCount;
+            rows.push(segItems.slice(idx, idx + cnt));
+            idx += cnt;
+        }
+    });
+    return rows;
 }
 
 function layoutGroup(gid, containerWidth) {
@@ -1200,15 +1290,20 @@ function layoutGroup(gid, containerWidth) {
     const childById = {};
     childSizes.forEach(c => { childById[c.id] = c; });
 
+    // Class-aware uniform wrap: hoisted to module scope so UT probes can call
+    // it directly.  See ``wrapByClass`` above; ``layoutGroup`` uses it below.
+
     // 2. Compute rank (vertical layer) for each child via longest-path on internal edges
     const rankInfo = computeRanks(g);
+    const classKey = rankInfo.classKey || {};
     const layers = orderRanks(rankInfo, childSizes);
     const maxRank = Math.max(0, ...Object.keys(layers).map(Number));
 
+    // (wrapByClass is defined above at module scope.)
+
     // 3. For each rank, lay children left-to-right; track row widths and heights.
-    //    If a single rank has too many children to fit horizontally, wrap it
-    //    onto multiple physical rows (a "wrapped layer") so we don't overflow
-    //    the parent container.
+    //    Class-aware even-split wrap keeps same-class children contiguous and
+    //    balances rows instead of greedily packing left-heavy.
     const rowLayouts = []; // each: y, h, rows (each row: items, totalW)
     let cy = LAYOUT.groupPadTop;
     let maxRowW = 0;
@@ -1218,22 +1313,13 @@ function layoutGroup(gid, containerWidth) {
         if (layerIds.length === 0) continue;
         const sizes = layerIds.map(id => childById[id]).filter(Boolean);
 
-        // Greedy wrap: pack items into as few rows as possible while staying
-        // under maxW. Always at least one item per row even if it's wider.
-        const wrapped = [];  // each: items, totalW, h
-        let curRow = []; let curW = 0;
-        for (const c of sizes) {
-            const tentative = curW + (curRow.length ? LAYOUT.siblingGap : 0) + c.w;
-            if (curRow.length && tentative > maxW) {
-                wrapped.push({ items: curRow, totalW: curW, h: Math.max(...curRow.map(x => x.h)) });
-                curRow = [c]; curW = c.w;
-            } else {
-                curRow.push(c); curW = tentative;
-            }
-        }
-        if (curRow.length) wrapped.push({ items: curRow, totalW: curW, h: Math.max(...curRow.map(x => x.h)) });
+        const wrappedRows = wrapByClass(sizes, maxW, LAYOUT.siblingGap, classKey);
+        const wrapped = wrappedRows.map(items => {
+            const totalW = items.reduce((s, it, i) => s + it.w + (i ? LAYOUT.siblingGap : 0), 0);
+            const h = Math.max(...items.map(it => it.h));
+            return { items, totalW, h };
+        });
 
-        const layerStartY = cy;
         for (const wr of wrapped) {
             rowLayouts.push({ y: cy, h: wr.h, items: wr.items, totalW: wr.totalW, rank: r });
             if (wr.totalW > maxRowW) maxRowW = wr.totalW;
