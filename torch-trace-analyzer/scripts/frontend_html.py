@@ -1218,39 +1218,77 @@ function orderRanks(rankInfo, childSizes) {
 //     balanced instead of packed left-heavy.
 // Returns an array of rows; each row is an array of items in visual order.
 function wrapByClass(items, maxW, gap, ckMap) {
-    // Step 1: segment by class-key runs.
     const segments = [];
     let seg = null;
     items.forEach(item => {
         const ck = ckMap[item.id] || '';
-        if (!seg || seg.ck !== ck) { seg = { ck, items: [] }; segments.push(seg); }
+        if (!seg || seg.ck !== ck) {
+            seg = { ck, items: [] };
+            segments.push(seg);
+        }
         seg.items.push(item);
     });
-    // Step 2: for each segment, compute capacity via cumulative width (works
-    // when same-class items have different widths), then split evenly.
-    const rows = [];
-    segments.forEach(({ items: segItems }) => {
-        let cap = 0, testW = 0;
+
+    const computeCap = (segItems) => {
+        let cap = 0;
+        let testW = 0;
         for (const item of segItems) {
             const next = testW + (cap ? gap : 0) + item.w;
             if (next > maxW && cap > 0) break;
-            testW = next; cap++;
+            testW = next;
+            cap++;
         }
         const allGroups = segItems.length > 0 && segItems.every(item => item.type === 'group');
         cap = Math.max(allGroups ? 2 : 1, cap);
-        cap = Math.min(cap, segItems.length);
+        return Math.min(cap, segItems.length);
+    };
+
+    const uniformSplit = (segItems, cap) => {
         const n = segItems.length;
         const nRows = Math.ceil(n / cap);
         const baseCount = Math.floor(n / nRows);
-        const extra = n - baseCount * nRows; // first `extra` rows get baseCount+1
+        const extra = n - baseCount * nRows;
+        const rows = [];
         let idx = 0;
         for (let ri = 0; ri < nRows; ri++) {
             const cnt = ri < extra ? baseCount + 1 : baseCount;
             rows.push(segItems.slice(idx, idx + cnt));
             idx += cnt;
         }
+        return rows;
+    };
+
+    const binPackRows = (packItems) => {
+        const rows = [];
+        let cur = [];
+        let curW = 0;
+        packItems.forEach(item => {
+            const next = curW + (cur.length ? gap : 0) + item.w;
+            if (cur.length && next > maxW) {
+                rows.push(cur);
+                cur = [item];
+                curW = item.w;
+                return;
+            }
+            cur.push(item);
+            curW = next;
+        });
+        if (cur.length) rows.push(cur);
+        return rows;
+    };
+
+    const bigRows = [];
+    const soloItems = [];
+    segments.forEach(({ items: segItems }) => {
+        if (segItems.length > 1) {
+            const cap = computeCap(segItems);
+            bigRows.push(...uniformSplit(segItems, cap));
+        } else {
+            soloItems.push(segItems[0]);
+        }
     });
-    return rows;
+
+    return [...bigRows, ...binPackRows(soloItems)];
 }
 
 function layoutGroup(gid, containerWidth) {

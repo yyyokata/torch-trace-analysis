@@ -737,13 +737,14 @@ def _apply_function_grouping_b(
         )
         pattern_key = (class_name_tuple, edge_index_tuple)
         if pattern_key not in pattern_registry:
-            pattern_registry[pattern_key] = chr(ord("A") + len(pattern_registry))
-        pattern_letter = pattern_registry[pattern_key]
-        pattern_index = pattern_counter.get(pattern_letter, 0)
-        group_name = f"Pattern{pattern_letter}" if pattern_index == 0 else f"Pattern{pattern_letter}#{pattern_index}"
-        pattern_counter[pattern_letter] = pattern_index + 1
+            pattern_registry[pattern_key] = str(len(pattern_registry) + 1)
+        pattern_num = pattern_registry[pattern_key]
+        pattern_index = pattern_counter.get(pattern_num, 0)
+        b_group_attr_name = f"Pattern{pattern_num}" if pattern_index == 0 else f"Pattern{pattern_num}#{pattern_index}"
+        b_group_class_name = f"Pattern{pattern_num}"
+        pattern_counter[pattern_num] = pattern_index + 1
 
-        group_node = _build_b_group_node(group_name, topo_order, dag, registry)
+        group_node = _build_b_group_node(b_group_attr_name, b_group_class_name, topo_order, dag, registry)
         dag.nodes.append(group_node.node_id)
         dag.direct_nodes = _replace_direct_nodes_with_group(
             dag.direct_nodes,
@@ -755,7 +756,8 @@ def _apply_function_grouping_b(
 
 
 def _build_b_group_node(
-    group_name: str,
+    attr_name: str,
+    class_name: str,
     member_ids: list[int],
     dag: DAG,
     registry: dict[int, DagNode],
@@ -766,8 +768,8 @@ def _build_b_group_node(
         node_id=_next_node_id(registry),
         call_loc=representative_node.call_loc,
         attr=ModuleAttr(
-            attr_name=group_name,
-            class_name=group_name,
+            attr_name=attr_name,
+            class_name=class_name,
         ),
         metadata={"is_synthetic": True, "synthetic_type": "callloc_group"},
         inner_dag=DAG(
