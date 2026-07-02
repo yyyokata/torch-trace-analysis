@@ -1101,7 +1101,8 @@ function computeRanks(group) {
     callOrder.forEach(c => {
         const grp = groupMap[c.id];
         const nd  = nodeMap[c.id];
-        classKey[c.id] = (grp && grp.class_name) || (nd && nd.class_name) || '';
+        const rawCk = (grp && grp.class_name) || (nd && nd.class_name) || '';
+        classKey[c.id] = rawCk.replace(/#\d+$/, '');
     });
     return { rank, edges, callIndex, classKey };
 }
@@ -1235,7 +1236,9 @@ function wrapByClass(items, maxW, gap, ckMap) {
             if (next > maxW && cap > 0) break;
             testW = next; cap++;
         }
-        cap = Math.max(1, cap);
+        const allGroups = segItems.length > 0 && segItems.every(item => item.type === 'group');
+        cap = Math.max(allGroups ? 2 : 1, cap);
+        cap = Math.min(cap, segItems.length);
         const n = segItems.length;
         const nRows = Math.ceil(n / cap);
         const baseCount = Math.floor(n / nRows);
@@ -1312,8 +1315,13 @@ function layoutGroup(gid, containerWidth) {
         const layerIds = layers[r] || [];
         if (layerIds.length === 0) continue;
         const sizes = layerIds.map(id => childById[id]).filter(Boolean);
+        const allGroupsInRank = sizes.length > 0 && sizes.every(s => s.type === 'group');
+        const maxItemW = sizes.length ? Math.max(...sizes.map(s => s.w)) : 0;
+        const effectiveMaxW = (allGroupsInRank && maxItemW > maxW)
+            ? (maxItemW * 2 + LAYOUT.siblingGap)
+            : maxW;
 
-        const wrappedRows = wrapByClass(sizes, maxW, LAYOUT.siblingGap, classKey);
+        const wrappedRows = wrapByClass(sizes, effectiveMaxW, LAYOUT.siblingGap, classKey);
         const wrapped = wrappedRows.map(items => {
             const totalW = items.reduce((s, it, i) => s + it.w + (i ? LAYOUT.siblingGap : 0), 0);
             const h = Math.max(...items.map(it => it.h));
