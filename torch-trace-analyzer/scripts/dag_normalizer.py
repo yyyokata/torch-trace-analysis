@@ -234,6 +234,7 @@ def apply_container_expansion_mode1(
 
     for container_id in container_ids:
         _descendants(container_id)
+    base_desc = {container_id: set(desc[container_id]) for container_id in container_ids}
 
     def _min_container(node_id: int) -> int | None:
         """返回包含 node_id 的最内层容器（descendant 最少者）；不在任何容器内则 None。"""
@@ -257,8 +258,18 @@ def apply_container_expansion_mode1(
             raise RuntimeError(
                 f"mode1: unexpected synthetic node {node_id} present before grouping"
             )
+        if not isinstance(node.attr, FunctionalAttr):
+            continue
         floating.add(node_id)
     if not floating:
+        _apply_container_expansion_mode1_phase2(
+            dag=dag,
+            registry=registry,
+            container_ids=container_ids,
+            desc=desc,
+            base_desc=base_desc,
+            global_edges=global_edges,
+        )
         return
 
     in_neighbors: dict[int, list[int]] = {node_id: [] for node_id in floating}
@@ -285,6 +296,14 @@ def apply_container_expansion_mode1(
                     changed = True
                     break
     if not survivors:
+        _apply_container_expansion_mode1_phase2(
+            dag=dag,
+            registry=registry,
+            container_ids=container_ids,
+            desc=desc,
+            base_desc=base_desc,
+            global_edges=global_edges,
+        )
         return
 
     # 把 survivors 按内部边（T-T 边）划分为连通分量，整组归入同一容器。
@@ -337,6 +356,94 @@ def apply_container_expansion_mode1(
             target_descendants=desc[target_id],
             global_edges=global_edges,
         )
+        desc[target_id].update(component)
+
+    _apply_container_expansion_mode1_phase2(
+        dag=dag,
+        registry=registry,
+        container_ids=container_ids,
+        desc=desc,
+        base_desc=base_desc,
+        global_edges=global_edges,
+    )
+
+
+def _apply_container_expansion_mode1_phase2(
+    dag: DAG,
+    registry: dict[int, DagNode],
+    container_ids: list[int],
+    desc: dict[int, set[int]],
+    base_desc: dict[int, set[int]],
+    global_edges: list[DataFlowEdge],
+) -> None:
+    """模式 1 阶段二：吸收容器两侧的 sibling ModuleNode。"""
+
+    def _min_container(node_id: int) -> int | None:
+        candidates = [cid for cid in container_ids if node_id in desc[cid]]
+        if not candidates:
+            return None
+        return min(candidates, key=lambda cid: len(desc[cid]))
+
+    protected = set().union(*(desc[cid] for cid in container_ids))
+    candidates: set[int] = set()
+    for node_id in dag.direct_nodes:
+        if node_id in protected:
+            continue
+        node = registry.get(node_id)
+        if node is None:
+            raise RuntimeError(f"mode1 phase2: direct node {node_id} missing from registry")
+        if not isinstance(node, ModuleNode):
+            continue
+        if _is_container_node(node):
+            continue
+        if node.metadata.get("is_synthetic"):
+            raise RuntimeError(
+                f"mode1 phase2: unexpected synthetic node {node_id} present before grouping"
+            )
+        candidates.add(node_id)
+    if not candidates:
+        return
+
+    incoming_seed: dict[int, set[int]] = {cid: set() for cid in container_ids}
+    outgoing_seed: dict[int, set[int]] = {cid: set() for cid in container_ids}
+    competitor_targets: dict[int, set[int]] = {node_id: set() for node_id in candidates}
+    for edge in global_edges:
+        if edge.src_id in candidates:
+            for cid in container_ids:
+                if edge.dst_id in base_desc[cid]:
+                    outgoing_seed[cid].add(edge.src_id)
+                    competitor_targets[edge.src_id].add(cid)
+        if edge.dst_id in candidates:
+            for cid in container_ids:
+                if edge.src_id in base_desc[cid]:
+                    incoming_seed[cid].add(edge.dst_id)
+                    competitor_targets[edge.dst_id].add(cid)
+
+    for node_id, targets in competitor_targets.items():
+        if not targets:
+            continue
+        if any(target is None for target in (_min_container(node_id),)):
+            continue
+        if len(targets) > 1:
+            continue
+
+    for target_id in container_ids:
+        component = (incoming_seed[target_id] | outgoing_seed[target_id])
+        if not component:
+            continue
+        if not incoming_seed[target_id] or not outgoing_seed[target_id]:
+            continue
+        if any(len(competitor_targets[node_id]) != 1 for node_id in component):
+            continue
+        _absorb_into_container(
+            dag=dag,
+            registry=registry,
+            component=component,
+            target_id=target_id,
+            target_descendants=desc[target_id],
+            global_edges=global_edges,
+        )
+        desc[target_id].update(component)
 
 
 def _absorb_into_container(
