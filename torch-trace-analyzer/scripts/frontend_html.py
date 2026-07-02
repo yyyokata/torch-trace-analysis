@@ -1108,7 +1108,7 @@ function orderRanks(rankInfo, childSizes) {
     let maxRank = 0;
     Object.entries(rank).forEach(([id, r]) => {
         if (!layers[r]) layers[r] = [];
-        layers[r].push(id);
+        layers[r].push(Number(id));
         if (r > maxRank) maxRank = r;
     });
     // Initial order = call order (stable starting point)
