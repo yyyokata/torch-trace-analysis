@@ -771,26 +771,38 @@ def _apply_framework_pattern_grouping(
     if not components:
         return set()
 
+    components_by_function_name: dict[str, list[list[int]]] = {}
+    for component_member_ids in components:
+        representative_node = registry[component_member_ids[0]]
+        call_loc = representative_node.call_loc
+        if call_loc is None or call_loc.top_framework_frame is None:
+            raise RuntimeError(
+                "framework pattern grouping requires top_framework_frame for all framework nodes"
+            )
+        function_name = call_loc.top_framework_frame.function_name
+        components_by_function_name.setdefault(function_name, []).append(component_member_ids)
+
     absorbed: set[int] = set()
-    for index, component_member_ids in enumerate(components):
-        attr_name = "FrameworkPattern" if index == 0 else f"FrameworkPattern#{index}"
-        class_name = "FrameworkPattern"
-        group_node = _build_framework_pattern_group_node(
-            attr_name=attr_name,
-            class_name=class_name,
-            member_ids=component_member_ids,
-            dag=dag,
-            registry=registry,
-        )
-        dag.nodes.append(group_node.node_id)
-        dag.direct_nodes = _replace_direct_nodes_with_group(
-            dag.direct_nodes,
-            member_ids=set(component_member_ids),
-            group_node_id=group_node.node_id,
-        )
-        registry[group_node.node_id] = group_node
-        absorbed.update(component_member_ids)
-        absorbed.add(group_node.node_id)
+    for function_name, bucket_components in components_by_function_name.items():
+        for index, component_member_ids in enumerate(bucket_components):
+            attr_name = function_name if index == 0 else f"{function_name}#{index}"
+            class_name = function_name
+            group_node = _build_framework_pattern_group_node(
+                attr_name=attr_name,
+                class_name=class_name,
+                member_ids=component_member_ids,
+                dag=dag,
+                registry=registry,
+            )
+            dag.nodes.append(group_node.node_id)
+            dag.direct_nodes = _replace_direct_nodes_with_group(
+                dag.direct_nodes,
+                member_ids=set(component_member_ids),
+                group_node_id=group_node.node_id,
+            )
+            registry[group_node.node_id] = group_node
+            absorbed.update(component_member_ids)
+            absorbed.add(group_node.node_id)
 
     return absorbed
 
