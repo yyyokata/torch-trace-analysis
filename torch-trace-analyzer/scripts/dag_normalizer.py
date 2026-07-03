@@ -867,9 +867,16 @@ def _apply_function_grouping_b(
 
     # 直接扇入/扇出度按当前 scope 全局 edges 统计（不限于 direct_nodes 端点），
     # 因为跨层 boundary edge 也可能让某节点成为高扇入/扇出汇聚点。
+    io_ids = {
+        node_id
+        for node_id, node in registry.items()
+        if isinstance(node.attr, _BGROUP_EXCLUDED_ATTR_TYPES)
+    }
     in_degree: dict[int, int] = {}
     out_degree: dict[int, int] = {}
     for edge in dag.edges:
+        if edge.src_id in io_ids or edge.dst_id in io_ids:
+            continue
         out_degree[edge.src_id] = out_degree.get(edge.src_id, 0) + 1
         in_degree[edge.dst_id] = in_degree.get(edge.dst_id, 0) + 1
 
@@ -885,7 +892,7 @@ def _apply_function_grouping_b(
         if node.metadata.get("synthetic_type") == "framework_pattern":
             continue
         # 排除高扇入/扇出节点，避免它们把多个连通分量粘成巨型 Pattern。
-        if in_degree.get(node_id, 0) + out_degree.get(node_id, 0) >= 5:
+        if in_degree.get(node_id, 0) >= 5 or out_degree.get(node_id, 0) >= 5:
             continue
         # 保留原有 B-group 候选类型判定。
         if not (
