@@ -1167,37 +1167,53 @@
             return { points: points, branch: branch, dashed: dashed };
         },
         // Skip-rank side-lane routing: an intra-group edge whose src/dst ranks
-        // differ by more than one is pushed out to a reserved gutter lane on the
-        // left or right side of the parent group and routed as an axis-aligned
-        // 4-point polyline, so it no longer crosses through the intermediate
-        // rows.  ``ctx`` is the edge-specific routing context baked in
-        // computeVisibleScene (all coordinate fields already in absolute world
-        // space): { groupLeft, groupRight, childLeftEdge, childRightEdge,
-        // fromRank, toRank, laneIndex, laneSide, gutter }.  The lane index/side
-        // are pre-assigned at layout time so the two routing passes
+        // differ by more than one is pushed out to the right reserved gutter lane
+        // and routed as a rounded 10-segment path, so it no longer crosses through
+        // the intermediate rows.  ``ctx`` is the edge-specific routing context
+        // baked in computeVisibleScene (all coordinate fields already in absolute
+        // world space): { childRightEdge, fromRank, toRank, gutter }.  The route
+        // context is pre-assigned at layout time so the two routing passes
         // (computeVisibleScene + patchEdgeView) agree byte-for-byte.
         intraGroup: function (x1, y1, x2, y2, ctx) {
             if (!ctx) {
                 throw new Error('render_canvas.js: EdgeRoute.intraGroup requires a routeCtx');
             }
-            const laneIndex = ctx.laneIndex;
-            const laneSide = ctx.laneSide;
-            if (typeof laneIndex !== 'number' || (laneSide !== 'left' && laneSide !== 'right')) {
-                throw new Error('render_canvas.js: EdgeRoute.intraGroup routeCtx missing laneIndex/laneSide');
+            if (typeof ctx.childRightEdge !== 'number' || !Number.isFinite(ctx.childRightEdge)) {
+                throw new Error('render_canvas.js: EdgeRoute.intraGroup routeCtx missing finite childRightEdge');
             }
-            const laneX = laneSide === 'left'
-                ? (ctx.groupLeft + laneIndex * 12)
-                : (ctx.groupRight - laneIndex * 12);
-            const points = [
-                { x: x1, y: y1 },
-                { x: laneX, y: y1 },
-                { x: laneX, y: y2 },
-                { x: x2, y: y2 }
+            const r = 16;
+            const gutter = 32;
+            const laneX = ctx.childRightEdge + gutter;
+            if (!(y2 - 3 * r > y1 + 3 * r)) {
+                throw new Error('render_canvas.js: EdgeRoute.intraGroup rounded lane vertical segment would flip');
+            }
+            if (!(laneX > x1 + r)) {
+                throw new Error('render_canvas.js: EdgeRoute.intraGroup laneX must be right of source turn radius');
+            }
+            if (!(x2 + r < laneX)) {
+                throw new Error('render_canvas.js: EdgeRoute.intraGroup laneX must be right of destination turn radius');
+            }
+            const commands = [
+                { cmd: 'M', x: x1, y: y1 },
+                { cmd: 'L', x: x1, y: y1 + r },
+                // turn 1: ↓→, sweep=0
+                { cmd: 'A', rx: r, ry: r, angle: 0, largeArc: 0, sweep: 0, x: x1 + r, y: y1 + 2 * r },
+                { cmd: 'L', x: laneX - r, y: y1 + 2 * r },
+                // turn 2: →↓, sweep=1
+                { cmd: 'A', rx: r, ry: r, angle: 0, largeArc: 0, sweep: 1, x: laneX, y: y1 + 3 * r },
+                { cmd: 'L', x: laneX, y: y2 - 3 * r },
+                // turn 3: ↓←, sweep=1
+                { cmd: 'A', rx: r, ry: r, angle: 0, largeArc: 0, sweep: 1, x: laneX - r, y: y2 - 2 * r },
+                { cmd: 'L', x: x2 + r, y: y2 - 2 * r },
+                // turn 4: ←↓, sweep=0
+                { cmd: 'A', rx: r, ry: r, angle: 0, largeArc: 0, sweep: 0, x: x2, y: y2 - r },
+                { cmd: 'L', x: x2, y: y2 }
             ];
+            const points = commands.map(function (c) { return { x: c.x, y: c.y }; });
             // Skip-lane edges are always drawn in full (never truncated): the
             // whole point of the side lane is to show the jump, so ``dashed`` is
             // false regardless of arc length.
-            return { points: points, branch: 'intraGroup', dashed: false };
+            return { points: points, commands: commands, branch: 'intraGroup', dashed: false };
         },
         compute: function (routingMode, x1, y1, x2, y2, routeMeta, routeCtx) {
             if (routingMode === 'direct') {
@@ -1396,6 +1412,26 @@
         g.moveTo(points[0].x, points[0].y);
         for (let i = 1; i < points.length; i++) {
             g.lineTo(points[i].x, points[i].y);
+        }
+        g.stroke({ width: style.width, color: style.color, alpha: style.alpha });
+    }
+
+    function strokePathCommands(g, commands, style) {
+        if (!commands || commands.length < 2) { return; }
+        for (let i = 0; i < commands.length; i++) {
+            const c = commands[i];
+            if (c.cmd === 'M') {
+                g.moveTo(c.x, c.y);
+            } else if (c.cmd === 'L') {
+                g.lineTo(c.x, c.y);
+            } else if (c.cmd === 'A') {
+                if (typeof g.arcToSvg !== 'function') {
+                    throw new Error('render_canvas.js: PIXI Graphics.arcToSvg is required for rounded side-lane edges');
+                }
+                g.arcToSvg(c.rx, c.ry, c.angle, c.largeArc, c.sweep, c.x, c.y);
+            } else {
+                throw new Error('render_canvas.js: unknown path command: ' + c.cmd);
+            }
         }
         g.stroke({ width: style.width, color: style.color, alpha: style.alpha });
     }
@@ -2004,7 +2040,11 @@
             if (truncate) {
                 drawTruncatedEdgePath(view.path, route.points, style, snapshot.isIO === true);
             } else {
-                strokePolyline(view.path, route.points, style);
+                if (route.commands) {
+                    strokePathCommands(view.path, route.commands, style);
+                } else {
+                    strokePolyline(view.path, route.points, style);
+                }
                 drawArrowHead(view.path, route.points, style);
             }
         }
