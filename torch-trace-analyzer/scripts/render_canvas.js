@@ -1010,6 +1010,11 @@
     // ── EdgeRoute (pure geometry) ──────────────────────────────────────────
     const EDGE_SAMPLE_STEPS = 24;
     const LONG_EDGE_MIN_SPAN = 260;
+    const EDGE_SKIP_LANE_GUTTER = 32;
+    const EDGE_SKIP_LANE_LAYOUT_GUTTER = 36;
+    const EDGE_SKIP_LANE_BASE_OFFSET = 14;
+    const EDGE_SKIP_LANE_OFFSET_STEP = 9;
+    const EDGE_SKIP_LANE_MAX_SLOT = 3;
     // Long edges keep only a ``head`` stub at the src side and a ``tail`` stub
     // at the dst side; the middle is hidden.  Both measured by arc length.
     const EDGE_TRUNCATE_HEAD = 40;
@@ -1167,53 +1172,78 @@
             return { points: points, branch: branch, dashed: dashed };
         },
         // Skip-rank side-lane routing: an intra-group edge whose src/dst ranks
-        // differ by more than one is pushed out to the right reserved gutter lane
-        // and routed as a rounded 10-segment path, so it no longer crosses through
-        // the intermediate rows.  ``ctx`` is the edge-specific routing context
-        // baked in computeVisibleScene (all coordinate fields already in absolute
-        // world space): { childRightEdge, fromRank, toRank, gutter }.  The route
-        // context is pre-assigned at layout time so the two routing passes
-        // (computeVisibleScene + patchEdgeView) agree byte-for-byte.
+        // differ by more than one is pushed into a reserved left/right gutter lane
+        // outside the owning group. ``ctx`` is pre-assigned at layout time so the
+        // two routing passes (computeVisibleScene + patchEdgeView) agree byte-for-byte.
         intraGroup: function (x1, y1, x2, y2, ctx) {
             if (!ctx) {
                 throw new Error('render_canvas.js: EdgeRoute.intraGroup requires a routeCtx');
             }
-            if (typeof ctx.childRightEdge !== 'number' || !Number.isFinite(ctx.childRightEdge)) {
-                throw new Error('render_canvas.js: EdgeRoute.intraGroup routeCtx missing finite childRightEdge');
+            if (typeof ctx.laneSide !== 'string' || (ctx.laneSide !== 'left' && ctx.laneSide !== 'right')) {
+                throw new Error('render_canvas.js: EdgeRoute.intraGroup routeCtx missing laneSide');
+            }
+            if (typeof ctx.laneOffset !== 'number' || !Number.isFinite(ctx.laneOffset)) {
+                throw new Error('render_canvas.js: EdgeRoute.intraGroup routeCtx missing finite laneOffset');
+            }
+            const needsRightEdge = ctx.laneSide === 'right';
+            const edgeField = needsRightEdge ? 'childRightEdge' : 'childLeftEdge';
+            if (typeof ctx[edgeField] !== 'number' || !Number.isFinite(ctx[edgeField])) {
+                throw new Error('render_canvas.js: EdgeRoute.intraGroup routeCtx missing finite ' + edgeField);
             }
             const r = 16;
-            const gutter = 32;
-            const laneX = ctx.childRightEdge + gutter;
+            if (typeof ctx.gutter !== 'number' || !Number.isFinite(ctx.gutter)) {
+                throw new Error('render_canvas.js: EdgeRoute.intraGroup routeCtx missing finite gutter');
+            }
+            const gutter = ctx.gutter;
+            const laneX = needsRightEdge
+                ? ctx.childRightEdge + gutter + ctx.laneOffset
+                : ctx.childLeftEdge - gutter - ctx.laneOffset;
             if (!(y2 - 3 * r > y1 + 3 * r)) {
                 throw new Error('render_canvas.js: EdgeRoute.intraGroup rounded lane vertical segment would flip');
             }
-            if (!(laneX > x1 + r)) {
-                throw new Error('render_canvas.js: EdgeRoute.intraGroup laneX must be right of source turn radius');
+            let commands;
+            if (needsRightEdge) {
+                if (!(laneX > x1 + r)) {
+                    throw new Error('render_canvas.js: EdgeRoute.intraGroup laneX must be right of source turn radius');
+                }
+                if (!(x2 + r < laneX)) {
+                    throw new Error('render_canvas.js: EdgeRoute.intraGroup laneX must be right of destination turn radius');
+                }
+                commands = [
+                    { cmd: 'M', x: x1, y: y1 },
+                    { cmd: 'L', x: x1, y: y1 + r },
+                    { cmd: 'A', rx: r, ry: r, angle: 0, largeArc: 0, sweep: 0, x: x1 + r, y: y1 + 2 * r },
+                    { cmd: 'L', x: laneX - r, y: y1 + 2 * r },
+                    { cmd: 'A', rx: r, ry: r, angle: 0, largeArc: 0, sweep: 1, x: laneX, y: y1 + 3 * r },
+                    { cmd: 'L', x: laneX, y: y2 - 3 * r },
+                    { cmd: 'A', rx: r, ry: r, angle: 0, largeArc: 0, sweep: 1, x: laneX - r, y: y2 - 2 * r },
+                    { cmd: 'L', x: x2 + r, y: y2 - 2 * r },
+                    { cmd: 'A', rx: r, ry: r, angle: 0, largeArc: 0, sweep: 0, x: x2, y: y2 - r },
+                    { cmd: 'L', x: x2, y: y2 }
+                ];
+            } else {
+                if (!(laneX < x1 - r)) {
+                    throw new Error('render_canvas.js: EdgeRoute.intraGroup laneX must be left of source turn radius');
+                }
+                if (!(x2 - r > laneX)) {
+                    throw new Error('render_canvas.js: EdgeRoute.intraGroup laneX must be left of destination turn radius');
+                }
+                commands = [
+                    { cmd: 'M', x: x1, y: y1 },
+                    { cmd: 'L', x: x1, y: y1 + r },
+                    { cmd: 'A', rx: r, ry: r, angle: 0, largeArc: 0, sweep: 1, x: x1 - r, y: y1 + 2 * r },
+                    { cmd: 'L', x: laneX + r, y: y1 + 2 * r },
+                    { cmd: 'A', rx: r, ry: r, angle: 0, largeArc: 0, sweep: 0, x: laneX, y: y1 + 3 * r },
+                    { cmd: 'L', x: laneX, y: y2 - 3 * r },
+                    { cmd: 'A', rx: r, ry: r, angle: 0, largeArc: 0, sweep: 0, x: laneX + r, y: y2 - 2 * r },
+                    { cmd: 'L', x: x2 - r, y: y2 - 2 * r },
+                    { cmd: 'A', rx: r, ry: r, angle: 0, largeArc: 0, sweep: 1, x: x2, y: y2 - r },
+                    { cmd: 'L', x: x2, y: y2 }
+                ];
             }
-            if (!(x2 + r < laneX)) {
-                throw new Error('render_canvas.js: EdgeRoute.intraGroup laneX must be right of destination turn radius');
-            }
-            const commands = [
-                { cmd: 'M', x: x1, y: y1 },
-                { cmd: 'L', x: x1, y: y1 + r },
-                // turn 1: ↓→, sweep=0
-                { cmd: 'A', rx: r, ry: r, angle: 0, largeArc: 0, sweep: 0, x: x1 + r, y: y1 + 2 * r },
-                { cmd: 'L', x: laneX - r, y: y1 + 2 * r },
-                // turn 2: →↓, sweep=1
-                { cmd: 'A', rx: r, ry: r, angle: 0, largeArc: 0, sweep: 1, x: laneX, y: y1 + 3 * r },
-                { cmd: 'L', x: laneX, y: y2 - 3 * r },
-                // turn 3: ↓←, sweep=1
-                { cmd: 'A', rx: r, ry: r, angle: 0, largeArc: 0, sweep: 1, x: laneX - r, y: y2 - 2 * r },
-                { cmd: 'L', x: x2 + r, y: y2 - 2 * r },
-                // turn 4: ←↓, sweep=0
-                { cmd: 'A', rx: r, ry: r, angle: 0, largeArc: 0, sweep: 0, x: x2, y: y2 - r },
-                { cmd: 'L', x: x2, y: y2 }
-            ];
             const points = commands.map(function (c) { return { x: c.x, y: c.y }; });
-            // Skip-lane edges are always drawn in full (never truncated): the
-            // whole point of the side lane is to show the jump, so ``dashed`` is
-            // false regardless of arc length.
-            return { points: points, commands: commands, branch: 'intraGroup', dashed: false };
+            const dashed = polylineLength(points) >= LONG_EDGE_MIN_SPAN;
+            return { points: points, commands: commands, branch: 'intraGroup', dashed: dashed };
         },
         compute: function (routingMode, x1, y1, x2, y2, routeMeta, routeCtx) {
             if (routingMode === 'direct') {
@@ -2398,6 +2428,183 @@
         };
     }
 
+    function analyzeSkipLaneLayout(data, layoutMap, layoutInfo) {
+        if (!data || typeof data !== 'object') {
+            throw new Error('render_canvas.js: analyzeSkipLaneLayout requires data');
+        }
+        if (!layoutMap || typeof layoutMap !== 'object') {
+            throw new Error('render_canvas.js: analyzeSkipLaneLayout requires layoutMap');
+        }
+        const planByGroup = new Map();
+        Object.keys(layoutMap).forEach(function (gid) {
+            const pos = layoutMap[gid];
+            const childPositions = Array.isArray(pos && pos.childPositions) ? pos.childPositions : [];
+            const childBoxById = new Map();
+            const uniqueY = [];
+            const seenY = new Set();
+            childPositions.forEach(function (child) {
+                childBoxById.set(String(child.id), {
+                    x: child.x,
+                    y: child.y,
+                    w: child.w,
+                    h: child.h,
+                    cx: child.x + child.w / 2,
+                    cy: child.y + child.h / 2
+                });
+                if (!seenY.has(child.y)) {
+                    seenY.add(child.y);
+                    uniqueY.push(child.y);
+                }
+            });
+            uniqueY.sort(function (a, b) { return a - b; });
+            const rankByY = new Map();
+            uniqueY.forEach(function (y, idx) { rankByY.set(y, idx); });
+            const rankOf = {};
+            childPositions.forEach(function (child) {
+                rankOf[String(child.id)] = rankByY.get(child.y);
+            });
+            planByGroup.set(String(gid), {
+                baseWidth: pos.w,
+                childBoxById: childBoxById,
+                rankOf: rankOf,
+                laneIndexByEdgeKey: {},
+                laneSideByEdgeKey: {},
+                laneOffsetByEdgeKey: {},
+                hasSkipEdges: false,
+                leftCount: 0,
+                rightCount: 0,
+                leftPad: 0,
+                rightPad: 0
+            });
+        });
+        const childParent = new Map();
+        (data.groups || []).forEach(function (g) {
+            const gid = String(g.id);
+            (g.children_nodes || []).forEach(function (nid) {
+                childParent.set(String(nid), gid);
+            });
+            (g.children_group_ids || []).forEach(function (cgid) {
+                childParent.set(String(cgid), gid);
+            });
+        });
+        (data.edges || []).forEach(function (e) {
+            const fromId = String(e.from);
+            const toId = String(e.to);
+            const parentId = childParent.get(fromId);
+            if (!parentId || parentId !== childParent.get(toId)) {
+                return;
+            }
+            const plan = planByGroup.get(parentId);
+            if (!plan || !plan.childBoxById.has(fromId) || !plan.childBoxById.has(toId)) {
+                return;
+            }
+            const fromRank = plan.rankOf[fromId];
+            const toRank = plan.rankOf[toId];
+            if (fromRank === undefined || toRank === undefined || Math.abs(toRank - fromRank) <= 1) {
+                return;
+            }
+            const fromBox = plan.childBoxById.get(fromId);
+            const toBox = plan.childBoxById.get(toId);
+            const avgX = (fromBox.cx + toBox.cx) / 2;
+            const groupMidX = plan.baseWidth / 2;
+            const laneSide = avgX >= groupMidX ? 'right' : 'left';
+            const laneIdx = laneSide === 'right' ? plan.rightCount : plan.leftCount;
+            if (laneSide === 'right') {
+                plan.rightCount += 1;
+                plan.rightPad = EDGE_SKIP_LANE_LAYOUT_GUTTER;
+            } else {
+                plan.leftCount += 1;
+                plan.leftPad = EDGE_SKIP_LANE_LAYOUT_GUTTER;
+            }
+            const laneSlot = laneIdx > EDGE_SKIP_LANE_MAX_SLOT ? EDGE_SKIP_LANE_MAX_SLOT : laneIdx;
+            const laneOffset = EDGE_SKIP_LANE_BASE_OFFSET + laneSlot * EDGE_SKIP_LANE_OFFSET_STEP;
+            const edgeId = fromId + '->' + toId;
+            plan.hasSkipEdges = true;
+            plan.laneIndexByEdgeKey[edgeId] = laneIdx;
+            plan.laneSideByEdgeKey[edgeId] = laneSide;
+            plan.laneOffsetByEdgeKey[edgeId] = laneOffset;
+        });
+        const adjustedLayout = {};
+        function adjustGroup(gidRaw) {
+            const gid = String(gidRaw);
+            if (adjustedLayout[gid]) {
+                return adjustedLayout[gid];
+            }
+            const pos = layoutMap[gid];
+            if (!pos) {
+                throw new Error('render_canvas.js: skip-lane layout missing group ' + gid);
+            }
+            const plan = planByGroup.get(gid);
+            const leftPad = plan ? plan.leftPad : 0;
+            const rightPad = plan ? plan.rightPad : 0;
+            const childPositions = Array.isArray(pos.childPositions) ? pos.childPositions : [];
+            const newChildPositions = childPositions.map(function (child) {
+                let childW = child.w;
+                let childH = child.h;
+                if (child.type === 'group') {
+                    const childAdjusted = adjustGroup(child.id);
+                    childW = childAdjusted.w;
+                    childH = childAdjusted.h;
+                }
+                return Object.assign({}, child, {
+                    x: child.x + leftPad,
+                    w: childW,
+                    h: childH
+                });
+            });
+            let childLeftEdge = null;
+            let childRightEdge = null;
+            let newW = pos.w + leftPad + rightPad;
+            newChildPositions.forEach(function (child) {
+                childLeftEdge = (childLeftEdge === null) ? child.x : Math.min(childLeftEdge, child.x);
+                childRightEdge = (childRightEdge === null) ? (child.x + child.w) : Math.max(childRightEdge, child.x + child.w);
+                newW = Math.max(newW, child.x + child.w);
+            });
+            const routeCtx = {
+                hasSkipEdges: plan ? plan.hasSkipEdges : false,
+                rankOf: plan ? plan.rankOf : {},
+                laneIndexByEdgeKey: plan ? plan.laneIndexByEdgeKey : {},
+                laneSideByEdgeKey: plan ? plan.laneSideByEdgeKey : {},
+                laneOffsetByEdgeKey: plan ? plan.laneOffsetByEdgeKey : {},
+                leftCount: plan ? plan.leftCount : 0,
+                rightCount: plan ? plan.rightCount : 0,
+                groupLeft: 0,
+                groupRight: newW,
+                childLeftEdge: childLeftEdge,
+                childRightEdge: childRightEdge,
+                gutter: EDGE_SKIP_LANE_GUTTER
+            };
+            if (routeCtx.hasSkipEdges === true && (routeCtx.childLeftEdge === null || routeCtx.childRightEdge === null)) {
+                throw new Error('render_canvas.js: skip-lane routeCtx missing child edges for group ' + gid);
+            }
+            const adjusted = Object.assign({}, pos, {
+                w: newW,
+                childPositions: newChildPositions,
+                routeCtx: routeCtx
+            });
+            adjustedLayout[gid] = adjusted;
+            return adjusted;
+        }
+        const rootPositions = Array.isArray(layoutInfo.rootPositions) ? layoutInfo.rootPositions : [];
+        const rootWorldPad = EDGE_SKIP_LANE_GUTTER + EDGE_SKIP_LANE_BASE_OFFSET + EDGE_SKIP_LANE_OFFSET_STEP * EDGE_SKIP_LANE_MAX_SLOT;
+        rootPositions.forEach(function (root) {
+            const adjusted = adjustGroup(root.id);
+            const rootPlan = planByGroup.get(String(root.id));
+            if (rootPlan && rootPlan.leftPad > 0) {
+                root.x += rootPlan.leftPad;
+            }
+            root.w = adjusted.w;
+            root.h = adjusted.h;
+            layoutInfo.svgW = Math.max(layoutInfo.svgW, root.x + adjusted.w + rootWorldPad);
+        });
+        Object.keys(layoutMap).forEach(function (gid) {
+            if (!adjustedLayout[gid]) {
+                adjustGroup(gid);
+            }
+            layoutMap[gid] = adjustedLayout[gid];
+        });
+    }
+
     // Recompute the flowchart layout for the *current* ``collapsedState`` and
     // flatten it into per-id absolute-coordinate meta maps.  This is the
     // coordinate source for the incremental snapshots.
@@ -2434,6 +2641,7 @@
         if (!layoutMap) {
             throw new Error('render_canvas.js: computeVisibleScene requires groupLayout after computeFlowchartLayout');
         }
+        analyzeSkipLaneLayout(data, layoutMap, layoutInfo);
         const nodeMeta = new Map();
         const groupMeta = new Map();
         // childParent maps every visible direct child id (node or subgroup) to
@@ -2958,7 +3166,8 @@
                             const ek2 = String(routeFromId) + '->' + String(routeToId);
                             const laneIndex = rc.laneIndexByEdgeKey[ek2];
                             const laneSide = rc.laneSideByEdgeKey[ek2];
-                            if (laneIndex === undefined || laneSide === undefined) {
+                            const laneOffset = rc.laneOffsetByEdgeKey[ek2];
+                            if (laneIndex === undefined || laneSide === undefined || laneOffset === undefined) {
                                 throw new Error('render_canvas.js: skip-rank edge ' + ek2 +
                                     ' missing pre-assigned lane in group ' + pFrom);
                             }
@@ -2976,6 +3185,7 @@
                                 toRank: toRank,
                                 laneIndex: laneIndex,
                                 laneSide: laneSide,
+                                laneOffset: laneOffset,
                                 gutter: rc.gutter
                             };
                         }
