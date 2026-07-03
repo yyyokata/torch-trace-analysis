@@ -26,6 +26,15 @@ def _serialize_call_loc(loc: CallLoc | None) -> dict | None:
             {"file": frame.file, "line": frame.line, "function_name": frame.function_name}
             for frame in loc.frames
         ],
+        "top_framework_frame": (
+            {
+                "file": loc.top_framework_frame.file,
+                "line": loc.top_framework_frame.line,
+                "function_name": loc.top_framework_frame.function_name,
+            }
+            if loc.top_framework_frame is not None
+            else None
+        ),
     }
 
 

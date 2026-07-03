@@ -19,6 +19,7 @@ class CallLoc:
     line: int
     col: int
     frames: tuple[CallFrame, ...] = ()
+    top_framework_frame: CallFrame | None = None
 
 
 @dataclass

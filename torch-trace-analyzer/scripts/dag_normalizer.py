@@ -735,39 +735,11 @@ def _normalize_modelcode_root(modelcode_root: str | None) -> str | None:
 
 
 def _is_framework_node(node: DagNode, modelcode_root: str | None) -> bool:
-    """判断节点是否为框架层（torch / lgtorch）路径展开出来的算子节点。
-
-    - `node.call_loc is None` 直接返回 False（无法判定，保守视为非框架）。
-    - 优先使用 `call_loc.frames`；若为空，则回退到只看 `call_loc.file` 这一帧。
-      注意：这里的 "回退" 只是遍历目标从多帧退化为单帧，并未改变判定规则本身，
-      不属于禁止的静默 fallback。
-    - 任意一帧命中"框架路径"即为 True。命中规则：
-        * 若提供 modelcode_root 且路径落在其下，则该帧被排除。
-        * `site-packages` 且 (`torch` 或 `lgtorch`) 命中 → 框架。
-        * 路径包含 `lgtorch` 命中 → 框架。
-    """
+    del modelcode_root
     call_loc = node.call_loc
     if call_loc is None:
         return False
-
-    if call_loc.frames:
-        frame_paths = [frame.file for frame in call_loc.frames]
-    else:
-        frame_paths = [call_loc.file]
-
-    for raw_path in frame_paths:
-        if not raw_path:
-            continue
-        normalized_path = os.path.abspath(raw_path)
-        if modelcode_root is not None and normalized_path.startswith(modelcode_root):
-            continue
-        if "site-packages" in normalized_path and (
-            "torch" in normalized_path or "lgtorch" in normalized_path
-        ):
-            return True
-        if "lgtorch" in normalized_path:
-            return True
-    return False
+    return call_loc.top_framework_frame is not None
 
 
 def _apply_framework_pattern_grouping(
