@@ -1166,9 +1166,45 @@
             const dashed = polylineLength(points) >= LONG_EDGE_MIN_SPAN;
             return { points: points, branch: branch, dashed: dashed };
         },
-        compute: function (routingMode, x1, y1, x2, y2, routeMeta) {
+        // Skip-rank side-lane routing: an intra-group edge whose src/dst ranks
+        // differ by more than one is pushed out to a reserved gutter lane on the
+        // left or right side of the parent group and routed as an axis-aligned
+        // 4-point polyline, so it no longer crosses through the intermediate
+        // rows.  ``ctx`` is the edge-specific routing context baked in
+        // computeVisibleScene (all coordinate fields already in absolute world
+        // space): { groupLeft, groupRight, childLeftEdge, childRightEdge,
+        // fromRank, toRank, laneIndex, laneSide, gutter }.  The lane index/side
+        // are pre-assigned at layout time so the two routing passes
+        // (computeVisibleScene + patchEdgeView) agree byte-for-byte.
+        intraGroup: function (x1, y1, x2, y2, ctx) {
+            if (!ctx) {
+                throw new Error('render_canvas.js: EdgeRoute.intraGroup requires a routeCtx');
+            }
+            const laneIndex = ctx.laneIndex;
+            const laneSide = ctx.laneSide;
+            if (typeof laneIndex !== 'number' || (laneSide !== 'left' && laneSide !== 'right')) {
+                throw new Error('render_canvas.js: EdgeRoute.intraGroup routeCtx missing laneIndex/laneSide');
+            }
+            const laneX = laneSide === 'left'
+                ? (ctx.groupLeft + laneIndex * 12)
+                : (ctx.groupRight - laneIndex * 12);
+            const points = [
+                { x: x1, y: y1 },
+                { x: laneX, y: y1 },
+                { x: laneX, y: y2 },
+                { x: x2, y: y2 }
+            ];
+            // Skip-lane edges are always drawn in full (never truncated): the
+            // whole point of the side lane is to show the jump, so ``dashed`` is
+            // false regardless of arc length.
+            return { points: points, branch: 'intraGroup', dashed: false };
+        },
+        compute: function (routingMode, x1, y1, x2, y2, routeMeta, routeCtx) {
             if (routingMode === 'direct') {
                 return EdgeRoute.direct(x1, y1, x2, y2, routeMeta);
+            }
+            if (routingMode === 'intraGroup') {
+                return EdgeRoute.intraGroup(x1, y1, x2, y2, routeCtx);
             }
             throw new Error('render_canvas.js: unknown edge routing mode: ' + routingMode);
         }
@@ -1655,7 +1691,7 @@
     // any field is missing (no silent default fill, no fallback).
     const NODE_SNAPSHOT_FIELDS  = ['x', 'y', 'w', 'h', 'label', 'sublabel', 'fill', 'stroke', 'alpha'];
     const GROUP_SNAPSHOT_FIELDS = ['x', 'y', 'w', 'h', 'label', 'collapsed', 'fill', 'alpha', 'hasTiming', 'timingText'];
-    const EDGE_SNAPSHOT_FIELDS  = ['srcId', 'dstId', 'stroke', 'strokeWidth', 'alpha', 'dashed', 'arrowAlpha', 'isIO'];
+    const EDGE_SNAPSHOT_FIELDS  = ['srcId', 'dstId', 'stroke', 'strokeWidth', 'alpha', 'dashed', 'arrowAlpha', 'isIO', 'routingMode', 'routeCtx'];
 
     function requireSnapshotFields(kind, id, snapshot, fields) {
         if (!snapshot || typeof snapshot !== 'object') {
@@ -1943,7 +1979,7 @@
         if (!toPort) {
             throw new Error('patchEdgeView: dst view missing from pools/io: ' + snapshot.dstId);
         }
-        const route = EdgeRoute.compute('direct', fromPort.cx, fromPort.cy, toPort.cx, toPort.cy, snapshot.routeMeta || null);
+        const route = EdgeRoute.compute(snapshot.routingMode, fromPort.cx, fromPort.cy, toPort.cx, toPort.cy, snapshot.routeMeta || null, snapshot.routeCtx || null);
         // ``interactive`` mirrors the IO flag: IO edges are inert (no hover
         // reveal, hit-area ``eventMode='none'``); normal edges route hover through
         // the transparent hit-area while the visible stroke stays inert.
@@ -2296,6 +2332,11 @@
             srcId: edgeMeta.srcId,
             dstId: edgeMeta.dstId,
             routeMeta: edgeMeta.routeMeta || null,
+            // Routing mode + the edge-specific side-lane context (null for
+            // ``direct`` edges).  patchEdgeView replays EdgeRoute.compute with
+            // these so the polyline it re-derives matches this pass exactly.
+            routingMode: edgeMeta.routingMode || 'direct',
+            routeCtx: edgeMeta.routeCtx || null,
             stroke: edgeMeta.stroke,
             strokeWidth: edgeMeta.strokeWidth,
             alpha: edgeMeta.alpha,
@@ -2355,6 +2396,11 @@
         }
         const nodeMeta = new Map();
         const groupMeta = new Map();
+        // childParent maps every visible direct child id (node or subgroup) to
+        // its immediate parent group id.  It is the ground truth used by the
+        // skip-rank router to decide whether an edge's two endpoints live in the
+        // SAME parent group (a prerequisite for intraGroup side-lane routing).
+        const childParent = new Map();
         function walk(gid, ox, oy) {
             const pos = layoutMap[gid];
             if (!pos) {
@@ -2365,6 +2411,7 @@
             (pos.childPositions || []).forEach(function (child) {
                 const cx = ox + child.x;
                 const cy = oy + child.y;
+                childParent.set(String(child.id), String(gid));
                 if (child.type === 'node') {
                     nodeMeta.set(String(child.id), { x: cx, y: cy, w: child.w, h: child.h });
                 } else if (child.type === 'group') {
@@ -2380,7 +2427,7 @@
         if (focusActive) {
             augmentFocusBoundaryMeta(data, focusRootId, layoutInfo, nodeMeta, groupMeta);
         }
-        return { layoutInfo: layoutInfo, nodeMeta: nodeMeta, groupMeta: groupMeta };
+        return { layoutInfo: layoutInfo, nodeMeta: nodeMeta, groupMeta: groupMeta, childParent: childParent };
     }
 
     // ``augmentFocusBoundaryMeta`` positions the one-hop boundary cards around the
@@ -2586,6 +2633,10 @@
         const metaBundle = layoutMeta || computeLayoutMeta(data);
         const nodeMetaById = metaBundle.nodeMeta;
         const groupMetaById = metaBundle.groupMeta;
+        const childParentById = metaBundle.childParent;
+        // Live group layout map (carries the per-group ``routeCtx`` produced by
+        // layoutGroup) used to decide skip-rank side-lane routing below.
+        const groupLayoutMap = lookupGroupLayout();
 
         const groupIds = [];
         const nodeIds = [];
@@ -2843,7 +2894,55 @@
                 throw new Error('global edge endpoint missing: ' + e.from + ' -> ' + e.to);
             }
             const routeMeta = bundleMeta ? (bundleMeta.get(edgeKeyFn(e)) || null) : null;
-            const route = EdgeRoute.compute('direct', fromPort.cx, fromPort.cy, toPort.cx, toPort.cy, routeMeta);
+            // ── Skip-rank side-lane routing decision ───────────────────────────
+            // An edge routes through a group's reserved side lane (``intraGroup``)
+            // when BOTH resolved endpoints are direct children of the SAME parent
+            // group, that group has skip edges, and the two children sit more than
+            // one rank apart.  Everything else stays ``direct``.  The lane
+            // index/side were pre-assigned at layout time (routeCtx), so the value
+            // is identical here and in patchEdgeView.  Focus mode keeps ``direct``
+            // (boundary cards are re-laid-out and not part of any group's rankOf).
+            let routingMode = 'direct';
+            let edgeRouteCtx = null;
+            if (!focusActive && childParentById) {
+                const pFrom = childParentById.get(String(routeFromId));
+                const pTo = childParentById.get(String(routeToId));
+                if (pFrom && pFrom === pTo && groupLayoutMap) {
+                    const parentLayout = groupLayoutMap[pFrom];
+                    const rc = parentLayout && parentLayout.routeCtx;
+                    if (rc && rc.hasSkipEdges === true) {
+                        const fromRank = rc.rankOf[String(routeFromId)];
+                        const toRank = rc.rankOf[String(routeToId)];
+                        if (fromRank !== undefined && toRank !== undefined &&
+                            Math.abs(toRank - fromRank) > 1) {
+                            const ek2 = String(routeFromId) + '->' + String(routeToId);
+                            const laneIndex = rc.laneIndexByEdgeKey[ek2];
+                            const laneSide = rc.laneSideByEdgeKey[ek2];
+                            if (laneIndex === undefined || laneSide === undefined) {
+                                throw new Error('render_canvas.js: skip-rank edge ' + ek2 +
+                                    ' missing pre-assigned lane in group ' + pFrom);
+                            }
+                            const gm = groupMetaById.get(pFrom);
+                            if (!gm) {
+                                throw new Error('render_canvas.js: skip-rank parent group meta missing: ' + pFrom);
+                            }
+                            routingMode = 'intraGroup';
+                            edgeRouteCtx = {
+                                groupLeft: gm.x + rc.groupLeft,
+                                groupRight: gm.x + rc.groupRight,
+                                childLeftEdge: gm.x + rc.childLeftEdge,
+                                childRightEdge: gm.x + rc.childRightEdge,
+                                fromRank: fromRank,
+                                toRank: toRank,
+                                laneIndex: laneIndex,
+                                laneSide: laneSide,
+                                gutter: rc.gutter
+                            };
+                        }
+                    }
+                }
+            }
+            const route = EdgeRoute.compute(routingMode, fromPort.cx, fromPort.cy, toPort.cx, toPort.cy, routeMeta, edgeRouteCtx);
             // EdgeRoute.direct returns null for a degenerate span (|dy|<3 &&
             // |dx|<3); such edges are not drawable and are dropped (legacy parity).
             if (!route) { return; }
@@ -2858,6 +2957,8 @@
                 srcId: routeFromId,
                 dstId: routeToId,
                 routeMeta: routeMeta,
+                routingMode: routingMode,
+                routeCtx: edgeRouteCtx,
                 dashed: route.dashed,
                 stroke: st.color,
                 strokeWidth: st.width,

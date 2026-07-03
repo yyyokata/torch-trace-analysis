@@ -952,7 +952,8 @@ indexGroupAncestors(DATA.root_groups.map(rid => groupMap[rid]).filter(Boolean));
 DATA.groups.forEach(g => {
     collapsedState[g.id] = g.depth >= 2 || g.is_native === true
         || g.synthetic_type === 'function_group'
-        || g.synthetic_type === 'callloc_group';
+        || g.synthetic_type === 'callloc_group'
+        || g.synthetic_type === 'framework_pattern';
 });
 // Top-level IO groups (Input/Param/Const) default to their adapter-provided collapsed state
 (DATA.io_groups || []).forEach(g => { if (!(g.id in collapsedState)) collapsedState[g.id] = g.collapsed; });
@@ -1405,9 +1406,55 @@ function layoutGroup(gid, containerWidth) {
         }
     }
 
+    // 5. Pre-assign a stable side + lane index to every skip-rank edge so the
+    // canvas router (which routes twice per frame: once in computeVisibleScene
+    // and once in patchEdgeView) produces byte-identical lanes both times.  A
+    // mutable counter walked at draw time would drift between the two passes.
+    // Coordinates here are LOCAL (group origin); the canvas router adds the
+    // group's absolute origin when it bakes the per-edge routeCtx.
+    const childPosById = {};
+    let childLeftEdge = Infinity, childRightEdge = -Infinity;
+    childPositions.forEach(cp => {
+        childPosById[cp.id] = cp;
+        if (cp.x < childLeftEdge) childLeftEdge = cp.x;
+        if (cp.x + cp.w > childRightEdge) childRightEdge = cp.x + cp.w;
+    });
+    if (!Number.isFinite(childLeftEdge)) { childLeftEdge = 0; childRightEdge = groupW; }
+    const laneIndexByEdgeKey = {};
+    const laneSideByEdgeKey = {};
+    if (hasSkipEdges) {
+        const groupMidX = (childLeftEdge + childRightEdge) / 2;
+        let leftCounter = 0, rightCounter = 0;
+        const rankOf = rankInfo.rank;
+        for (const ed of rankInfo.edges) {
+            const ra = rankOf[ed.from], rb = rankOf[ed.to];
+            if (ra === undefined || rb === undefined || Math.abs(rb - ra) <= 1) continue;
+            const cf = childPosById[ed.from], ct = childPosById[ed.to];
+            if (!cf || !ct) continue;
+            const avgX = ((cf.x + cf.w / 2) + (ct.x + ct.w / 2)) / 2;
+            const side = avgX >= groupMidX ? 'right' : 'left';
+            const idx = side === 'right' ? rightCounter++ : leftCounter++;
+            const k = ed.from + '->' + ed.to;
+            laneIndexByEdgeKey[k] = idx;
+            laneSideByEdgeKey[k] = side;
+        }
+    }
+
     groupLayout[gid] = {
         w: groupW, h: groupH, collapsed: false, childPositions,
-        rowLayouts, rankInfo
+        rowLayouts, rankInfo,
+        // Skip-rank side-lane routing context consumed by render_canvas.js.
+        routeCtx: {
+            hasSkipEdges,
+            gutter,
+            groupLeft: 0,
+            groupRight: groupW,
+            childLeftEdge,
+            childRightEdge,
+            rankOf: rankInfo.rank,
+            laneIndexByEdgeKey,
+            laneSideByEdgeKey
+        }
     };
     return { w: groupW, h: groupH };
 }
@@ -2949,7 +2996,7 @@ def _generate_flowchart_html_multi(tabs: dict[str, list[dict]]) -> str:
         "    (DATA.io_groups || []).forEach(g => {\n"
         "        (g.member_ids || []).forEach(nid => nodeAncestorGroups.set(nid, [g.id]));\n"
         "    });\n"
-        "    DATA.groups.forEach(g => { collapsedState[g.id] = g.depth >= 2 || g.is_native === true || g.synthetic_type === 'function_group' || g.synthetic_type === 'callloc_group'; });\n"
+        "    DATA.groups.forEach(g => { collapsedState[g.id] = g.depth >= 2 || g.is_native === true || g.synthetic_type === 'function_group' || g.synthetic_type === 'callloc_group' || g.synthetic_type === 'framework_pattern'; });\n"
         # Re-seed io_group collapsedState defaults that _resetSharedState() cleared.
         "    (DATA.io_groups || []).forEach(g => { if (!(g.id in collapsedState)) collapsedState[g.id] = g.collapsed; });\n"
         "}\n"
