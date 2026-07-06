@@ -1946,6 +1946,20 @@ if (typeof window !== 'undefined') {
         }
         showSourcePanel(n);
     };
+    // Phase 3 (edge interaction): a click on a revealed / IO edge forwards the
+    // edge key here (render_canvas.js' engine.onEdgeSelect).  The key is the
+    // canonical edgeKey() string (from||to||type||parent_class), so we resolve
+    // the full edge record from DATA.edges by re-deriving the same key.  A
+    // missing edge is a hard error — no silent fallback.
+    window.__canvasOnEdgeSelect = function (key) {
+        const edge = (DATA.edges || []).find(function (e) { return edgeKey(e) === key; });
+        if (!edge) {
+            throw new Error('__canvasOnEdgeSelect: edge not found for key ' + key);
+        }
+        const engine = (typeof window.__canvasEnginePhase1 === 'function') ? window.__canvasEnginePhase1() : null;
+        if (engine) { engine.selectedEdgeKey = key; }
+        showEdgePanel(edge);
+    };
 }
 
 // Phase 2 step 5 — Semantic Zoom helpers.

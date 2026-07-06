@@ -307,10 +307,15 @@
             // incremental path ran instead of a full re-render.
             incrementalRenderCount: 0,
             isIncrementalPatching: false,
-            // Phase 2 step 6 (edge style): key of the currently hovered edge, or
-            // null.  Only non-IO edges set it (IO edges suppress hover); when set,
-            // patchEdgeView reveals that edge's full polyline instead of the stubs.
-            hoveredEdgeKey: null
+            // Phase 3 (edge interaction): edge reveal is driven by hovering a
+            // group / node, not the edge itself.  ``hoveredGroupOrNodeId`` is the
+            // id of the currently hovered group/node (string) or null;
+            // ``revealedEdgeKeys`` is the set of edge keys whose full polyline is
+            // revealed for that hover (its src/dst resolves to the hovered id, IO
+            // edges excluded); ``selectedEdgeKey`` is the edge whose panel is open.
+            hoveredGroupOrNodeId: null,
+            revealedEdgeKeys: new Set(),
+            selectedEdgeKey: null
         };
         // Phase 2 step 3: ``engine.onGroupToggle`` / ``engine.onGroupSelect``
         // are the *engine-side* interaction hooks fired by ``bindGroupBox()``.
@@ -340,6 +345,17 @@
                 throw new Error('render_canvas.js: window.__canvasOnNodeSelect is not wired by inline runtime');
             }
             global.__canvasOnNodeSelect(nid);
+        };
+        // Phase 3 (edge interaction): a click on a revealed / IO edge hit-area
+        // forwards here.  The inline runtime installs
+        // ``window.__canvasOnEdgeSelect`` (looks the edge up in DATA.edges by key
+        // and opens the edge panel).  Late-bound at call time like the group /
+        // node hooks; a missing global throws hard (no silent fallback).
+        built.onEdgeSelect = function (key) {
+            if (typeof global.__canvasOnEdgeSelect !== 'function') {
+                throw new Error('render_canvas.js: window.__canvasOnEdgeSelect is not wired by inline runtime');
+            }
+            global.__canvasOnEdgeSelect(key);
         };
         built.viewportController = new ViewportController(built);
         built.cullManager = new CullManager();
@@ -954,6 +970,10 @@
             rightClick: null,
             rightDblClick: null
         });
+        // Phase 3 (edge interaction): hovering the group box reveals its
+        // associated (non-IO) edges' full polylines; leaving collapses them back.
+        box.on('pointerover', function () { setRevealedGroup(String(gid)); });
+        box.on('pointerout', function () { setRevealedGroup(null); });
     }
 
     // Phase 2: bind a *single* left-click handler to a leaf node hit box so a
@@ -972,6 +992,10 @@
             rightClick: null,
             rightDblClick: null
         });
+        // Phase 3 (edge interaction): hovering the node box reveals its
+        // associated (non-IO) edges' full polylines; leaving collapses them back.
+        box.on('pointerover', function () { setRevealedGroup(String(nid)); });
+        box.on('pointerout', function () { setRevealedGroup(null); });
     }
 
     function toggleIOGroup(ioGroupId) {
@@ -1837,47 +1861,62 @@
             hitArea: hitArea,
             arrow: null,
             visible: false,
-            // ``interactive`` gates hover participation: normal edges hover to
-            // reveal the full (un-truncated) polyline; IO edges are suppressed
-            // (set false in patchEdgeView from ``snapshot.isIO``).  Defaults
-            // false until the first patch resolves the snapshot's IO flag.
+            // ``interactive`` mirrors the non-IO flag (set in patchEdgeView from
+            // ``snapshot.isIO``).  It gates *reveal* participation: only non-IO
+            // edges reveal their full polyline when their src/dst group/node is
+            // hovered.  Both IO and non-IO edges are clickable (open the edge
+            // panel); defaults false until the first patch resolves the IO flag.
             interactive: false,
             snapshot: null
         };
-        bindEdgeHover(view);
+        bindEdgeInteraction(view);
         return view;
     }
 
-    // Idempotent hover wiring for an edge hit-area.  ``pointerover`` /
-    // ``pointerout`` forward to ``setEdgeHover`` only when the edge is
-    // interactive (non-IO), so IO edges never trigger the reveal even if the
-    // runtime dispatches an event.  The visible stroke itself is inert; only the
-    // transparent hit-area participates in picking.
-    function bindEdgeHover(view) {
-        if (view.hitArea.__edgeHoverBound === true) { return; }
-        view.hitArea.__edgeHoverBound = true;
-        view.hitArea.on('pointerover', function () {
-            if (view.interactive === true) { setEdgeHover(view.key); }
-        });
-        view.hitArea.on('pointerout', function () {
-            if (view.interactive === true && engine.hoveredEdgeKey === view.key) {
-                setEdgeHover(null);
-            }
+    // Phase 3 (edge interaction): idempotent click wiring for an edge hit-area.
+    // A ``pointerdown`` on the transparent hit-area opens the edge panel via
+    // ``engine.onEdgeSelect``.  The hit-area spans the full polyline (including
+    // the hidden middle of a truncated long edge), so the whole line is
+    // clickable.  Both revealed non-IO edges and IO edges respond; a
+    // non-interactive non-IO edge (should not occur) is inert.
+    function bindEdgeInteraction(view) {
+        if (view.hitArea.__edgeInteractionBound === true) { return; }
+        view.hitArea.__edgeInteractionBound = true;
+        view.hitArea.on('pointerdown', function (evt) {
+            if (!view.interactive && view.snapshot && view.snapshot.isIO !== true) { return; }
+            if (evt && typeof evt.stopPropagation === 'function') { evt.stopPropagation(); }
+            engine.selectedEdgeKey = view.key;
+            engine.onEdgeSelect(view.key);
         });
     }
 
-    // Set (or clear, with ``null``) the hovered edge and re-patch only the
-    // affected edge views so the previously-hovered edge collapses back to its
-    // truncated stubs and the newly-hovered one reveals its full polyline.  IO
-    // edges are inert: patchEdgeView ignores hover for them.
-    function setEdgeHover(key) {
-        const newKey = (key === null || key === undefined) ? null : String(key);
-        if (engine.hoveredEdgeKey === newKey) { return; }
-        const prevKey = engine.hoveredEdgeKey;
-        engine.hoveredEdgeKey = newKey;
-        [prevKey, newKey].forEach(function (k) {
-            if (k === null) { return; }
-            const view = engine.edgePool.get(k);
+    // Phase 3 (edge interaction): set (or clear, with ``null``) the currently
+    // hovered group/node and recompute ``revealedEdgeKeys`` — the visible non-IO
+    // edges whose resolved src/dst id equals the hovered id.  Only the edges
+    // entering or leaving the revealed set are re-patched, so the previously
+    // revealed edges collapse back to their truncated stubs and the newly
+    // revealed ones show their full polyline.  IO edges never reveal.
+    function setRevealedGroup(id) {
+        const newId = (id === null || id === undefined) ? null : String(id);
+        if (engine.hoveredGroupOrNodeId === newId) { return; }
+        engine.hoveredGroupOrNodeId = newId;
+        const newKeys = new Set();
+        if (newId !== null) {
+            engine.edgePool.forEach(function (view, key) {
+                if (view.visible !== true) { return; }
+                const s = view.snapshot;
+                if (!s || s.isIO === true) { return; }
+                if (String(s.srcId) === newId || String(s.dstId) === newId) {
+                    newKeys.add(key);
+                }
+            });
+        }
+        const toRepatch = new Set();
+        engine.revealedEdgeKeys.forEach(function (k) { toRepatch.add(k); });
+        newKeys.forEach(function (k) { toRepatch.add(k); });
+        engine.revealedEdgeKeys = newKeys;
+        toRepatch.forEach(function (key) {
+            const view = engine.edgePool.get(key);
             if (view && view.visible === true && view.snapshot) {
                 patchEdgeView(view, view.snapshot);
             }
@@ -2042,27 +2081,31 @@
             throw new Error('patchEdgeView: dst view missing from pools/io: ' + snapshot.dstId);
         }
         const route = EdgeRoute.compute(snapshot.routingMode, fromPort.cx, fromPort.cy, toPort.cx, toPort.cy, snapshot.routeMeta || null, snapshot.routeCtx || null);
-        // ``interactive`` mirrors the IO flag: IO edges are inert (no hover
-        // reveal, hit-area ``eventMode='none'``); normal edges route hover through
-        // the transparent hit-area while the visible stroke stays inert.
+        // ``interactive`` mirrors the IO flag: only non-IO edges participate in
+        // hover-reveal (their src/dst group/node being hovered).  ``revealed`` is
+        // true when this edge is in the current reveal set (see setRevealedGroup).
+        // Both IO and non-IO edges are clickable, so the hit-area is always
+        // ``eventMode='static'`` and drawn along the full polyline; the visible
+        // stroke stays inert.
         const interactive = snapshot.isIO !== true;
+        const revealed = engine.revealedEdgeKeys.has(view.key);
         view.interactive = interactive;
         view.path.eventMode = 'none';
-        view.hitArea.eventMode = interactive ? 'static' : 'none';
+        view.hitArea.eventMode = 'static';
         // route is null only for a degenerate span; computeVisibleScene already
         // drops such edges, so this is defensive: clear-only, never draw garbage.
         if (route) {
             // ``dashed`` marks a long edge (polyline length >= LONG_EDGE_MIN_SPAN).
             // Long edges are truncated to head + tail stubs (middle hidden, arrow
-            // only at the dst stub) unless a normal edge is being hovered, in
-            // which case the full polyline is revealed.  IO edges never reveal on
-            // hover (``interactive`` is false), so they stay truncated.
-            const hovered = interactive && engine.hoveredEdgeKey === view.key;
-            const style = edgeDrawStyle(snapshot, hovered);
-            if (interactive) {
-                drawEdgeHitBands(view.hitArea, route.points, EDGE_HIT_WIDTH);
-            }
-            const truncate = snapshot.dashed === true && !hovered;
+            // only at the dst stub) unless the edge is revealed (its src/dst
+            // group/node is hovered), in which case the full polyline is shown.
+            // IO edges never reveal, so they stay truncated.
+            const style = edgeDrawStyle(snapshot, revealed);
+            // The hit-area always spans the FULL polyline (never the truncated
+            // stubs) so the whole line — including the hidden middle of a long
+            // edge — is clickable.  Drawn for IO and non-IO edges alike.
+            drawEdgeHitBands(view.hitArea, route.points, EDGE_HIT_WIDTH);
+            const truncate = snapshot.dashed === true && !revealed;
             if (truncate) {
                 drawTruncatedEdgePath(view.path, route.points, style, snapshot.isIO === true);
             } else {
@@ -3879,14 +3922,15 @@
     };
     global.__EdgeRoute = EdgeRoute;
     global.__EDGE_STYLE = EDGE_STYLE;
-    // Edge-style (Phase 2 step 6) test surface: arc-length truncation helpers,
-    // IO-edge classifier, truncation/dot constants, and the hover setter.
+    // Edge-style test surface: arc-length truncation helpers, IO-edge
+    // classifier, truncation/dot constants, and the Phase 3 reveal setter
+    // (``setRevealedGroup`` drives hover-reveal from a group/node id).
     global.__EdgeStyle = {
         takeHeadByLength: takeHeadByLength,
         takeTailByLength: takeTailByLength,
         polylineLength: polylineLength,
         isIOEdge: function (e) { ensureEngine(); return isIOEdge(e); },
-        setEdgeHover: function (key) { ensureEngine(); return setEdgeHover(key); },
+        setRevealedGroup: function (id) { ensureEngine(); return setRevealedGroup(id); },
         constants: {
             LONG_EDGE_MIN_SPAN: LONG_EDGE_MIN_SPAN,
             EDGE_TRUNCATE_HEAD: EDGE_TRUNCATE_HEAD,
@@ -3896,7 +3940,9 @@
             IO_EDGE_DOT_RING_COLOR: IO_EDGE_DOT_RING_COLOR
         }
     };
-    global.__canvasSetEdgeHover = function (key) { ensureEngine(); return setEdgeHover(key); };
+    // Phase 3 (edge interaction) test surface: drive hover-reveal directly by
+    // group/node id (null clears), mirroring the box pointerover/pointerout path.
+    global.__canvasSetRevealedGroup = function (id) { ensureEngine(); return setRevealedGroup(id); };
     global.__renderSnapshot = function () {
         ensureEngine();
         return buildSnapshot();
