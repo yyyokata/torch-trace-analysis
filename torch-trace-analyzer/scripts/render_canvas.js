@@ -3173,8 +3173,18 @@
                     if (rc && rc.hasSkipEdges === true) {
                         const fromRank = rc.rankOf[String(routeFromId)];
                         const toRank = rc.rankOf[String(routeToId)];
+                        // ``analyzeSkipLaneLayout`` pre-assigns lanes from child-center
+                        // geometry, but the renderer routes the live source out-port to
+                        // the live destination in-port.  A very tall collapsed source can
+                        // make those actual ports too close (or inverted) for the rounded
+                        // side-lane's vertical segment, so only select ``intraGroup`` when
+                        // the exact port coordinates satisfy the same 48px clearance
+                        // invariant that the lane planner uses.  Otherwise this edge is
+                        // not eligible for side-lane routing and stays on the direct route;
+                        // malformed routeCtx still raises inside EdgeRoute.intraGroup.
                         if (fromRank !== undefined && toRank !== undefined &&
-                            Math.abs(toRank - fromRank) > 1) {
+                            Math.abs(toRank - fromRank) > 1 &&
+                            (toPort.cy - 48 > fromPort.cy + 48)) {
                             const ek2 = String(routeFromId) + '->' + String(routeToId);
                             const laneIndex = rc.laneIndexByEdgeKey[ek2];
                             const laneSide = rc.laneSideByEdgeKey[ek2];
