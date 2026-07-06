@@ -1010,10 +1010,10 @@
     // ── EdgeRoute (pure geometry) ──────────────────────────────────────────
     const EDGE_SAMPLE_STEPS = 24;
     const LONG_EDGE_MIN_SPAN = 260;
-    const EDGE_SKIP_LANE_GUTTER = 32;
-    const EDGE_SKIP_LANE_LAYOUT_GUTTER = 36;
-    const EDGE_SKIP_LANE_BASE_OFFSET = 14;
-    const EDGE_SKIP_LANE_OFFSET_STEP = 9;
+    const EDGE_SKIP_LANE_GUTTER = 8;
+    const EDGE_SKIP_LANE_LAYOUT_GUTTER = 16;
+    const EDGE_SKIP_LANE_BASE_OFFSET = 6;
+    const EDGE_SKIP_LANE_OFFSET_STEP = 5;
     const EDGE_SKIP_LANE_MAX_SLOT = 3;
     // Long edges keep only a ``head`` stub at the src side and a ``tail`` stub
     // at the dst side; the middle is hidden.  Both measured by arc length.
@@ -1190,7 +1190,7 @@
             if (typeof ctx[edgeField] !== 'number' || !Number.isFinite(ctx[edgeField])) {
                 throw new Error('render_canvas.js: EdgeRoute.intraGroup routeCtx missing finite ' + edgeField);
             }
-            const r = 16;
+            const r = 10;
             if (typeof ctx.gutter !== 'number' || !Number.isFinite(ctx.gutter)) {
                 throw new Error('render_canvas.js: EdgeRoute.intraGroup routeCtx missing finite gutter');
             }
@@ -1198,7 +1198,7 @@
             const laneX = needsRightEdge
                 ? ctx.childRightEdge + gutter + ctx.laneOffset
                 : ctx.childLeftEdge - gutter - ctx.laneOffset;
-            if (!(y2 - 3 * r > y1 + 3 * r)) {
+            if (!(y2 - 2 * r > y1 + 2 * r)) {
                 throw new Error('render_canvas.js: EdgeRoute.intraGroup rounded lane vertical segment would flip');
             }
             let commands;
@@ -1211,15 +1211,13 @@
                 }
                 commands = [
                     { cmd: 'M', x: x1, y: y1 },
-                    { cmd: 'L', x: x1, y: y1 + r },
-                    { cmd: 'A', rx: r, ry: r, angle: 0, largeArc: 0, sweep: 0, x: x1 + r, y: y1 + 2 * r },
-                    { cmd: 'L', x: laneX - r, y: y1 + 2 * r },
-                    { cmd: 'A', rx: r, ry: r, angle: 0, largeArc: 0, sweep: 1, x: laneX, y: y1 + 3 * r },
-                    { cmd: 'L', x: laneX, y: y2 - 3 * r },
-                    { cmd: 'A', rx: r, ry: r, angle: 0, largeArc: 0, sweep: 1, x: laneX - r, y: y2 - 2 * r },
-                    { cmd: 'L', x: x2 + r, y: y2 - 2 * r },
-                    { cmd: 'A', rx: r, ry: r, angle: 0, largeArc: 0, sweep: 0, x: x2, y: y2 - r },
-                    { cmd: 'L', x: x2, y: y2 }
+                    { cmd: 'A', rx: r, ry: r, angle: 0, largeArc: 0, sweep: 0, x: x1 + r, y: y1 + r },
+                    { cmd: 'L', x: laneX - r, y: y1 + r },
+                    { cmd: 'A', rx: r, ry: r, angle: 0, largeArc: 0, sweep: 1, x: laneX, y: y1 + 2 * r },
+                    { cmd: 'L', x: laneX, y: y2 - 2 * r },
+                    { cmd: 'A', rx: r, ry: r, angle: 0, largeArc: 0, sweep: 1, x: laneX - r, y: y2 - r },
+                    { cmd: 'L', x: x2 + r, y: y2 - r },
+                    { cmd: 'A', rx: r, ry: r, angle: 0, largeArc: 0, sweep: 0, x: x2, y: y2 }
                 ];
             } else {
                 if (!(laneX < x1 - r)) {
@@ -1230,15 +1228,13 @@
                 }
                 commands = [
                     { cmd: 'M', x: x1, y: y1 },
-                    { cmd: 'L', x: x1, y: y1 + r },
-                    { cmd: 'A', rx: r, ry: r, angle: 0, largeArc: 0, sweep: 1, x: x1 - r, y: y1 + 2 * r },
-                    { cmd: 'L', x: laneX + r, y: y1 + 2 * r },
-                    { cmd: 'A', rx: r, ry: r, angle: 0, largeArc: 0, sweep: 0, x: laneX, y: y1 + 3 * r },
-                    { cmd: 'L', x: laneX, y: y2 - 3 * r },
-                    { cmd: 'A', rx: r, ry: r, angle: 0, largeArc: 0, sweep: 0, x: laneX + r, y: y2 - 2 * r },
-                    { cmd: 'L', x: x2 - r, y: y2 - 2 * r },
-                    { cmd: 'A', rx: r, ry: r, angle: 0, largeArc: 0, sweep: 1, x: x2, y: y2 - r },
-                    { cmd: 'L', x: x2, y: y2 }
+                    { cmd: 'A', rx: r, ry: r, angle: 0, largeArc: 0, sweep: 1, x: x1 - r, y: y1 + r },
+                    { cmd: 'L', x: laneX + r, y: y1 + r },
+                    { cmd: 'A', rx: r, ry: r, angle: 0, largeArc: 0, sweep: 0, x: laneX, y: y1 + 2 * r },
+                    { cmd: 'L', x: laneX, y: y2 - 2 * r },
+                    { cmd: 'A', rx: r, ry: r, angle: 0, largeArc: 0, sweep: 0, x: laneX + r, y: y2 - r },
+                    { cmd: 'L', x: x2 - r, y: y2 - r },
+                    { cmd: 'A', rx: r, ry: r, angle: 0, largeArc: 0, sweep: 1, x: x2, y: y2 }
                 ];
             }
             const points = commands.map(function (c) { return { x: c.x, y: c.y }; });
@@ -2510,7 +2506,7 @@
             }
             const fromBox = plan.childBoxById.get(fromId);
             const toBox = plan.childBoxById.get(toId);
-            if (!(toBox.cy - 48 > fromBox.cy + 48)) {
+            if (!(toBox.cy - 20 > fromBox.cy + 20)) {
                 return;
             }
             const avgX = (fromBox.cx + toBox.cx) / 2;
@@ -2656,6 +2652,31 @@
         // skip-rank router to decide whether an edge's two endpoints live in the
         // SAME parent group (a prerequisite for intraGroup side-lane routing).
         const childParent = new Map();
+        function collectChildParent(gid) {
+            const pos = layoutMap[gid];
+            if (!pos) {
+                throw new Error('render_canvas.js: computeVisibleScene missing layout for group ' + gid);
+            }
+            if (pos.collapsed) { return; }
+            (pos.childPositions || []).forEach(function (child) {
+                childParent.set(String(child.id), String(gid));
+                if (child.type === 'group') {
+                    collectChildParent(child.id);
+                    return;
+                }
+                if (child.type !== 'node') {
+                    throw new Error('render_canvas.js: computeVisibleScene unknown layout child type: ' + child.type);
+                }
+            });
+        }
+        (layoutInfo.rootPositions || []).forEach(function (root) {
+            collectChildParent(root.id);
+        });
+        const resolveAncestor = lookupResolveCollapsedAncestor();
+        if (typeof resolveAncestor !== 'function') {
+            throw new Error('render_canvas.js: computeLayoutMeta requires resolveCollapsedAncestor');
+        }
+        analyzeSkipLaneLayout(data, layoutMap, layoutInfo, childParent, resolveAncestor);
         function walk(gid, ox, oy) {
             const pos = layoutMap[gid];
             if (!pos) {
@@ -2666,7 +2687,6 @@
             (pos.childPositions || []).forEach(function (child) {
                 const cx = ox + child.x;
                 const cy = oy + child.y;
-                childParent.set(String(child.id), String(gid));
                 if (child.type === 'node') {
                     nodeMeta.set(String(child.id), { x: cx, y: cy, w: child.w, h: child.h });
                 } else if (child.type === 'group') {
@@ -2679,11 +2699,6 @@
         (layoutInfo.rootPositions || []).forEach(function (root) {
             walk(root.id, root.x, root.y);
         });
-        const resolveAncestor = lookupResolveCollapsedAncestor();
-        if (typeof resolveAncestor !== 'function') {
-            throw new Error('render_canvas.js: computeLayoutMeta requires resolveCollapsedAncestor');
-        }
-        analyzeSkipLaneLayout(data, layoutMap, layoutInfo, childParent, resolveAncestor);
         if (focusActive) {
             augmentFocusBoundaryMeta(data, focusRootId, layoutInfo, nodeMeta, groupMeta);
         }
@@ -3178,13 +3193,13 @@
                         // the live destination in-port.  A very tall collapsed source can
                         // make those actual ports too close (or inverted) for the rounded
                         // side-lane's vertical segment, so only select ``intraGroup`` when
-                        // the exact port coordinates satisfy the same 48px clearance
+                        // the exact port coordinates satisfy the same 20px clearance
                         // invariant that the lane planner uses.  Otherwise this edge is
                         // not eligible for side-lane routing and stays on the direct route;
                         // malformed routeCtx still raises inside EdgeRoute.intraGroup.
                         if (fromRank !== undefined && toRank !== undefined &&
                             Math.abs(toRank - fromRank) > 1 &&
-                            (toPort.cy - 48 > fromPort.cy + 48)) {
+                            (toPort.cy - 20 > fromPort.cy + 20)) {
                             const ek2 = String(routeFromId) + '->' + String(routeToId);
                             const laneIndex = rc.laneIndexByEdgeKey[ek2];
                             const laneSide = rc.laneSideByEdgeKey[ek2];
