@@ -972,8 +972,10 @@
         });
         // Phase 3 (edge interaction): hovering the group box reveals its
         // associated (non-IO) edges' full polylines; leaving collapses them back.
-        box.on('pointerover', function () { setRevealedGroup(String(gid)); });
-        box.on('pointerout', function () { setRevealedGroup(null); });
+        // ``pointerenter``/``pointerleave`` (not over/out) so child elements
+        // moving under the box do NOT bubble a spurious out → setRevealedGroup(null).
+        box.on('pointerenter', function () { setRevealedGroup(String(gid)); });
+        box.on('pointerleave', function () { setRevealedGroup(null); });
     }
 
     // Phase 2: bind a *single* left-click handler to a leaf node hit box so a
@@ -994,8 +996,10 @@
         });
         // Phase 3 (edge interaction): hovering the node box reveals its
         // associated (non-IO) edges' full polylines; leaving collapses them back.
-        box.on('pointerover', function () { setRevealedGroup(String(nid)); });
-        box.on('pointerout', function () { setRevealedGroup(null); });
+        // ``pointerenter``/``pointerleave`` (not over/out) so child elements
+        // moving under the box do NOT bubble a spurious out → setRevealedGroup(null).
+        box.on('pointerenter', function () { setRevealedGroup(String(nid)); });
+        box.on('pointerleave', function () { setRevealedGroup(null); });
     }
 
     function toggleIOGroup(ioGroupId) {
@@ -2084,14 +2088,16 @@
         // ``interactive`` mirrors the IO flag: only non-IO edges participate in
         // hover-reveal (their src/dst group/node being hovered).  ``revealed`` is
         // true when this edge is in the current reveal set (see setRevealedGroup).
-        // Both IO and non-IO edges are clickable, so the hit-area is always
-        // ``eventMode='static'`` and drawn along the full polyline; the visible
-        // stroke stays inert.
+        // The hit-area is clickable only when the edge is revealed (a non-IO edge
+        // whose group/node is hovered) or when it is an IO edge (always clickable);
+        // a non-revealed non-IO edge does not respond, so the hidden middle of a
+        // collapsed long edge cannot be clicked until it is revealed.  The visible
+        // stroke always stays inert.
         const interactive = snapshot.isIO !== true;
         const revealed = engine.revealedEdgeKeys.has(view.key);
         view.interactive = interactive;
         view.path.eventMode = 'none';
-        view.hitArea.eventMode = 'static';
+        view.hitArea.eventMode = (revealed || !interactive) ? 'static' : 'none';
         // route is null only for a degenerate span; computeVisibleScene already
         // drops such edges, so this is defensive: clear-only, never draw garbage.
         if (route) {
@@ -2103,7 +2109,7 @@
             const style = edgeDrawStyle(snapshot, revealed);
             // The hit-area always spans the FULL polyline (never the truncated
             // stubs) so the whole line — including the hidden middle of a long
-            // edge — is clickable.  Drawn for IO and non-IO edges alike.
+            // edge — is clickable once the edge is revealed / IO.
             drawEdgeHitBands(view.hitArea, route.points, EDGE_HIT_WIDTH);
             const truncate = snapshot.dashed === true && !revealed;
             if (truncate) {
