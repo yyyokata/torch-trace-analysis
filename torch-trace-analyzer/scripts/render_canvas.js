@@ -2428,12 +2428,18 @@
         };
     }
 
-    function analyzeSkipLaneLayout(data, layoutMap, layoutInfo) {
+    function analyzeSkipLaneLayout(data, layoutMap, layoutInfo, childParent, resolveAncestor) {
         if (!data || typeof data !== 'object') {
             throw new Error('render_canvas.js: analyzeSkipLaneLayout requires data');
         }
         if (!layoutMap || typeof layoutMap !== 'object') {
             throw new Error('render_canvas.js: analyzeSkipLaneLayout requires layoutMap');
+        }
+        if (!(childParent instanceof Map)) {
+            throw new Error('render_canvas.js: analyzeSkipLaneLayout requires childParent map');
+        }
+        if (typeof resolveAncestor !== 'function') {
+            throw new Error('render_canvas.js: analyzeSkipLaneLayout requires resolveAncestor');
         }
         const planByGroup = new Map();
         Object.keys(layoutMap).forEach(function (gid) {
@@ -2477,23 +2483,22 @@
                 rightPad: 0
             });
         });
-        const childParent = new Map();
-        (data.groups || []).forEach(function (g) {
-            const gid = String(g.id);
-            (g.children_nodes || []).forEach(function (nid) {
-                childParent.set(String(nid), gid);
-            });
-            (g.children_group_ids || []).forEach(function (cgid) {
-                childParent.set(String(cgid), gid);
-            });
-        });
+        const seenKeys = new Set();
         (data.edges || []).forEach(function (e) {
-            const fromId = String(e.from);
-            const toId = String(e.to);
+            const fromId = String(resolveAncestor(e.from));
+            const toId = String(resolveAncestor(e.to));
+            if (fromId === toId) {
+                return;
+            }
             const parentId = childParent.get(fromId);
             if (!parentId || parentId !== childParent.get(toId)) {
                 return;
             }
+            const dedupeKey = String(parentId) + '::' + fromId + '->' + toId;
+            if (seenKeys.has(dedupeKey)) {
+                return;
+            }
+            seenKeys.add(dedupeKey);
             const plan = planByGroup.get(parentId);
             if (!plan || !plan.childBoxById.has(fromId) || !plan.childBoxById.has(toId)) {
                 return;
@@ -2505,6 +2510,9 @@
             }
             const fromBox = plan.childBoxById.get(fromId);
             const toBox = plan.childBoxById.get(toId);
+            if (!(toBox.cy - 48 > fromBox.cy + 48)) {
+                return;
+            }
             const avgX = (fromBox.cx + toBox.cx) / 2;
             const groupMidX = plan.baseWidth / 2;
             const laneSide = avgX >= groupMidX ? 'right' : 'left';
@@ -2641,7 +2649,6 @@
         if (!layoutMap) {
             throw new Error('render_canvas.js: computeVisibleScene requires groupLayout after computeFlowchartLayout');
         }
-        analyzeSkipLaneLayout(data, layoutMap, layoutInfo);
         const nodeMeta = new Map();
         const groupMeta = new Map();
         // childParent maps every visible direct child id (node or subgroup) to
@@ -2672,6 +2679,11 @@
         (layoutInfo.rootPositions || []).forEach(function (root) {
             walk(root.id, root.x, root.y);
         });
+        const resolveAncestor = lookupResolveCollapsedAncestor();
+        if (typeof resolveAncestor !== 'function') {
+            throw new Error('render_canvas.js: computeLayoutMeta requires resolveCollapsedAncestor');
+        }
+        analyzeSkipLaneLayout(data, layoutMap, layoutInfo, childParent, resolveAncestor);
         if (focusActive) {
             augmentFocusBoundaryMeta(data, focusRootId, layoutInfo, nodeMeta, groupMeta);
         }
