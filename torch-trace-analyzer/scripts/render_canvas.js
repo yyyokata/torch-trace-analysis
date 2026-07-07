@@ -314,7 +314,9 @@
             // revealed for that hover (its src/dst resolves to the hovered id, IO
             // edges excluded); ``selectedEdgeKey`` is the edge whose panel is open.
             hoveredGroupOrNodeId: null,
+            selectedGroupOrNodeId: null,
             revealedEdgeKeys: new Set(),
+            ioRevealedEdgeKeys: new Set(),
             selectedEdgeKey: null
         };
         // Phase 2 step 3: ``engine.onGroupToggle`` / ``engine.onGroupSelect``
@@ -965,7 +967,17 @@
             // handler inside bindPointerGestures still fires to suppress the
             // browser context menu and to swallow the artefact left-``click``
             // Pixi v8 emits on right-mouse-up — but it invokes no callback here.
-            leftClick: function (e) { void e; engine.onGroupSelect(gid); },
+            leftClick: function (e) {
+                if (e && typeof e.stopPropagation === 'function') { e.stopPropagation(); }
+                const sid = String(gid);
+                if (engine.selectedGroupOrNodeId === sid) {
+                    engine.selectedGroupOrNodeId = null;
+                } else {
+                    engine.selectedGroupOrNodeId = sid;
+                }
+                refreshRevealedEdges(engine.hoveredGroupOrNodeId);
+                engine.onGroupSelect(gid);
+            },
             leftDblClick: function (e) { void e; engine.onGroupToggle(gid); },
             rightClick: null,
             rightDblClick: null
@@ -973,9 +985,9 @@
         // Phase 3 (edge interaction): hovering the group box reveals its
         // associated (non-IO) edges' full polylines; leaving collapses them back.
         // ``pointerenter``/``pointerleave`` (not over/out) so child elements
-        // moving under the box do NOT bubble a spurious out → setRevealedGroup(null).
-        box.on('pointerenter', function () { setRevealedGroup(String(gid)); });
-        box.on('pointerleave', function () { setRevealedGroup(null); });
+        // moving under the box do NOT bubble a spurious out → refreshRevealedEdges(null).
+        box.on('pointerenter', function () { refreshRevealedEdges(String(gid)); });
+        box.on('pointerleave', function () { refreshRevealedEdges(null); });
     }
 
     // Phase 2: bind a *single* left-click handler to a leaf node hit box so a
@@ -989,7 +1001,17 @@
         if (box.__phase2NodeEventsBound) { return; }
         box.__phase2NodeEventsBound = true;
         bindPointerGestures(box, {
-            leftClick: function (e) { void e; engine.onNodeSelect(nid); },
+            leftClick: function (e) {
+                if (e && typeof e.stopPropagation === 'function') { e.stopPropagation(); }
+                const sid = String(nid);
+                if (engine.selectedGroupOrNodeId === sid) {
+                    engine.selectedGroupOrNodeId = null;
+                } else {
+                    engine.selectedGroupOrNodeId = sid;
+                }
+                refreshRevealedEdges(engine.hoveredGroupOrNodeId);
+                engine.onNodeSelect(nid);
+            },
             leftDblClick: null,
             rightClick: null,
             rightDblClick: null
@@ -997,9 +1019,9 @@
         // Phase 3 (edge interaction): hovering the node box reveals its
         // associated (non-IO) edges' full polylines; leaving collapses them back.
         // ``pointerenter``/``pointerleave`` (not over/out) so child elements
-        // moving under the box do NOT bubble a spurious out → setRevealedGroup(null).
-        box.on('pointerenter', function () { setRevealedGroup(String(nid)); });
-        box.on('pointerleave', function () { setRevealedGroup(null); });
+        // moving under the box do NOT bubble a spurious out → refreshRevealedEdges(null).
+        box.on('pointerenter', function () { refreshRevealedEdges(String(nid)); });
+        box.on('pointerleave', function () { refreshRevealedEdges(null); });
     }
 
     function toggleIOGroup(ioGroupId) {
@@ -1887,10 +1909,46 @@
         if (view.hitArea.__edgeInteractionBound === true) { return; }
         view.hitArea.__edgeInteractionBound = true;
         view.hitArea.on('pointerdown', function (evt) {
-            if (!view.interactive && view.snapshot && view.snapshot.isIO !== true) { return; }
             if (evt && typeof evt.stopPropagation === 'function') { evt.stopPropagation(); }
+            const s = view.snapshot;
+            if (s && s.isIO === true) {
+                engine.ioRevealedEdgeKeys.add(view.key);
+                refreshRevealedEdges(engine.hoveredGroupOrNodeId);
+            }
             engine.selectedEdgeKey = view.key;
             engine.onEdgeSelect(view.key);
+        });
+    }
+
+    function refreshRevealedEdges(hoverId) {
+        engine.hoveredGroupOrNodeId = (hoverId === null || hoverId === undefined) ? null : String(hoverId);
+        const effectiveId = engine.selectedGroupOrNodeId || engine.hoveredGroupOrNodeId;
+        const newKeys = new Set();
+        engine.ioRevealedEdgeKeys.forEach(function (k) { newKeys.add(k); });
+        if (effectiveId !== null) {
+            engine.edgePool.forEach(function (view, key) {
+                if (view.visible !== true) { return; }
+                const s = view.snapshot;
+                if (!s || s.isIO === true) { return; }
+                if (String(s.srcId) === effectiveId || String(s.dstId) === effectiveId) {
+                    newKeys.add(key);
+                }
+            });
+        }
+        const toRepatch = new Set();
+        engine.revealedEdgeKeys.forEach(function (k) { toRepatch.add(k); });
+        newKeys.forEach(function (k) { toRepatch.add(k); });
+        engine.revealedEdgeKeys = newKeys;
+        engine.edgePool.forEach(function (view, key) {
+            if (view.visible !== true) { return; }
+            const s = view.snapshot;
+            if (s && s.isIO === true) { toRepatch.add(key); }
+        });
+        toRepatch.forEach(function (key) {
+            const view = engine.edgePool.get(key);
+            if (view && view.visible === true && view.snapshot) {
+                patchEdgeView(view, view.snapshot);
+            }
         });
     }
 
@@ -1901,30 +1959,7 @@
     // revealed edges collapse back to their truncated stubs and the newly
     // revealed ones show their full polyline.  IO edges never reveal.
     function setRevealedGroup(id) {
-        const newId = (id === null || id === undefined) ? null : String(id);
-        if (engine.hoveredGroupOrNodeId === newId) { return; }
-        engine.hoveredGroupOrNodeId = newId;
-        const newKeys = new Set();
-        if (newId !== null) {
-            engine.edgePool.forEach(function (view, key) {
-                if (view.visible !== true) { return; }
-                const s = view.snapshot;
-                if (!s || s.isIO === true) { return; }
-                if (String(s.srcId) === newId || String(s.dstId) === newId) {
-                    newKeys.add(key);
-                }
-            });
-        }
-        const toRepatch = new Set();
-        engine.revealedEdgeKeys.forEach(function (k) { toRepatch.add(k); });
-        newKeys.forEach(function (k) { toRepatch.add(k); });
-        engine.revealedEdgeKeys = newKeys;
-        toRepatch.forEach(function (key) {
-            const view = engine.edgePool.get(key);
-            if (view && view.visible === true && view.snapshot) {
-                patchEdgeView(view, view.snapshot);
-            }
-        });
+        refreshRevealedEdges(id);
     }
 
     function patchNodeView(view, snapshot) {
@@ -2087,17 +2122,21 @@
         const route = EdgeRoute.compute(snapshot.routingMode, fromPort.cx, fromPort.cy, toPort.cx, toPort.cy, snapshot.routeMeta || null, snapshot.routeCtx || null);
         // ``interactive`` mirrors the IO flag: only non-IO edges participate in
         // hover-reveal (their src/dst group/node being hovered).  ``revealed`` is
-        // true when this edge is in the current reveal set (see setRevealedGroup).
+        // true when this edge is in the current reveal set (see refreshRevealedEdges).
         // The hit-area is clickable only when the edge is revealed (a non-IO edge
-        // whose group/node is hovered) or when it is an IO edge (always clickable);
-        // a non-revealed non-IO edge does not respond, so the hidden middle of a
-        // collapsed long edge cannot be clicked until it is revealed.  The visible
-        // stroke always stays inert.
+        // whose group/node is hovered or selected) or when it is an IO edge whose
+        // owning group/node is selected or the edge itself has been clicked.  The
+        // visible stroke always stays inert.
         const interactive = snapshot.isIO !== true;
         const revealed = engine.revealedEdgeKeys.has(view.key);
+        const ioClickable = engine.selectedGroupOrNodeId !== null || engine.ioRevealedEdgeKeys.has(view.key);
         view.interactive = interactive;
         view.path.eventMode = 'none';
-        view.hitArea.eventMode = (revealed || !interactive) ? 'static' : 'none';
+        if (snapshot.isIO === true) {
+            view.hitArea.eventMode = ioClickable ? 'static' : 'none';
+        } else {
+            view.hitArea.eventMode = revealed ? 'static' : 'none';
+        }
         // route is null only for a degenerate span; computeVisibleScene already
         // drops such edges, so this is defensive: clear-only, never draw garbage.
         if (route) {
