@@ -1061,7 +1061,6 @@
     const EDGE_SAMPLE_STEPS = 24;
     const LONG_EDGE_MIN_SPAN = 260;
     const EDGE_SKIP_LANE_GUTTER = 8;
-    const EDGE_SKIP_LANE_LAYOUT_GUTTER = 16;
     const EDGE_SKIP_LANE_BASE_OFFSET = 6;
     const EDGE_SKIP_LANE_OFFSET_STEP = 5;
     const EDGE_SKIP_LANE_COUNT = 4;
@@ -2565,8 +2564,8 @@
                 hasSkipEdges: false,
                 leftCount: 0,
                 rightCount: 0,
-                leftPad: EDGE_SKIP_LANE_LAYOUT_GUTTER + (EDGE_SKIP_LANE_COUNT - 1) * EDGE_SKIP_LANE_OFFSET_STEP + EDGE_SKIP_LANE_BASE_OFFSET,
-                rightPad: EDGE_SKIP_LANE_LAYOUT_GUTTER + (EDGE_SKIP_LANE_COUNT - 1) * EDGE_SKIP_LANE_OFFSET_STEP + EDGE_SKIP_LANE_BASE_OFFSET
+                leftPad: 0,
+                rightPad: 0
             });
         });
         const seenKeys = new Set();
@@ -2627,8 +2626,6 @@
                 throw new Error('render_canvas.js: skip-lane layout missing group ' + gid);
             }
             const plan = planByGroup.get(gid);
-            const leftPad = plan ? plan.leftPad : 0;
-            const rightPad = plan ? plan.rightPad : 0;
             const childPositions = Array.isArray(pos.childPositions) ? pos.childPositions : [];
             const newChildPositions = childPositions.map(function (child) {
                 let childW = child.w;
@@ -2639,14 +2636,14 @@
                     childH = childAdjusted.h;
                 }
                 return Object.assign({}, child, {
-                    x: child.x + leftPad,
+                    x: child.x,
                     w: childW,
                     h: childH
                 });
             });
             let childLeftEdge = null;
             let childRightEdge = null;
-            let newW = pos.w + leftPad + rightPad;
+            let newW = pos.w;
             newChildPositions.forEach(function (child) {
                 childLeftEdge = (childLeftEdge === null) ? child.x : Math.min(childLeftEdge, child.x);
                 childRightEdge = (childRightEdge === null) ? (child.x + child.w) : Math.max(childRightEdge, child.x + child.w);
@@ -2681,10 +2678,6 @@
         const rootWorldPad = EDGE_SKIP_LANE_GUTTER + EDGE_SKIP_LANE_BASE_OFFSET + EDGE_SKIP_LANE_OFFSET_STEP * (EDGE_SKIP_LANE_COUNT - 1);
         rootPositions.forEach(function (root) {
             const adjusted = adjustGroup(root.id);
-            const rootPlan = planByGroup.get(String(root.id));
-            if (rootPlan && rootPlan.leftPad > 0) {
-                root.x += rootPlan.leftPad;
-            }
             root.w = adjusted.w;
             root.h = adjusted.h;
             layoutInfo.svgW = Math.max(layoutInfo.svgW, root.x + adjusted.w + rootWorldPad);
