@@ -1936,13 +1936,20 @@ if (typeof window !== 'undefined') {
             throw new Error('__canvasOnGroupSelect: unknown group id ' + gid);
         }
         const engine = (typeof window.__canvasEnginePhase1 === 'function') ? window.__canvasEnginePhase1() : null;
-        if (engine) { engine.selectedGroupId = gid; }
+        if (engine) {
+            engine.selectedGroupId = gid;
+            engine.ioRevealedEdgeKeys.clear();
+        }
         showSourcePanel(g);
     };
     window.__canvasOnNodeSelect = function (nid) {
         const n = nodeMap[nid];
         if (!n) {
             throw new Error('__canvasOnNodeSelect: unknown node id ' + nid);
+        }
+        const engine = (typeof window.__canvasEnginePhase1 === 'function') ? window.__canvasEnginePhase1() : null;
+        if (engine) {
+            engine.ioRevealedEdgeKeys.clear();
         }
         showSourcePanel(n);
     };
@@ -2474,11 +2481,19 @@ function showEdgePanel(edge) {
     sp.classList.add('open');
 }
 
-document.getElementById('sp-close').addEventListener('click', () => {
+function clearRevealAndClosePanel() {
+    const engine = (typeof window.__canvasEnginePhase1 === 'function') ? window.__canvasEnginePhase1() : null;
+    if (engine && typeof engine.clearIOReveal === 'function') {
+        engine.clearIOReveal();
+    }
     document.getElementById('side-panel').classList.remove('open');
     const focusBtn = document.getElementById('sp-focus');
     if (focusBtn) { focusBtn.classList.add('hidden'); focusBtn.onclick = null; }
-});
+}
+
+window.__canvasOnBackgroundClick = clearRevealAndClosePanel;
+
+document.getElementById('sp-close').addEventListener('click', clearRevealAndClosePanel);
 document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
         // Phase 2 step 5 — Semantic Zoom: ESC pops a focus level first.
@@ -2490,7 +2505,7 @@ document.addEventListener('keydown', (e) => {
             exitFocus();
             return;
         }
-        document.getElementById('side-panel').classList.remove('open');
+        clearRevealAndClosePanel();
         return;
     }
     const tag = e.target && e.target.tagName;

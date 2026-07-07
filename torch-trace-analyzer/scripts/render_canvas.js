@@ -359,6 +359,11 @@
             }
             global.__canvasOnEdgeSelect(key);
         };
+        built.clearIOReveal = function () {
+            engine.ioRevealedEdgeKeys.clear();
+            engine.selectedGroupOrNodeId = null;
+            refreshRevealedEdges(engine.hoveredGroupOrNodeId);
+        };
         built.viewportController = new ViewportController(built);
         built.cullManager = new CullManager();
         return built;
@@ -442,6 +447,14 @@
                 // `init()` may (re)create app.stage; (re-)attach the world graph.
                 if (eng.app.stage && typeof eng.app.stage.addChild === 'function') {
                     eng.app.stage.addChild(eng.world);
+                    eng.app.stage.on('pointerdown', function () {
+                        if (engine.selectedGroupOrNodeId !== null || engine.ioRevealedEdgeKeys.size > 0) {
+                            engine.clearIOReveal();
+                            if (typeof global.__canvasOnBackgroundClick === 'function') {
+                                global.__canvasOnBackgroundClick();
+                            }
+                        }
+                    });
                 }
             })();
         }
