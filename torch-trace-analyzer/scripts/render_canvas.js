@@ -2129,7 +2129,9 @@
         // visible stroke always stays inert.
         const interactive = snapshot.isIO !== true;
         const revealed = engine.revealedEdgeKeys.has(view.key);
-        const ioClickable = engine.selectedGroupOrNodeId !== null || engine.ioRevealedEdgeKeys.has(view.key);
+        const selectedId = engine.selectedGroupOrNodeId;
+        const ioClickable = engine.ioRevealedEdgeKeys.has(view.key) ||
+            (selectedId !== null && (String(snapshot.srcId) === selectedId || String(snapshot.dstId) === selectedId));
         view.interactive = interactive;
         view.path.eventMode = 'none';
         if (snapshot.isIO === true) {
