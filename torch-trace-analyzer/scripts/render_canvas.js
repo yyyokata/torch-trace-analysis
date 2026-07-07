@@ -1938,11 +1938,16 @@
         const newKeys = new Set();
         engine.ioRevealedEdgeKeys.forEach(function (k) { newKeys.add(k); });
         if (effectiveId !== null) {
+            function isEndpointOf(endpointId) {
+                const eid = String(endpointId);
+                const ancestors = engine.groupAncestors && engine.groupAncestors.get(eid);
+                return eid === effectiveId || !!(ancestors && ancestors.has(effectiveId));
+            }
             engine.edgePool.forEach(function (view, key) {
                 if (view.visible !== true) { return; }
                 const s = view.snapshot;
                 if (!s || s.isIO === true) { return; }
-                if (String(s.srcId) === effectiveId || String(s.dstId) === effectiveId) {
+                if (isEndpointOf(s.srcId) || isEndpointOf(s.dstId)) {
                     newKeys.add(key);
                 }
             });
@@ -2149,7 +2154,7 @@
         if (snapshot.isIO === true) {
             view.hitArea.eventMode = ioClickable ? 'static' : 'none';
         } else {
-            view.hitArea.eventMode = revealed ? 'static' : 'none';
+            view.hitArea.eventMode = (revealed || snapshot.dashed !== true) ? 'static' : 'none';
         }
         // route is null only for a degenerate span; computeVisibleScene already
         // drops such edges, so this is defensive: clear-only, never draw garbage.
@@ -2771,6 +2776,24 @@
             throw new Error('render_canvas.js: computeLayoutMeta requires resolveCollapsedAncestor');
         }
         analyzeSkipLaneLayout(data, layoutMap, layoutInfo, childParent, resolveAncestor);
+        function buildGroupAncestors() {
+            const groupAncestors = new Map();
+            const allVisibleIds = new Set([
+                ...Array.from(groupMeta.keys()).map(String),
+                ...Array.from(nodeMeta.keys()).map(String)
+            ]);
+            allVisibleIds.forEach(function (id) {
+                const ancestors = new Set();
+                let cur = childParent.get(String(id));
+                while (cur !== undefined && cur !== null) {
+                    const sid = String(cur);
+                    ancestors.add(sid);
+                    cur = childParent.get(sid);
+                }
+                groupAncestors.set(String(id), ancestors);
+            });
+            return groupAncestors;
+        }
         function walk(gid, ox, oy) {
             const pos = layoutMap[gid];
             if (!pos) {
@@ -2796,7 +2819,14 @@
         if (focusActive) {
             augmentFocusBoundaryMeta(data, focusRootId, layoutInfo, nodeMeta, groupMeta);
         }
-        return { layoutInfo: layoutInfo, nodeMeta: nodeMeta, groupMeta: groupMeta, childParent: childParent };
+        const groupAncestors = buildGroupAncestors();
+        return {
+            layoutInfo: layoutInfo,
+            nodeMeta: nodeMeta,
+            groupMeta: groupMeta,
+            childParent: childParent,
+            groupAncestors: groupAncestors
+        };
     }
 
     // ``augmentFocusBoundaryMeta`` positions the one-hop boundary cards around the
@@ -3375,6 +3405,7 @@
             edgeKeys: engine.visibleEdgeKeys
         };
         const layoutMeta = computeLayoutMeta(engine.dataRef);
+        engine.groupAncestors = layoutMeta.groupAncestors;
         applyWorldLayout(layoutMeta.layoutInfo);
         // Draw the IO pills BEFORE computeVisibleScene/diffAndPatch so the
         // ``engine.ioPillById`` index is live when edge routing (both the
@@ -3392,6 +3423,7 @@
         } finally {
             engine.isIncrementalPatching = false;
         }
+        refreshRevealedEdges(engine.hoveredGroupOrNodeId);
         performAutoFit();
         // scroll anchor: after expand/collapse, scroll so the toggled group appears near top of viewport
         if (opts && opts.anchorGid) {
