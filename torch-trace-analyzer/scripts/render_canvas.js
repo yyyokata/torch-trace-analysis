@@ -1064,7 +1064,7 @@
     const EDGE_SKIP_LANE_LAYOUT_GUTTER = 16;
     const EDGE_SKIP_LANE_BASE_OFFSET = 6;
     const EDGE_SKIP_LANE_OFFSET_STEP = 5;
-    const EDGE_SKIP_LANE_MAX_SLOT = 3;
+    const EDGE_SKIP_LANE_COUNT = 4;
     // Long edges keep only a ``head`` stub at the src side and a ``tail`` stub
     // at the dst side; the middle is hidden.  Both measured by arc length.
     const EDGE_TRUNCATE_HEAD = 40;
@@ -2565,8 +2565,8 @@
                 hasSkipEdges: false,
                 leftCount: 0,
                 rightCount: 0,
-                leftPad: 0,
-                rightPad: 0
+                leftPad: EDGE_SKIP_LANE_LAYOUT_GUTTER + (EDGE_SKIP_LANE_COUNT - 1) * EDGE_SKIP_LANE_OFFSET_STEP + EDGE_SKIP_LANE_BASE_OFFSET,
+                rightPad: EDGE_SKIP_LANE_LAYOUT_GUTTER + (EDGE_SKIP_LANE_COUNT - 1) * EDGE_SKIP_LANE_OFFSET_STEP + EDGE_SKIP_LANE_BASE_OFFSET
             });
         });
         const seenKeys = new Set();
@@ -2605,12 +2605,10 @@
             const laneIdx = laneSide === 'right' ? plan.rightCount : plan.leftCount;
             if (laneSide === 'right') {
                 plan.rightCount += 1;
-                plan.rightPad = EDGE_SKIP_LANE_LAYOUT_GUTTER;
             } else {
                 plan.leftCount += 1;
-                plan.leftPad = EDGE_SKIP_LANE_LAYOUT_GUTTER;
             }
-            const laneSlot = laneIdx > EDGE_SKIP_LANE_MAX_SLOT ? EDGE_SKIP_LANE_MAX_SLOT : laneIdx;
+            const laneSlot = laneIdx % EDGE_SKIP_LANE_COUNT;
             const laneOffset = EDGE_SKIP_LANE_BASE_OFFSET + laneSlot * EDGE_SKIP_LANE_OFFSET_STEP;
             const edgeId = fromId + '->' + toId;
             plan.hasSkipEdges = true;
@@ -2680,7 +2678,7 @@
             return adjusted;
         }
         const rootPositions = Array.isArray(layoutInfo.rootPositions) ? layoutInfo.rootPositions : [];
-        const rootWorldPad = EDGE_SKIP_LANE_GUTTER + EDGE_SKIP_LANE_BASE_OFFSET + EDGE_SKIP_LANE_OFFSET_STEP * EDGE_SKIP_LANE_MAX_SLOT;
+        const rootWorldPad = EDGE_SKIP_LANE_GUTTER + EDGE_SKIP_LANE_BASE_OFFSET + EDGE_SKIP_LANE_OFFSET_STEP * (EDGE_SKIP_LANE_COUNT - 1);
         rootPositions.forEach(function (root) {
             const adjusted = adjustGroup(root.id);
             const rootPlan = planByGroup.get(String(root.id));
