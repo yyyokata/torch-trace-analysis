@@ -710,15 +710,6 @@ def _extract_instance_keys_from_stack(frames, class_map):
     return keys
 
 
-def _is_backward_trace(traces):
-    if not traces:
-        return False
-    for t in traces:
-        if "Gradient" in t or "Backward" in t or "backward" in t:
-            return True
-    return False
-
-
 def build_kernel_stack_cost_table(events, source_files, fwdbwd_index):
     """Step 1a: 将所有 kernel 对齐到"堆栈-开销"记录。
 
@@ -752,7 +743,9 @@ def build_kernel_stack_cost_table(events, source_files, fwdbwd_index):
         ts = float(e.get("ts") or 0.0)
         tid = e.get("tid")
         traces = e.get("args", {}).get("stack", {}).get("stack_traces", [])
-        is_bwd = (tid in bwd_tids) or _is_backward_trace(traces)
+        ext_id = e.get("args", {}).get("External id")
+        cpu_op = ext_id_to_cpuop[ext_id]
+        is_bwd = cpu_op["tid"] in bwd_tids
         chains = _parse_user_frames(traces, source_files)
         kernel_rows[idx] = {
             "event": e,
@@ -775,7 +768,7 @@ def build_kernel_stack_cost_table(events, source_files, fwdbwd_index):
         if meta["traces"]:
             table[idx] = {
                 "dur_us": meta["dur_us"],
-                "phase": "bwd" if _is_backward_trace(meta["traces"]) else "fwd",
+                "phase": phase,
                 "chains": meta["chains"],
                 "mod_name": None,
                 "unmatched": False,
@@ -991,6 +984,7 @@ def build_kernel_attribution_table(events, source_files, class_map, step_infos, 
     cpu_op_by_tid = _build_cpu_op_index_by_tid(events) if fwdbwd_index else {}
     ext_to_module, ext_id_to_cpuop = _build_external_id_to_module_map(events)
     python_id_index = _build_python_id_index(events)
+    bwd_tids = set((fwdbwd_index or {}).get("by_bwd_tid", {}).keys())
 
     kernel_attribution = {}
     cpu_attribution = {}
@@ -1046,7 +1040,8 @@ def build_kernel_attribution_table(events, source_files, class_map, step_infos, 
         tid = e.get("tid")
         traces = e.get("args", {}).get("stack", {}).get("stack_traces", [])
         ext_id = e.get("args", {}).get("External id")
-        is_bwd = _is_backward_trace(traces)
+        cpu_op = ext_id_to_cpuop[ext_id]
+        is_bwd = cpu_op["tid"] in bwd_tids
         stats["total_kernels"] += 1
         stats["total_kernel_dur_us"] += dur
 
