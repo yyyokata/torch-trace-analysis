@@ -1038,6 +1038,7 @@ def build_kernel_attribution_table(events, source_files, class_map, step_infos, 
         stats["total_kernel_dur_us"] += dur
 
         inner_chains = _parse_user_frames(traces, source_files) if traces else []
+        user_frames = bool(inner_chains)
 
         if inner_chains:
             # Frame path: leaf module event (source of outer frames) via External id.
@@ -1061,6 +1062,16 @@ def build_kernel_attribution_table(events, source_files, class_map, step_infos, 
 
         if _store_from_module_chain(kernel_attribution, idx, leaf_event):
             stats["bwd_attributed" if is_bwd else "fwd_attributed"] += 1
+            continue
+
+        if ext_id is None and not user_frames:
+            stats.setdefault("skipped_no_ext_no_stack", []).append({
+                "idx": idx,
+                "name": e.get("name"),
+                "cat": e.get("cat"),
+                "ts": e.get("ts"),
+                "tid": e.get("tid"),
+            })
             continue
 
         raise RuntimeError(
