@@ -1550,6 +1550,19 @@ def analyze_source_hotspots(events, source_files):
 
 
 
+def _build_ast_frontends(source_files):
+    ast_frontends = {}
+    for fname in source_files.keys():
+        try:
+            ast_frontends[fname] = ASTFrontend(
+                source='\n'.join(source_files.get(fname, [])),
+                path=fname,
+            )
+        except Exception:
+            ast_frontends[fname] = None
+    return ast_frontends
+
+
 def _build_class_map_ast(source_files, ast_frontends=None):
     class_map = {}
     failed_files = set()
