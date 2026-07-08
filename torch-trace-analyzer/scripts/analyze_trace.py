@@ -426,7 +426,7 @@ def _build_external_id_to_module_map(events):
 
             ext_id = e.get("args", {}).get("External id")
             if ext_id is not None and module_stack:
-                ext_to_module.setdefault(ext_id, module_stack[-1][0].get("name"))
+                ext_to_module.setdefault(ext_id, module_stack[-1][0])
 
     return ext_to_module
 
@@ -658,13 +658,14 @@ def _extract_instance_keys_from_stack(frames, class_map):
     if first_idx != -1:
         # Outermost class attribution. If it was called from a user frame
         # that doesn't map to a class (e.g. main.py), use that as callsite.
-        # If it's the very first frame in the stack, use a <root> anchor.
+        # If it's the very first frame in the stack (no outer caller frame),
+        # anchor the callsite to the class's own frame (real file/line) — we
+        # never emit a synthetic "<root>" sentinel.
         cls = frame_classes[first_idx]
         if first_idx > 0:
             cf, cl = frames[first_idx-1][0], frames[first_idx-1][1]
         else:
-            # Use the class's start line as a stable anchor for the root.
-            cf, cl = "<root>", class_map.get((frames[0][0], cls), {}).get("start", 0)
+            cf, cl = frames[0][0], frames[0][1]
         
         root_key = (cls, cf, cl, ())
         keys.append(root_key)
@@ -794,7 +795,8 @@ def build_kernel_stack_cost_table(events, source_files, fwdbwd_index):
             continue
 
         ext_id = meta["event"].get("args", {}).get("External id")
-        mod_name = ext_to_module.get(ext_id)
+        mod_ev = ext_to_module.get(ext_id)
+        mod_name = mod_ev.get("name") if mod_ev else None
         if not mod_name:
             mod_name, _pidx = find_module_parent(meta["event"], events)
         normalized = _normalize_runtime_module_name(mod_name) if mod_name else None
@@ -810,29 +812,208 @@ def build_kernel_stack_cost_table(events, source_files, fwdbwd_index):
     return table
 
 
+_CALLFROM_RE = re.compile(r'^(.*):(\d+)$')
+
+
+def _parse_callfrom(callfrom):
+    """Parse a module event's ``CallFrom`` ("path/file.py:123") into a
+    (basename, lineno) frame. Returns None when missing / malformed."""
+    if not callfrom or not isinstance(callfrom, str):
+        return None
+    m = _CALLFROM_RE.match(callfrom.strip())
+    if not m:
+        return None
+    return (os.path.basename(m.group(1)), int(m.group(2)))
+
+
+def _build_python_id_index(events):
+    """Index nn.Module python_function events by their ``Python id`` so we can
+    walk the runtime module parent chain via ``Python parent id``."""
+    index = {}
+    for e in events:
+        if e.get("cat") != "python_function":
+            continue
+        if not str(e.get("name", "")).startswith("nn.Module:"):
+            continue
+        pid = e.get("args", {}).get("Python id")
+        if pid is None:
+            continue
+        index.setdefault(pid, e)
+    return index
+
+
+def _collect_module_chain(leaf_event, python_id_index, include_leaf):
+    """Walk ``Python parent id`` from ``leaf_event`` up to the outermost
+    module, returning the module events ordered outermost→leaf.
+
+    ``include_leaf`` controls whether ``leaf_event`` itself is part of the
+    returned chain (False → stop at the leaf's parent)."""
+    if leaf_event is None:
+        return []
+    chain = []
+    if include_leaf:
+        chain.append(leaf_event)
+    seen = set()
+    pid = leaf_event.get("args", {}).get("Python parent id")
+    while pid is not None and pid in python_id_index and pid not in seen:
+        seen.add(pid)
+        parent = python_id_index[pid]
+        chain.append(parent)
+        pid = parent.get("args", {}).get("Python parent id")
+    chain.reverse()
+    return chain
+
+
+def _collect_outer_frames(leaf_event, python_id_index):
+    """Outer frames = the ``CallFrom`` callsite of every module on the runtime
+    parent chain (outermost→leaf, including the leaf's own callsite), parsed as
+    (fname, lineno, "") frames compatible with ``_parse_user_frames`` output.
+
+    The leaf's own CallFrom is the callsite connecting its parent to it (it
+    lives in the parent's body), so it is the join point with the innermost
+    stack frames — the caller is responsible for de-duplicating it against the
+    first inner frame."""
+    chain = _collect_module_chain(leaf_event, python_id_index, include_leaf=True)
+    frames = []
+    for m in chain:
+        parsed = _parse_callfrom(m.get("args", {}).get("CallFrom"))
+        if parsed is None:
+            continue
+        frames.append((parsed[0], parsed[1], ""))
+    return frames
+
+
+def _join_outer_inner_frames(outer_frames, inner_frames):
+    """Concatenate outer (python_function parent chain) and inner (stack_traces)
+    frames, dropping the duplicated leaf callsite when the last outer frame and
+    the first inner frame point at the same (file, line)."""
+    if outer_frames and inner_frames:
+        o_last = outer_frames[-1]
+        i_first = inner_frames[0]
+        if o_last[0] == i_first[0] and o_last[1] == i_first[1]:
+            outer_frames = outer_frames[:-1]
+    return list(outer_frames) + list(inner_frames)
+
+
+def _build_instance_keys_from_module_chain(module_events):
+    """Build a full InstanceKey chain directly from module events (used when no
+    inner user frames exist, e.g. CPU ops or kernels without stack_traces).
+
+    Each module contributes a key (class_name, callsite_file, callsite_line,
+    ancestors_tuple) using its own runtime class name and its own ``CallFrom``
+    as the callsite. ancestors_tuple is the preceding modules' callsites."""
+    keys = []
+    ancestors = []
+    for m in module_events:
+        info = _normalize_runtime_module_name(m.get("name"))
+        cls = info.get("class_name") if info else None
+        parsed = _parse_callfrom(m.get("args", {}).get("CallFrom"))
+        if not cls or parsed is None:
+            continue
+        csf, csl = parsed
+        keys.append((cls, csf, csl, tuple(ancestors)))
+        ancestors.append((csf, csl))
+    return keys
+
+
+def _find_innermost_module_in_window(events, tid, start, end):
+    """Among nn.Module python_function events on ``tid`` whose interval
+    intersects [start, end], return the innermost one (smallest duration)."""
+    best = None
+    best_dur = None
+    for e in events:
+        if e.get("cat") != "python_function":
+            continue
+        if not str(e.get("name", "")).startswith("nn.Module:"):
+            continue
+        if e.get("tid") != tid:
+            continue
+        ts = e.get("ts")
+        if ts is None:
+            continue
+        dur = e.get("dur") or 0.0
+        if ts > end or ts + dur < start:
+            continue
+        if best is None or dur < best_dur:
+            best = e
+            best_dur = dur
+    return best
+
+
 def build_kernel_attribution_table(events, source_files, class_map, step_infos, fwdbwd_index):
-    """Step 2: for every kernel, decide which InstanceKey(s) it belongs to
-    and with what weight (weights sum to 1 per kernel).
+    """Step 2: for every kernel (and CPU op), decide which InstanceKey(s) it
+    belongs to and with what weight (weights sum to 1 per event).
 
     Returns (attribution, debug_stats):
-      attribution: {kernel_idx: {InstanceKey: weight}}
+      attribution: {event_idx: {leaf_InstanceKey: (full_chain, weight)}}
+        - full_chain: complete InstanceKey list, outermost→leaf. full_chain[-1]
+          is the leaf key the entry is stored under.
       debug_stats: counts dict
+
+    Full-chain construction (design/timing_parent_chain.md, 2026-07-08):
+      * outer frames = python_function parent chain ``CallFrom`` (walked via
+        ``Python id`` / ``Python parent id``), including the leaf's own callsite.
+      * inner frames = ``stack_traces`` user frames.
+      * the two segments are joined (leaf callsite de-duplicated at the seam),
+        then fed to ``_extract_instance_keys_from_stack``.
+      * when there are NO inner user frames (CPU op, or kernel without a usable
+        stack), the chain is built directly from the module event chain.
+      * ``<root>`` / ``<wrapped>`` sentinels are never produced; an event with
+        neither a resolvable module parent chain nor any user frame raises
+        RuntimeError instead of falling back to a synthetic key.
     """
     if not source_files or not class_map:
         return {}, {"total_kernels": 0, "fwd_attributed": 0, "bwd_attributed": 0,
-                    "wrapped_fallback": 0, "fwd_unattributed": 0, "bwd_unattributed": 0,
-                    "bwd_via_flow_narrowed": 0}
+                    "cpu_attributed": 0, "fwd_unattributed": 0, "bwd_unattributed": 0,
+                    "bwd_via_flow_narrowed": 0, "total_kernel_dur_us": 0.0}
 
     cpu_op_by_tid = _build_cpu_op_index_by_tid(events) if fwdbwd_index else {}
     ext_to_module = _build_external_id_to_module_map(events)
+    python_id_index = _build_python_id_index(events)
 
-    # Index forward kernels by enclosing forward scope (fwd_tid, [fwd_start,fwd_end])
-    # — actually we don't index globally; instead, for each backward kernel
-    # we find its fwd scope and re-scan forward kernels within that range.
-    # To make that efficient, pre-bucket forward kernels (with stack_traces)
-    # by tid, sorted by ts, and only those classified as 'forward' phase.
-    fwd_kernel_buckets = defaultdict(list)  # tid -> [(ts, ts+dur, kernel_idx, frames)]
-    kernel_meta = {}  # idx -> dict
+    attribution = {}
+    stats = {
+        "total_kernels": 0, "fwd_attributed": 0, "bwd_attributed": 0,
+        "cpu_attributed": 0, "fwd_unattributed": 0, "bwd_unattributed": 0,
+        "bwd_via_flow_narrowed": 0,
+        "total_kernel_dur_us": 0.0,
+    }
+
+    def _store_from_module_chain(idx, leaf_event):
+        """Attribute an event via its runtime module parent chain (no inner
+        frames). Returns True on success."""
+        module_events = _collect_module_chain(leaf_event, python_id_index, include_leaf=True)
+        full_chain = _build_instance_keys_from_module_chain(module_events)
+        if not full_chain:
+            return False
+        leaf = full_chain[-1]
+        attribution[idx] = {leaf: (full_chain, 1.0)}
+        return True
+
+    def _store_from_frames(idx, leaf_event, chains):
+        """Attribute via joined outer+inner frames across all stack chains.
+        Weight per leaf = hit_count / total_hits. Returns True on success."""
+        outer_frames = _collect_outer_frames(leaf_event, python_id_index)
+        hit_counts = {}
+        full_chains = {}
+        total_hits = 0
+        for chain in chains:
+            joined = _join_outer_inner_frames(outer_frames, chain)
+            chain_keys = _extract_instance_keys_from_stack(joined, class_map)
+            if not chain_keys:
+                continue
+            leaf = chain_keys[-1]
+            hit_counts[leaf] = hit_counts.get(leaf, 0) + 1
+            full_chains[leaf] = chain_keys
+            total_hits += 1
+        if total_hits == 0:
+            return False
+        attribution[idx] = {
+            k: (full_chains[k], cnt / total_hits) for k, cnt in hit_counts.items()
+        }
+        return True
+
+    # ---- kernels ----------------------------------------------------------
     for idx, e in enumerate(events):
         if e.get("cat") != "kernel":
             continue
@@ -840,126 +1021,60 @@ def build_kernel_attribution_table(events, source_files, class_map, step_infos, 
         if dur <= 0:
             continue
         ts = float(e.get("ts") or 0.0)
+        tid = e.get("tid")
         traces = e.get("args", {}).get("stack", {}).get("stack_traces", [])
+        ext_id = e.get("args", {}).get("External id")
         is_bwd = _is_backward_trace(traces)
-        kernel_meta[idx] = {
-            "ts": ts, "dur": dur, "tid": e.get("tid"),
-            "is_bwd": is_bwd, "traces": traces, "ext_id": e.get("args", {}).get("External id"),
-        }
-        if not is_bwd and traces:
-            chains = _parse_user_frames(traces, source_files)
-            # The fwd_kernel_buckets entry is currently informational
-            # (no downstream consumer yet); record the first non-empty
-            # chain so the bucket schema stays stable.
-            if chains:
-                fwd_kernel_buckets[e.get("tid")].append((ts, ts + dur, idx, chains[0]))
-    for tid in fwd_kernel_buckets:
-        fwd_kernel_buckets[tid].sort(key=lambda x: x[0])
-
-    attribution = {}
-    stats = {
-        "total_kernels": 0, "fwd_attributed": 0, "bwd_attributed": 0,
-        "wrapped_fallback": 0, "fwd_unattributed": 0, "bwd_unattributed": 0,
-        "bwd_via_flow_narrowed": 0,
-        "total_kernel_dur_us": 0.0,
-    }
-
-    def _wrapped_fallback(idx, mod_name):
-        info = _normalize_runtime_module_name(mod_name)
-        cls = info.get("class_name")
-        if not cls:
-            return False
-        # Synthesize a weak InstanceKey: ancestors empty, callsite_line None.
-        rt_idx = info.get("runtime_index")
-        callsite = info.get("callsite")
-        # Use callsite line if available; otherwise use runtime_index packed as -idx
-        cs_line = callsite if callsite is not None else (-(rt_idx or 0))
-        key = (cls, "<wrapped>", int(cs_line) if cs_line is not None else 0, ())
-        attribution[idx] = {key: 1.0}
-        return True
-
-    for idx, meta in kernel_meta.items():
         stats["total_kernels"] += 1
-        stats["total_kernel_dur_us"] += meta["dur"]
-        traces = meta["traces"]
-        is_bwd = meta["is_bwd"]
-        if not traces:
-            mod_name = ext_to_module.get(meta["ext_id"])
-            if not mod_name:
-                # Second-level fallback: walk parent chain via _P pointers.
-                mod_name, _pidx = find_module_parent(events[idx], events)
-            if mod_name and _wrapped_fallback(idx, mod_name):
-                stats["wrapped_fallback"] += 1
-                continue
-            if is_bwd:
-                stats["bwd_unattributed"] += 1
-            else:
-                stats["fwd_unattributed"] += 1
-            continue
+        stats["total_kernel_dur_us"] += dur
 
-        chains = _parse_user_frames(traces, source_files)
-        if not chains:
-            # Try wrapped fallback
-            mod_name = ext_to_module.get(meta["ext_id"])
-            if not mod_name:
-                mod_name, _pidx = find_module_parent(events[idx], events)
-            if mod_name and _wrapped_fallback(idx, mod_name):
-                stats["wrapped_fallback"] += 1
-                continue
-            if is_bwd:
-                stats["bwd_unattributed"] += 1
-            else:
-                stats["fwd_unattributed"] += 1
-            continue
+        inner_chains = _parse_user_frames(traces, source_files) if traces else []
 
-        # Accumulate leaf-InstanceKey hits across ALL traces of this kernel.
-        # Contract (P0-A, no-dedup):
-        #   * Every non-empty trace contributes +1 weight to its leaf key.
-        #   * If two traces resolve to the same leaf key, that key gets +2.
-        #   * Final weight = hit_count / total_hits (sum normalized to 1.0).
-        # This makes 1 kernel × N traces equivalent to N kernels each
-        # attributed once, as required by the timing contract.
-        hit_counts = {}
-        total_hits = 0
-        for chain in chains:
-            chain_keys = _extract_instance_keys_from_stack(chain, class_map)
-            if not chain_keys:
+        if inner_chains:
+            # Frame path: leaf module event (source of outer frames) via External id.
+            leaf_event = ext_to_module.get(ext_id)
+            if _store_from_frames(idx, leaf_event, inner_chains):
+                stats["bwd_attributed" if is_bwd else "fwd_attributed"] += 1
                 continue
-            leaf = chain_keys[-1]
-            hit_counts[leaf] = hit_counts.get(leaf, 0) + 1
-            total_hits += 1
 
-        if total_hits == 0:
-            mod_name = ext_to_module.get(meta["ext_id"])
-            if not mod_name:
-                mod_name, _pidx = find_module_parent(events[idx], events)
-            if mod_name and _wrapped_fallback(idx, mod_name):
-                stats["wrapped_fallback"] += 1
-                continue
-            if is_bwd:
-                stats["bwd_unattributed"] += 1
-            else:
-                stats["fwd_unattributed"] += 1
-            continue
-
+        # No usable inner user frames — recover the module chain directly.
+        leaf_event = None
         if is_bwd and fwdbwd_index and fwdbwd_index["all"]:
-            # Try to narrow via fwdbwd flow: find forward scope, then look
-            # for forward kernels whose stack reproduces the leaf keys —
-            # if there's a unique match, we keep the current weights.
-            scope = _resolve_fwdbwd_scope(fwdbwd_index, cpu_op_by_tid, meta["ts"], meta["tid"])
+            # Backward kernel: resolve the forward scope via fwdbwd flow, then
+            # pick the innermost forward module event to rebuild the fwd chain.
+            scope = _resolve_fwdbwd_scope(fwdbwd_index, cpu_op_by_tid, ts, tid)
             if scope is not None:
                 stats["bwd_via_flow_narrowed"] += 1
-            # Backward stack_traces already encode forward callsite chains
-            # (recorded by autograd), so the leaf keys are normally already
-            # correct. Flow-based narrowing is informational; we keep the
-            # accumulated weights.
+                fwd_start, fwd_end, fwd_tid = scope
+                leaf_event = _find_innermost_module_in_window(events, fwd_tid, fwd_start, fwd_end)
+        if leaf_event is None:
+            leaf_event = ext_to_module.get(ext_id)
 
-        # Normalize hit counts to weights summing to 1.0.
-        attribution[idx] = {k: cnt / total_hits for k, cnt in hit_counts.items()}
-        if is_bwd:
-            stats["bwd_attributed"] += 1
+        if _store_from_module_chain(idx, leaf_event):
+            stats["bwd_attributed" if is_bwd else "fwd_attributed"] += 1
+            continue
+
+        raise RuntimeError(
+            "Kernel idx=%d (ts=%s, tid=%s, ext_id=%s, is_bwd=%s) has neither a "
+            "resolvable module parent chain nor any user stack frame; refusing "
+            "to emit a sentinel attribution." % (idx, ts, tid, ext_id, is_bwd)
+        )
+
+    # ---- CPU ops ----------------------------------------------------------
+    for idx, e in enumerate(events):
+        if e.get("cat") != "cpu_op":
+            continue
+        py_parent = e.get("args", {}).get("Python parent id")
+        if py_parent is None or py_parent not in python_id_index:
+            continue
+        leaf_event = python_id_index[py_parent]
+        if _store_from_module_chain(idx, leaf_event):
+            stats["cpu_attributed"] += 1
         else:
-            stats["fwd_attributed"] += 1
+            raise RuntimeError(
+                "CPU op idx=%d (Python parent id=%s) resolved to a module event "
+                "but produced no InstanceKey chain." % (idx, py_parent)
+            )
 
     return attribution, stats
 
@@ -1005,7 +1120,9 @@ def rollup_instance_timing(kernel_attribution, events, step_infos, class_map, ro
         phase = classify_kernel_phase(ts, ts + dur, step_infos)
         if phase not in ("forward", "backward", "optimize", "other"):
             phase = "other"
-        for key, w in weights.items():
+        for key, entry in weights.items():
+            # entry == (full_chain, weight); rollup only needs the weight.
+            w = entry[1]
             rec = _ensure(key)
             rec["self_us"][phase] += dur * w
 
