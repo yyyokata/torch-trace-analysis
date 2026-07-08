@@ -1074,10 +1074,23 @@ def build_kernel_attribution_table(events, source_files, class_map, step_infos, 
             })
             continue
 
+        # Has ext_id but still cannot attribute and no user stack frames.
+        # Typical: optimizer/grad kernels where dispatcher records External id
+        # but the module parent chain is broken, and there is no user stack.
+        if not user_frames:
+            stats.setdefault("skipped_no_stack", []).append({
+                "idx": idx,
+                "name": e.get("name"),
+                "cat": e.get("cat"),
+                "ts": e.get("ts"),
+                "tid": e.get("tid"),
+                "ext_id": ext_id,
+            })
+            continue
+
         raise RuntimeError(
-            "Kernel idx=%d (ts=%s, tid=%s, ext_id=%s, is_bwd=%s) has neither a "
-            "resolvable module parent chain nor any user stack frame; refusing "
-            "to emit a sentinel attribution." % (idx, ts, tid, ext_id, is_bwd)
+            "Kernel idx=%d (ts=%s, tid=%s, ext_id=%s, is_bwd=%s) has user stack frames "
+            "but still cannot be attributed; refusing to emit a sentinel attribution." % (idx, ts, tid, ext_id, is_bwd)
         )
 
     # ---- CPU ops ----------------------------------------------------------
