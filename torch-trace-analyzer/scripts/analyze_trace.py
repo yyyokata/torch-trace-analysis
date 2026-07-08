@@ -405,12 +405,17 @@ def _normalize_runtime_module_name(mod_name):
 
 def _build_external_id_to_module_map(events):
     by_tid = defaultdict(list)
+    ext_id_to_cpuop = {}
     for e in events:
         if e.get("ph") != "X" or e.get("dur") is None:
             continue
         if e.get("cat") == "kernel":
             continue
         by_tid[e.get("tid")].append(e)
+        if e.get("cat") == "cpu_op":
+            ext_id = e.get("args", {}).get("External id")
+            if ext_id is not None:
+                ext_id_to_cpuop.setdefault(ext_id, e)
 
     ext_to_module = {}
     for tid, tid_events in by_tid.items():
@@ -430,7 +435,7 @@ def _build_external_id_to_module_map(events):
             if ext_id is not None and module_stack:
                 ext_to_module.setdefault(ext_id, module_stack[-1][0])
 
-    return ext_to_module
+    return ext_to_module, ext_id_to_cpuop
 
 
 # ==========================================================================
@@ -582,20 +587,29 @@ def _build_cpu_op_index_by_tid(events):
     return dict(by_tid)
 
 
-def _resolve_fwdbwd_scope(fwdbwd_index, cpu_op_by_tid, bwd_kernel_ts, bwd_kernel_tid):
-    """For a backward kernel at (ts, tid), find the corresponding forward
-    scope time range.
+def _resolve_fwdbwd_scope(kernel_event, fwdbwd_index, cpu_op_by_tid, ext_id_to_cpuop):
+    """For a backward kernel event, find the corresponding forward scope time
+    range.
 
     Returns (fwd_start, fwd_end, fwd_tid) or None.
     """
+    bwd_kernel_ts = float(kernel_event.get("ts") or 0.0)
+    bwd_kernel_tid = kernel_event.get("tid")
     cands = fwdbwd_index["by_bwd_tid"].get(bwd_kernel_tid, [])
     if not cands:
-        return None
+        ext_id = kernel_event.get("args", {}).get("External id")
+        cpu_op = ext_id_to_cpuop.get(ext_id) if ext_id is not None else None
+        if cpu_op is None:
+            return None
+        bwd_kernel_tid = cpu_op.get("tid")
+        bwd_kernel_ts = float(cpu_op.get("ts") or 0.0)
+        cands = fwdbwd_index["by_bwd_tid"].get(bwd_kernel_tid, [])
+        if not cands:
+            return None
     # Find the fwdbwd entry whose enclosing backward op contains bwd_kernel_ts.
     # Strategy: pick the entry with the largest bwd_ts <= kernel_ts whose
     # enclosing bwd op covers the kernel.
     chosen = None
-    chosen_op = None
     for ent in cands:
         if ent["bwd_ts"] > bwd_kernel_ts:
             continue
@@ -606,7 +620,6 @@ def _resolve_fwdbwd_scope(fwdbwd_index, cpu_op_by_tid, bwd_kernel_ts, bwd_kernel
         bwd_end = bwd_start + (bwd_op.get("dur") or 0.0)
         if bwd_start <= bwd_kernel_ts <= bwd_end:
             chosen = ent
-            chosen_op = bwd_op
             # Don't break — later entries (same op) override since they
             # represent finer-grained scope.
     if chosen is None:
@@ -722,7 +735,7 @@ def build_kernel_stack_cost_table(events, source_files, fwdbwd_index):
         return {}
 
     cpu_op_by_tid = _build_cpu_op_index_by_tid(events) if fwdbwd_index else {}
-    ext_to_module = _build_external_id_to_module_map(events)
+    ext_to_module, ext_id_to_cpuop = _build_external_id_to_module_map(events)
     bwd_tids = set((fwdbwd_index or {}).get("by_bwd_tid", {}).keys())
 
     # Forward kernels with usable user-frame chains; used by Path B to borrow
@@ -771,7 +784,7 @@ def build_kernel_stack_cost_table(events, source_files, fwdbwd_index):
 
         borrowed_chains = []
         if meta["is_bwd"] and fwdbwd_index:
-            scope = _resolve_fwdbwd_scope(fwdbwd_index, cpu_op_by_tid, meta["ts"], meta["tid"])
+            scope = _resolve_fwdbwd_scope(meta["event"], fwdbwd_index, cpu_op_by_tid, ext_id_to_cpuop)
             if scope is not None:
                 fwd_start, fwd_end, fwd_tid = scope
                 nearest = None
@@ -976,7 +989,7 @@ def build_kernel_attribution_table(events, source_files, class_map, step_infos, 
         )
 
     cpu_op_by_tid = _build_cpu_op_index_by_tid(events) if fwdbwd_index else {}
-    ext_to_module = _build_external_id_to_module_map(events)
+    ext_to_module, ext_id_to_cpuop = _build_external_id_to_module_map(events)
     python_id_index = _build_python_id_index(events)
 
     kernel_attribution = {}
@@ -1052,7 +1065,7 @@ def build_kernel_attribution_table(events, source_files, class_map, step_infos, 
         if is_bwd and fwdbwd_index and fwdbwd_index["all"]:
             # Backward kernel: resolve the forward scope via fwdbwd flow, then
             # pick the innermost forward module event to rebuild the fwd chain.
-            scope = _resolve_fwdbwd_scope(fwdbwd_index, cpu_op_by_tid, ts, tid)
+            scope = _resolve_fwdbwd_scope(e, fwdbwd_index, cpu_op_by_tid, ext_id_to_cpuop)
             if scope is not None:
                 stats["bwd_via_flow_narrowed"] += 1
                 fwd_start, fwd_end, fwd_tid = scope
