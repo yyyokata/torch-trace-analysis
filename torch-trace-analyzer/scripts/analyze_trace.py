@@ -32,10 +32,9 @@ from collections import Counter, defaultdict
 # Registering the half-built module under the canonical name ``analyze_trace``
 # (without overwriting an existing entry) makes the partial module visible
 # to ``frontend_html`` so imports resolve to *this* instance regardless of
-# how it was loaded.  All names referenced by frontend_html (ASTFrontend,
-# _build_class_map, _strip_inline_comment, build_static_module_tree, ...) are
-# defined further down in this file BEFORE ``from frontend_html import ...``
-# at the bottom triggers the cross-module import.
+# how it was loaded.  Names referenced by frontend_html are defined further
+# down in this file BEFORE ``from frontend_html import ...`` at the bottom
+# triggers the cross-module import.
 #
 # Three loading modes need to work:
 #
@@ -452,51 +451,6 @@ def _build_external_id_to_module_map(events):
 # ==========================================================================
 
 
-_STACK_FRAME_RE = re.compile(r'File "([^"]+)", line (\d+), in (\w+)')
-
-
-def _parse_user_frames(traces, source_files):
-    """Parse a list of trace strings into per-trace user-code frame chains.
-
-    Returns a list of frame chains, one per input trace, preserving the
-    original outer-first ordering inside each chain. Frames whose file is
-    not in source_files (third-party libs, torch internals) are dropped.
-    Empty chains (traces with no user frames) are filtered out.
-
-    Contract change (P0-A): previously this function returned a single flat
-    list and stopped at the first non-empty trace, which silently dropped
-    every additional trace recorded for a kernel and prevented multi-leaf
-    weight accumulation.  We now return all per-trace chains so downstream
-    can attribute weight across distinct leaf InstanceKeys (and accumulate
-    repeats when multiple traces resolve to the same key).
-
-    Returns:
-        list[list[(fname_basename, lineno, func_name)]]
-    """
-    if not traces or not source_files:
-        return []
-    chains = []
-    for trace in traces:
-        chain = []
-        for ln in trace.split("\n"):
-            m = _STACK_FRAME_RE.search(ln)
-            if not m:
-                continue
-            fpath, lineno_s, func = m.groups()
-            fname = os.path.basename(fpath)
-            if fname not in source_files:
-                continue
-            chain.append((fname, int(lineno_s), func))
-        if chain:
-            chains.append(chain)
-    return chains
-
-
-def _frame_class(fname, lineno, class_map):
-    cls, _ = _find_class_for_line(fname, lineno, class_map)
-    return cls
-
-
 def build_fwdbwd_flow_index(events):
     """Step 1: pair fwdbwd flow events (ph='s' on forward tid, ph='f' on
     backward tid) and resolve them to forward/backward op time ranges.
@@ -636,190 +590,6 @@ def _resolve_fwdbwd_scope(kernel_event, fwdbwd_index, cpu_op_by_tid, ext_id_to_c
 # Step 2: kernel attribution to InstanceKey
 # --------------------------------------------------------------------------
 
-def _extract_instance_keys_from_stack(frames, class_map):
-    """From a list of (fname, lineno, func_name) frames (outer→inner),
-    walk class boundaries and produce a list of InstanceKey ordered from
-    outermost to deepest.
-
-    InstanceKey = (class_name, callsite_file, callsite_line, ancestors_tuple)
-      - callsite_file/line: parent frame's (file, line) — i.e. where the
-        parent class's code calls into this child class.
-      - ancestors_tuple: ((file, line), ...) of all preceding callsites
-        outermost→inner, NOT including self.
-
-    Single-frame fallback: when only one user frame is present and it maps
-    to a class, emit a weak key for that class (callsite_file=<self>,
-    callsite_line=that frame's line, ancestors=()).  This lets us attribute
-    e.g. autograd-leaf kernels whose stack has only the leaf class's forward
-    method.
-
-    Returns [] only if no frame maps to any user class.
-    """
-    if not frames or not class_map:
-        return []
-    # Compute class for each frame.
-    frame_classes = []
-    for f in frames:
-        cls = _frame_class(f[0], f[1], class_map)
-        frame_classes.append(cls)
-    keys = []
-    # Find the first frame that maps to a class.
-    first_idx = -1
-    for i, cls in enumerate(frame_classes):
-        if cls:
-            first_idx = i
-            break
-
-    if first_idx != -1:
-        # Outermost class attribution. If it was called from a user frame
-        # that doesn't map to a class (e.g. main.py), use that as callsite.
-        # If it's the very first frame in the stack (no outer caller frame),
-        # anchor the callsite to the class's own frame (real file/line) — we
-        # never emit a synthetic "<root>" sentinel.
-        cls = frame_classes[first_idx]
-        if first_idx > 0:
-            cf, cl = frames[first_idx-1][0], frames[first_idx-1][1]
-        else:
-            cf, cl = frames[0][0], frames[0][1]
-        
-        root_key = (cls, cf, cl, ())
-        keys.append(root_key)
-        
-        ancestors = [(cf, cl)]
-        last_class = cls
-        last_frame = frames[first_idx]
-        for i in range(first_idx + 1, len(frames)):
-            cur_class = frame_classes[i]
-            if cur_class and last_class and cur_class != last_class:
-                key = (cur_class, last_frame[0], last_frame[1], tuple(ancestors))
-                keys.append(key)
-                ancestors.append((last_frame[0], last_frame[1]))
-            if cur_class:
-                last_class = cur_class
-            last_frame = frames[i]
-
-    if not keys:
-        # No class boundary detected. Emit a weak key for the deepest
-        # frame whose class is known so the kernel still gets attributed.
-        for i in range(len(frames) - 1, -1, -1):
-            cls = frame_classes[i]
-            if cls:
-                key = (cls, "<self>", frames[i][1], ())
-                keys.append(key)
-                break
-    return keys
-
-
-def build_kernel_stack_cost_table(events, source_files, fwdbwd_index):
-    """Step 1a: 将所有 kernel 对齐到"堆栈-开销"记录。
-
-    Returns:
-        dict[kernel_idx, {
-            "dur_us":    float,
-            "phase":     "fwd" | "bwd" | "other",
-            "chains":    list[list[(fname, lineno, func_name)]],
-            "mod_name":  str | None,
-            "unmatched": bool,
-        }]
-    """
-    if not events:
-        return {}
-
-    cpu_op_by_tid = _build_cpu_op_index_by_tid(events) if fwdbwd_index else {}
-    ext_to_module, ext_id_to_cpuop = _build_external_id_to_module_map(events)
-    bwd_tids = set((fwdbwd_index or {}).get("by_bwd_tid", {}).keys())
-
-    # Forward kernels with usable user-frame chains; used by Path B to borrow
-    # the nearest forward stack within the matched fwdbwd scope.
-    fwd_kernel_buckets = defaultdict(list)  # tid -> [(ts, idx, chains)]
-    kernel_rows = {}
-
-    for idx, e in enumerate(events):
-        if e.get("cat") != "kernel":
-            continue
-        dur = float(e.get("dur") or 0.0)
-        if dur <= 0:
-            continue
-        ts = float(e.get("ts") or 0.0)
-        tid = e.get("tid")
-        traces = e.get("args", {}).get("stack", {}).get("stack_traces", [])
-        ext_id = e.get("args", {}).get("External id")
-        cpu_op = ext_id_to_cpuop[ext_id]
-        is_bwd = cpu_op["tid"] in bwd_tids
-        chains = _parse_user_frames(traces, source_files)
-        kernel_rows[idx] = {
-            "event": e,
-            "ts": ts,
-            "tid": tid,
-            "dur_us": dur,
-            "traces": traces,
-            "chains": chains,
-            "is_bwd": is_bwd,
-        }
-        if (not is_bwd) and chains:
-            fwd_kernel_buckets[tid].append((ts, idx, chains))
-
-    for tid in fwd_kernel_buckets:
-        fwd_kernel_buckets[tid].sort(key=lambda x: x[0])
-
-    table = {}
-    for idx, meta in kernel_rows.items():
-        phase = "bwd" if meta["is_bwd"] else "fwd"
-        if meta["traces"]:
-            table[idx] = {
-                "dur_us": meta["dur_us"],
-                "phase": phase,
-                "chains": meta["chains"],
-                "mod_name": None,
-                "unmatched": False,
-            }
-            continue
-
-        borrowed_chains = []
-        if meta["is_bwd"] and fwdbwd_index:
-            scope = _resolve_fwdbwd_scope(meta["event"], fwdbwd_index, cpu_op_by_tid, ext_id_to_cpuop)
-            if scope is not None:
-                fwd_start, fwd_end, fwd_tid = scope
-                nearest = None
-                nearest_dist = None
-                for cand_ts, cand_idx, cand_chains in fwd_kernel_buckets.get(fwd_tid, []):
-                    if not (fwd_start <= cand_ts <= fwd_end):
-                        continue
-                    dist = abs(cand_ts - meta["ts"])
-                    if nearest is None or dist < nearest_dist:
-                        nearest = cand_chains
-                        nearest_dist = dist
-                if nearest:
-                    borrowed_chains = nearest
-
-        if borrowed_chains:
-            table[idx] = {
-                "dur_us": meta["dur_us"],
-                "phase": "bwd",
-                "chains": borrowed_chains,
-                "mod_name": None,
-                "unmatched": False,
-            }
-            continue
-
-        ext_id = meta["event"].get("args", {}).get("External id")
-        mod_ev = ext_to_module.get(ext_id)
-        mod_name = mod_ev.get("name") if mod_ev else None
-        if not mod_name:
-            mod_name, _pidx = find_module_parent(meta["event"], events)
-        normalized = _normalize_runtime_module_name(mod_name) if mod_name else None
-        class_name = normalized.get("class_name") if normalized else None
-        table[idx] = {
-            "dur_us": meta["dur_us"],
-            "phase": phase,
-            "chains": [],
-            "mod_name": class_name,
-            "unmatched": class_name is None,
-        }
-
-    return table
-
-
 _CALLFROM_RE = re.compile(r'^(.*):(\d+)$')
 
 
@@ -872,37 +642,6 @@ def _collect_module_chain(leaf_event, python_id_index, include_leaf):
     return chain
 
 
-def _collect_outer_frames(leaf_event, python_id_index):
-    """Outer frames = the ``CallFrom`` callsite of every module on the runtime
-    parent chain (outermost→leaf, including the leaf's own callsite), parsed as
-    (fname, lineno, "") frames compatible with ``_parse_user_frames`` output.
-
-    The leaf's own CallFrom is the callsite connecting its parent to it (it
-    lives in the parent's body), so it is the join point with the innermost
-    stack frames — the caller is responsible for de-duplicating it against the
-    first inner frame."""
-    chain = _collect_module_chain(leaf_event, python_id_index, include_leaf=True)
-    frames = []
-    for m in chain:
-        parsed = _parse_callfrom(m.get("args", {}).get("CallFrom"))
-        if parsed is None:
-            continue
-        frames.append((parsed[0], parsed[1], ""))
-    return frames
-
-
-def _join_outer_inner_frames(outer_frames, inner_frames):
-    """Concatenate outer (python_function parent chain) and inner (stack_traces)
-    frames, dropping the duplicated leaf callsite when the last outer frame and
-    the first inner frame point at the same (file, line)."""
-    if outer_frames and inner_frames:
-        o_last = outer_frames[-1]
-        i_first = inner_frames[0]
-        if o_last[0] == i_first[0] and o_last[1] == i_first[1]:
-            outer_frames = outer_frames[:-1]
-    return list(outer_frames) + list(inner_frames)
-
-
 def _build_instance_keys_from_module_chain(module_events):
     """Build a full InstanceKey chain directly from module events (used when no
     inner user frames exist, e.g. CPU ops or kernels without stack_traces).
@@ -948,7 +687,7 @@ def _find_innermost_module_in_window(events, tid, start, end):
     return best
 
 
-def build_kernel_attribution_table(events, source_files, class_map, step_infos, fwdbwd_index):
+def build_kernel_attribution_table(events, step_infos, fwdbwd_index):
     """Step 2: for every kernel / GPU memcpy / GPU memset / CPU op, decide
     which InstanceKey(s) it belongs to and with what weight (weights sum to 1
     per event).
@@ -960,27 +699,16 @@ def build_kernel_attribution_table(events, source_files, class_map, step_infos, 
         - only cat == "cpu_op"
       debug_stats: counts dict
 
-    Full-chain construction (design/timing_parent_chain.md, 2026-07-08):
-      * outer frames = python_function parent chain ``CallFrom`` (walked via
-        ``Python id`` / ``Python parent id``), including the leaf's own callsite.
-      * inner frames = ``stack_traces`` user frames.
-      * the two segments are joined (leaf callsite de-duplicated at the seam),
-        then fed to ``_extract_instance_keys_from_stack``.
-      * when there are NO inner user frames (CPU op, or kernel without a usable
-        stack), the chain is built directly from the module event chain.
+    Full-chain construction (runtime-only):
+      * every attributed event is mapped through the runtime nn.Module event
+        chain using ``Python id`` / ``Python parent id`` and ``CallFrom``.
+      * backward kernels first use fwdbwd flow to recover the corresponding
+        forward module scope, then fall back to the direct External id module
+        chain when the flow scope is unavailable.
       * ``<root>`` / ``<wrapped>`` sentinels are never produced; an event with
-        neither a resolvable module parent chain nor any user frame raises
-        RuntimeError instead of falling back to a synthetic key.
+        no resolvable module parent chain is reported in debug stats or raises
+        RuntimeError for inconsistent CPU parent chains.
     """
-    if not source_files or not class_map:
-        return (
-            {},
-            {},
-            {"total_kernels": 0, "fwd_attributed": 0, "bwd_attributed": 0,
-             "cpu_attributed": 0, "fwd_unattributed": 0, "bwd_unattributed": 0,
-             "bwd_via_flow_narrowed": 0, "total_kernel_dur_us": 0.0},
-        )
-
     cpu_op_by_tid = _build_cpu_op_index_by_tid(events) if fwdbwd_index else {}
     ext_to_module, ext_id_to_cpuop = _build_external_id_to_module_map(events)
     python_id_index = _build_python_id_index(events)
@@ -1006,29 +734,6 @@ def build_kernel_attribution_table(events, source_files, class_map, step_infos, 
         target[idx] = {leaf: (full_chain, 1.0)}
         return True
 
-    def _store_from_frames(target, idx, leaf_event, chains):
-        """Attribute via joined outer+inner frames across all stack chains.
-        Weight per leaf = hit_count / total_hits. Returns True on success."""
-        outer_frames = _collect_outer_frames(leaf_event, python_id_index)
-        hit_counts = {}
-        full_chains = {}
-        total_hits = 0
-        for chain in chains:
-            joined = _join_outer_inner_frames(outer_frames, chain)
-            chain_keys = _extract_instance_keys_from_stack(joined, class_map)
-            if not chain_keys:
-                continue
-            leaf = chain_keys[-1]
-            hit_counts[leaf] = hit_counts.get(leaf, 0) + 1
-            full_chains[leaf] = chain_keys
-            total_hits += 1
-        if total_hits == 0:
-            return False
-        target[idx] = {
-            k: (full_chains[k], cnt / total_hits) for k, cnt in hit_counts.items()
-        }
-        return True
-
     # ---- kernels ----------------------------------------------------------
     for idx, e in enumerate(events):
         if e.get("cat") not in ("kernel", "gpu_memcpy", "gpu_memset"):
@@ -1038,24 +743,12 @@ def build_kernel_attribution_table(events, source_files, class_map, step_infos, 
             continue
         ts = float(e.get("ts") or 0.0)
         tid = e.get("tid")
-        traces = e.get("args", {}).get("stack", {}).get("stack_traces", [])
         ext_id = e.get("args", {}).get("External id")
         cpu_op = ext_id_to_cpuop[ext_id]
         is_bwd = cpu_op["tid"] in bwd_tids
         stats["total_kernels"] += 1
         stats["total_kernel_dur_us"] += dur
 
-        inner_chains = _parse_user_frames(traces, source_files) if traces else []
-        user_frames = bool(inner_chains)
-
-        if inner_chains:
-            # Frame path: leaf module event (source of outer frames) via External id.
-            leaf_event = ext_to_module.get(ext_id)
-            if _store_from_frames(kernel_attribution, idx, leaf_event, inner_chains):
-                stats["bwd_attributed" if is_bwd else "fwd_attributed"] += 1
-                continue
-
-        # No usable inner user frames — recover the module chain directly.
         leaf_event = None
         if is_bwd and fwdbwd_index and fwdbwd_index["all"]:
             # Backward kernel: resolve the forward scope via fwdbwd flow, then
@@ -1072,8 +765,8 @@ def build_kernel_attribution_table(events, source_files, class_map, step_infos, 
             stats["bwd_attributed" if is_bwd else "fwd_attributed"] += 1
             continue
 
-        if ext_id is None and not user_frames:
-            stats.setdefault("skipped_no_ext_no_stack", []).append({
+        if ext_id is None:
+            stats.setdefault("skipped_no_ext", []).append({
                 "idx": idx,
                 "name": e.get("name"),
                 "cat": e.get("cat"),
@@ -1082,24 +775,18 @@ def build_kernel_attribution_table(events, source_files, class_map, step_infos, 
             })
             continue
 
-        # Has ext_id but still cannot attribute and no user stack frames.
-        # Typical: optimizer/grad kernels where dispatcher records External id
-        # but the module parent chain is broken, and there is no user stack.
-        if not user_frames:
-            stats.setdefault("skipped_no_stack", []).append({
-                "idx": idx,
-                "name": e.get("name"),
-                "cat": e.get("cat"),
-                "ts": e.get("ts"),
-                "tid": e.get("tid"),
-                "ext_id": ext_id,
-            })
-            continue
-
-        raise RuntimeError(
-            "Kernel idx=%d (ts=%s, tid=%s, ext_id=%s, is_bwd=%s) has user stack frames "
-            "but still cannot be attributed; refusing to emit a sentinel attribution." % (idx, ts, tid, ext_id, is_bwd)
-        )
+        # Has ext_id but still cannot attribute. Typical: optimizer/grad kernels
+        # where dispatcher records External id but the module parent chain is broken.
+        stats.setdefault("skipped_no_module_chain", []).append({
+            "idx": idx,
+            "name": e.get("name"),
+            "cat": e.get("cat"),
+            "ts": e.get("ts"),
+            "tid": e.get("tid"),
+            "ext_id": ext_id,
+        })
+        stats["bwd_unattributed" if is_bwd else "fwd_unattributed"] += 1
+        continue
 
     # ---- CPU ops ----------------------------------------------------------
     for idx, e in enumerate(events):
@@ -1124,7 +811,7 @@ def build_kernel_attribution_table(events, source_files, class_map, step_infos, 
 # Step 3: bottom-up self/inclusive rollup
 # --------------------------------------------------------------------------
 
-def rollup_instance_timing(kernel_attribution, cpu_attribution, events, step_infos, class_map, roots=None):
+def rollup_instance_timing(kernel_attribution, cpu_attribution, events, step_infos, roots=None):
     """Step 3: aggregate kernel durations into per-InstanceKey inclusive_us,
     collect cpu_op durations into cpu_us, then compute bottom-up kernel-only
     inclusive totals by walking the InstanceKey ancestors chain.
@@ -1154,6 +841,13 @@ def rollup_instance_timing(kernel_attribution, cpu_attribution, events, step_inf
             }
         return timings[key]
 
+    def _record_chain_relationships(weights):
+        for _leaf_key, entry in weights.items():
+            full_chain = entry[0]
+            for parent_key, child_key in zip(full_chain, full_chain[1:]):
+                _ensure(parent_key)["child_keys"].add(child_key)
+                _ensure(child_key)
+
     # Phase A: kernel leaf inclusive_us
     for idx, weights in kernel_attribution.items():
         e = events[idx]
@@ -1162,6 +856,7 @@ def rollup_instance_timing(kernel_attribution, cpu_attribution, events, step_inf
         phase = classify_kernel_phase(ts, ts + dur, step_infos)
         if phase not in ("forward", "backward", "optimize", "other"):
             phase = "other"
+        _record_chain_relationships(weights)
         for key, entry in weights.items():
             # entry == (full_chain, weight); rollup only needs the weight.
             w = entry[1]
@@ -1176,6 +871,7 @@ def rollup_instance_timing(kernel_attribution, cpu_attribution, events, step_inf
         phase = classify_kernel_phase(ts, ts + dur, step_infos)
         if phase not in ("forward", "backward", "optimize", "other"):
             phase = "other"
+        _record_chain_relationships(weights)
         for key, entry in weights.items():
             w = entry[1]
             rec = _ensure(key)
@@ -1188,25 +884,8 @@ def rollup_instance_timing(kernel_attribution, cpu_attribution, events, step_inf
         for ph in rec["cpu_us"]:
             rec["cpu_us"][ph] /= num_steps
 
-    # Phase B: parent-child relationships from ancestors
-    # parent of (cls, csf, csl, ancestors) = (parent_cls, parent_csf, parent_csl, ancestors[:-1])
-    # where parent_cls is the class containing (csf, csl).
-    for key in list(timings.keys()):
-        class_name, csf, csl, ancestors = key
-        if not ancestors:
-            continue  # top-level / weak key
-        # Find parent's class via class_map
-        parent_cls = _frame_class(csf, csl, class_map) if csf != "<wrapped>" else None
-        if not parent_cls:
-            continue
-        parent_csf, parent_csl = ancestors[-1]
-        parent_ancestors = ancestors[:-1]
-        parent_key = (parent_cls, parent_csf, parent_csl, parent_ancestors)
-        if parent_key not in timings:
-            # Synthesize parent record so its inclusive_us aggregates
-            # children even when no kernel directly attributed to parent.
-            _ensure(parent_key)
-        timings[parent_key]["child_keys"].add(key)
+    # Phase B: parent-child relationships were recorded from runtime module
+    # chains carried in kernel_attribution / cpu_attribution entries.
 
     # Phase C: bottom-up sum (topological order — leaves first).
     # Compute depth = len(ancestors); larger depth processed first.
@@ -1257,7 +936,7 @@ def rollup_instance_timing(kernel_attribution, cpu_attribution, events, step_inf
 # Step 4: instance + class panel data
 # --------------------------------------------------------------------------
 
-def build_timing_panel_data(instance_timing, class_map, step_dur_us):
+def build_timing_panel_data(instance_timing, step_dur_us):
     """Step 4: convert instance_timing → timing_data fields:
       - runtime_instance_timings_by_class (instance level)
       - class_durations / class_durations_fwd / class_durations_bwd
@@ -1329,7 +1008,7 @@ def build_timing_panel_data(instance_timing, class_map, step_dur_us):
     }
 
 
-def build_instance_timing_pipeline(events, source_files, class_map, step_infos, step_dur_us, roots=None):
+def build_instance_timing_pipeline(events, step_infos, step_dur_us, roots=None):
     """Top-level entry: runs Step 1→4 and returns timing_data fragment.
 
     Output keys:
@@ -1339,12 +1018,12 @@ def build_instance_timing_pipeline(events, source_files, class_map, step_infos, 
     """
     fwdbwd_index = build_fwdbwd_flow_index(events)
     kernel_attribution, cpu_attribution, stats = build_kernel_attribution_table(
-        events, source_files, class_map, step_infos, fwdbwd_index,
+        events, step_infos, fwdbwd_index,
     )
     instance_timing = rollup_instance_timing(
-        kernel_attribution, cpu_attribution, events, step_infos, class_map, roots=roots,
+        kernel_attribution, cpu_attribution, events, step_infos, roots=roots,
     )
-    panel = build_timing_panel_data(instance_timing, class_map, step_dur_us)
+    panel = build_timing_panel_data(instance_timing, step_dur_us)
     panel["_timing_pipeline_stats"] = stats
     num_steps = max(1, len(step_infos))
     panel["step_kernel_us"] = stats.get("total_kernel_dur_us", 0) / num_steps
@@ -1468,209 +1147,7 @@ def compute_timing_coverage_summary(groups):
     }
 
 
-def analyze_source_hotspots(events, source_files):
-    # Build class/method line range map
-    class_map = _build_class_map(source_files)
 
-    line_dur = defaultdict(lambda: {"fwd": 0.0, "bwd": 0.0})
-    class_dur = defaultdict(lambda: {"fwd": 0.0, "bwd": 0.0})
-    class_method_dur = defaultdict(lambda: {"fwd": 0.0, "bwd": 0.0})
-    total_kernel_dur = 0.0
-
-    for e in events:
-        if e.get("cat") != "kernel":
-            continue
-        dur = e.get("dur", 0)
-        total_kernel_dur += dur
-        st = e.get("args", {}).get("stack", {})
-        traces = st.get("stack_traces", [])
-        if not traces:
-            continue
-
-        is_bwd = any("Gradient" in t or "Backward" in t or "backward" in t for t in traces)
-        phase = "bwd" if is_bwd else "fwd"
-        n_traces = max(1, len(traces))
-        per_trace_dur = dur / n_traces
-
-        seen_classes = set()
-        seen_lines = set()
-        for trace in traces:
-            for tl in trace.split("\n"):
-                m = re.search(r'File "([^"]+)", line (\d+), in (\w+)', tl)
-                if not m:
-                    continue
-                fpath, lineno_s, func = m.groups()
-                fname = os.path.basename(fpath)
-                lineno = int(lineno_s)
-                loc = f"{fname}:{lineno_s}"
-
-                if loc not in seen_lines:
-                    seen_lines.add(loc)
-                    line_dur[loc][phase] += per_trace_dur
-
-                cname, mname = _find_class_for_line(fname, lineno, class_map)
-                if cname:
-                    ckey = f"{fname}:{cname}"
-                    if ckey not in seen_classes:
-                        seen_classes.add(ckey)
-                        class_dur[ckey][phase] += per_trace_dur
-                    if mname:
-                        cmkey = f"{ckey}.{mname}"
-                        if cmkey not in seen_classes:
-                            seen_classes.add(cmkey)
-                            class_method_dur[cmkey][phase] += per_trace_dur
-
-    # Sort classes by total time
-    sorted_classes = sorted(class_dur.items(), key=lambda x: -(x[1]["fwd"] + x[1]["bwd"]))
-    sorted_methods = sorted(class_method_dur.items(), key=lambda x: -(x[1]["fwd"] + x[1]["bwd"]))
-
-    # For top classes, collect hot lines
-    class_hot_lines = defaultdict(list)
-    for loc, phases in line_dur.items():
-        parts = loc.split(":")
-        fname, lineno = parts[0], int(parts[1])
-        cname, mname = _find_class_for_line(fname, lineno, class_map)
-        if cname:
-            total = phases["fwd"] + phases["bwd"]
-            class_hot_lines[f"{fname}:{cname}"].append((lineno, total, phases["fwd"], phases["bwd"], mname))
-
-    for k in class_hot_lines:
-        class_hot_lines[k].sort(key=lambda x: -x[1])
-
-    return {
-        "class_dur": dict(class_dur),
-        "class_method_dur": dict(class_method_dur),
-        "line_dur": {k: dict(v) for k, v in line_dur.items()},
-        "total_kernel_dur": total_kernel_dur,
-        "sorted_classes": sorted_classes,
-        "sorted_methods": sorted_methods,
-        "class_hot_lines": dict(class_hot_lines),
-        "class_map": class_map,
-    }
-
-
-
-def _build_ast_frontends(source_files):
-    ast_frontends = {}
-    for fname in source_files.keys():
-        try:
-            ast_frontends[fname] = ASTFrontend(
-                source='\n'.join(source_files.get(fname, [])),
-                path=fname,
-            )
-        except Exception:
-            ast_frontends[fname] = None
-    return ast_frontends
-
-
-def _build_class_map_ast(source_files, ast_frontends=None):
-    class_map = {}
-    failed_files = set()
-    if ast_frontends is None:
-        ast_frontends = _build_ast_frontends(source_files)
-    for fname, lines in source_files.items():
-        fe = ast_frontends.get(fname)
-        if fe is None:
-            failed_files.add(fname)
-            continue
-        file_failed = False
-        for cname, info in fe.class_registry.items():
-            cls_node = info.get("node")
-            start = getattr(cls_node, "lineno", None)
-            end = getattr(cls_node, "end_lineno", None)
-            if start is None or end is None:
-                file_failed = True
-                break
-            methods = {}
-            for method in info.get("methods", []):
-                mstart = method.get("lineno")
-                mend = method.get("end_lineno")
-                mname = method.get("name")
-                if not mname or mstart is None or mend is None:
-                    file_failed = True
-                    break
-                methods[mname] = (mstart, mend)
-            if file_failed:
-                break
-            class_map[(fname, cname)] = {"start": start, "end": end, "methods": methods}
-        if file_failed:
-            failed_files.add(fname)
-            for key in [k for k in class_map if k[0] == fname]:
-                class_map.pop(key, None)
-    return class_map, failed_files
-
-
-def _build_class_map(source_files, ast_frontends=None):
-    ast_map, failed_files = _build_class_map_ast(source_files, ast_frontends=ast_frontends)
-    if failed_files:
-        print(f"[WARN] AST parse failed for {len(failed_files)} file(s): {sorted(failed_files)}", file=sys.stderr)
-    return ast_map
-
-
-def _find_class_for_line(fname, lineno, class_map):
-    for (f, cname), info in class_map.items():
-        if f == fname and info["start"] <= lineno <= info["end"]:
-            for mname, (ms, me) in info["methods"].items():
-                if ms <= lineno <= me:
-                    return cname, mname
-            return cname, None
-    return None, None
-
-
-def enrich_kernel_modules_with_source(events, gpu_info, src_info):
-    """When source code is available, map top kernel HostModules to actual nn.Module class names
-    by using stack_traces to find the deepest user-code class in the call chain."""
-    if not gpu_info or not src_info:
-        return
-    class_map = src_info.get("class_map", {})
-    if not class_map:
-        return
-
-    # Build kernel -> source class mapping using stack_traces
-    kernel_source_class = defaultdict(lambda: defaultdict(float))
-    for e in events:
-        if e.get("cat") != "kernel":
-            continue
-        kname = e.get("name", "")
-        dur = e.get("dur", 0)
-        st = e.get("args", {}).get("stack", {})
-        traces = st.get("stack_traces", [])
-        if not traces:
-            continue
-        n_traces = max(1, len(traces))
-        per_dur = dur / n_traces
-        for trace in traces:
-            # Find the most specific (innermost) user source class in the stack
-            # Stack traces go from innermost (top) to outermost (bottom) typically,
-            # but in PyTorch traces they go outermost first. We want the leaf user class.
-            best_class = None
-            for tl in trace.split("\n"):
-                m = re.search(r'File "([^"]+)", line (\d+), in (\w+)', tl)
-                if not m:
-                    continue
-                fpath, lineno_s, func = m.groups()
-                if "site-packages" in fpath or "/usr/" in fpath:
-                    continue
-                fname = os.path.basename(fpath)
-                lineno = int(lineno_s)
-                cname, mname = _find_class_for_line(fname, lineno, class_map)
-                if cname:
-                    best_class = cname  # keep overwriting to get the last (leaf) match
-            if best_class:
-                kernel_source_class[kname][best_class] += per_dur
-
-    # Enrich top_kernel_modules: replace runtime names with source class names where possible
-    enriched = {}
-    for kname, runtime_modules in gpu_info["top_kernel_modules"].items():
-        source_classes = kernel_source_class.get(kname, {})
-        if source_classes:
-            sorted_src = sorted(source_classes.items(), key=lambda x: -x[1])
-            enriched[kname] = sorted_src
-        elif runtime_modules:
-            enriched[kname] = runtime_modules
-        else:
-            enriched[kname] = []
-    gpu_info["top_kernel_modules"] = enriched
 
 
 # ---------------------------------------------------------------------------
@@ -2933,110 +2410,6 @@ def save_comm_compute_overlap_md(overlap_info, gpu_info, L):
         L.append("")
 
 
-# ===========================================================================
-# Source code hotspot report
-# ===========================================================================
-
-def print_source_hotspot_report(src_info, source_files):
-    if not src_info:
-        return
-    print_header("源码热点分析 (Class/Module 粒度, 正向/反向分离)")
-    total = src_info["total_kernel_dur"]
-    print(f"  Kernel 总耗时 (带 stack_traces): {format_duration(total)}")
-    print()
-
-    # Per-class with fwd/bwd
-    print("  ── Class (nn.Module) 级别耗时 ──")
-    print(f"  {'Class':<45} {'Forward':>12} {'Backward':>12} {'Total':>12} {'占比':>8}")
-    print(f"  {'─'*45} {'─'*12} {'─'*12} {'─'*12} {'─'*8}")
-    for ckey, phases in src_info["sorted_classes"][:20]:
-        fwd, bwd = phases["fwd"], phases["bwd"]
-        t = fwd + bwd
-        print(f"  {ckey:<45} {format_duration(fwd):>12} {format_duration(bwd):>12} {format_duration(t):>12} {pct_str(t, total):>8}")
-    print()
-
-    # Per-class.method with fwd/bwd
-    print("  ── Class.Method 级别耗时 ──")
-    print(f"  {'Class.Method':<55} {'Forward':>12} {'Backward':>12} {'Total':>12} {'占比':>8}")
-    print(f"  {'─'*55} {'─'*12} {'─'*12} {'─'*12} {'─'*8}")
-    for cmkey, phases in src_info["sorted_methods"][:25]:
-        fwd, bwd = phases["fwd"], phases["bwd"]
-        t = fwd + bwd
-        print(f"  {cmkey:<55} {format_duration(fwd):>12} {format_duration(bwd):>12} {format_duration(t):>12} {pct_str(t, total):>8}")
-    print()
-
-    # Top classes with annotated hot code
-    for ckey, phases in src_info["sorted_classes"][:5]:
-        fwd, bwd = phases["fwd"], phases["bwd"]
-        t = fwd + bwd
-        if t < 1000:
-            continue
-        hot_lines = src_info["class_hot_lines"].get(ckey, [])[:10]
-        if not hot_lines:
-            continue
-        fname = ckey.split(":")[0]
-        cname = ckey.split(":")[1]
-        print(f"  ── {ckey} (fwd={format_duration(fwd)}, bwd={format_duration(bwd)}) ──")
-        lines = source_files.get(fname, [])
-        for lineno, dur_total, dur_fwd, dur_bwd, mname in hot_lines:
-            content = lines[lineno - 1].rstrip()[:80] if 0 < lineno <= len(lines) else ""
-            method_tag = f"[{mname}]" if mname else ""
-            phase_tag = ""
-            if dur_fwd > 0 and dur_bwd > 0:
-                phase_tag = f"fwd={format_duration(dur_fwd)},bwd={format_duration(dur_bwd)}"
-            elif dur_fwd > 0:
-                phase_tag = f"fwd={format_duration(dur_fwd)}"
-            else:
-                phase_tag = f"bwd={format_duration(dur_bwd)}"
-            print(f"    🔥 {format_duration(dur_total):>10} L{lineno:<5} {method_tag:<12} {content}")
-        print()
-
-
-def save_source_hotspot_markdown(src_info, source_files, L):
-    if not src_info:
-        return
-    total = src_info["total_kernel_dur"]
-    L.append("## 源码热点分析 (Class/Module 粒度)\n")
-    L.append(f"Kernel 总耗时 (带 stack_traces): {format_duration(total)}\n")
-
-    L.append("### Class (nn.Module) 级别耗时\n")
-    L.append("| Class | Forward | Backward | Total | 占比 |")
-    L.append("|-------|---------|----------|-------|------|")
-    for ckey, phases in src_info["sorted_classes"][:20]:
-        fwd, bwd = phases["fwd"], phases["bwd"]
-        t = fwd + bwd
-        L.append(f"| {ckey} | {format_duration(fwd)} | {format_duration(bwd)} | {format_duration(t)} | {pct_str(t, total)} |")
-    L.append("")
-
-    L.append("### Class.Method 级别耗时\n")
-    L.append("| Class.Method | Forward | Backward | Total | 占比 |")
-    L.append("|--------------|---------|----------|-------|------|")
-    for cmkey, phases in src_info["sorted_methods"][:25]:
-        fwd, bwd = phases["fwd"], phases["bwd"]
-        t = fwd + bwd
-        L.append(f"| {cmkey} | {format_duration(fwd)} | {format_duration(bwd)} | {format_duration(t)} | {pct_str(t, total)} |")
-    L.append("")
-
-    L.append("### 热点代码段\n")
-    for ckey, phases in src_info["sorted_classes"][:5]:
-        fwd, bwd = phases["fwd"], phases["bwd"]
-        t = fwd + bwd
-        if t < 1000:
-            continue
-        hot_lines = src_info["class_hot_lines"].get(ckey, [])[:10]
-        if not hot_lines:
-            continue
-        fname = ckey.split(":")[0]
-        L.append(f"**{ckey}** (fwd={format_duration(fwd)}, bwd={format_duration(bwd)})\n")
-        L.append("```python")
-        lines = source_files.get(fname, [])
-        for lineno, dur_total, dur_fwd, dur_bwd, mname in hot_lines:
-            content = lines[lineno - 1].rstrip()[:90] if 0 < lineno <= len(lines) else ""
-            L.append(f"# 🔥 {format_duration(dur_total)} (L{lineno}) [{mname or ''}]")
-            L.append(f"{content}")
-        L.append("```\n")
-    L.append("")
-
 
 # ===========================================================================
 # Per-thread timeline report
@@ -3147,9 +2520,8 @@ def save_lagrange_refs_md(lagrange_refs, L):
 
 def save_markdown_report(meta, trace_type, step_dur_us, step_decomp, thread_info, workers,
                          mod_info, gpu_info, dh_info, output_path, max_level=None,
-                         src_info=None, source_files=None, timelines=None,
-                         kernel_stacks=None, lagrange_refs=None, screenshot_path=None,
-                         num_steps=1, overlap_info=None):
+                         timelines=None, kernel_stacks=None, lagrange_refs=None,
+                         screenshot_path=None, num_steps=1, overlap_info=None):
     L = []
     L.append("# Torch Trace 训练分析报告\n")
 
@@ -3266,10 +2638,6 @@ def save_markdown_report(meta, trace_type, step_dur_us, step_decomp, thread_info
     # Comm/compute overlap
     if overlap_info:
         save_comm_compute_overlap_md(overlap_info, gpu_info, L)
-
-    # Source hotspot
-    if src_info and source_files:
-        save_source_hotspot_markdown(src_info, source_files, L)
 
     # Per-thread timeline
     if timelines:
@@ -3566,11 +2934,7 @@ def main():
 
     step_decomp = analyze_step_decomposition(events, thread_info, profiler_steps)
 
-    if source_files and is_enhanced:
-        print("  正在分析源码热点...")
-        src_info = analyze_source_hotspots(events, source_files, profiler_steps)
-    else:
-        src_info = None
+    src_info = None
 
     print("  正在构建 Module 层级...")
     module_tree, root_modules, mod_info = build_module_hierarchy(events, source_files)
