@@ -1550,6 +1550,43 @@ def analyze_source_hotspots(events, source_files):
 
 
 
+def _build_class_map_ast(source_files, ast_frontends=None):
+    class_map = {}
+    failed_files = set()
+    if ast_frontends is None:
+        ast_frontends = _build_ast_frontends(source_files)
+    for fname, lines in source_files.items():
+        fe = ast_frontends.get(fname)
+        if fe is None:
+            failed_files.add(fname)
+            continue
+        file_failed = False
+        for cname, info in fe.class_registry.items():
+            cls_node = info.get("node")
+            start = getattr(cls_node, "lineno", None)
+            end = getattr(cls_node, "end_lineno", None)
+            if start is None or end is None:
+                file_failed = True
+                break
+            methods = {}
+            for method in info.get("methods", []):
+                mstart = method.get("lineno")
+                mend = method.get("end_lineno")
+                mname = method.get("name")
+                if not mname or mstart is None or mend is None:
+                    file_failed = True
+                    break
+                methods[mname] = (mstart, mend)
+            if file_failed:
+                break
+            class_map[(fname, cname)] = {"start": start, "end": end, "methods": methods}
+        if file_failed:
+            failed_files.add(fname)
+            for key in [k for k in class_map if k[0] == fname]:
+                class_map.pop(key, None)
+    return class_map, failed_files
+
+
 def _build_class_map(source_files, ast_frontends=None):
     ast_map, failed_files = _build_class_map_ast(source_files, ast_frontends=ast_frontends)
     if failed_files:
@@ -3395,6 +3432,13 @@ def _expand_fstring_with_loop_vars(joined_str_node, loop_var_to_str_items: dict)
                 built.append(str(item))
         results.append(''.join(built))
     return results
+
+_FRONTEND_HTML_REEXPORT_NAMES = (
+    "generate_html_flowchart",
+    "generate_html_flowchart_dual",
+    "build_timing_data_from_trace",
+    "_generate_flowchart_html",
+)
 
 
 def __getattr__(name):  # noqa: D401 (PEP 562 module-level __getattr__)
