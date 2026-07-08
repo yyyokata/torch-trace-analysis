@@ -9,10 +9,11 @@ import re
 import copy
 import tarfile
 import argparse
+import bisect
 import subprocess
 import textwrap
 import tokenize
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 
 # ---------------------------------------------------------------------------
 # Module identity registration.
@@ -405,6 +406,7 @@ def _normalize_runtime_module_name(mod_name):
 def _build_external_id_to_module_map(events):
     by_tid = defaultdict(list)
     ext_id_to_cpuop = {}
+    ext_to_module = {}
     for e in events:
         if e.get("ph") != "X" or e.get("dur") is None:
             continue
@@ -416,23 +418,28 @@ def _build_external_id_to_module_map(events):
             if ext_id is not None:
                 ext_id_to_cpuop.setdefault(ext_id, e)
 
-    ext_to_module = {}
     for tid, tid_events in by_tid.items():
         tid_events.sort(key=lambda e: (e["ts"], -(e.get("dur") or 0), 0 if e.get("cat") == "python_function" else 1))
         module_stack = []
+        pending_cpu_ops = deque()
         for e in tid_events:
             start = e["ts"]
             end = start + (e.get("dur") or 0)
             while module_stack and module_stack[-1][1] <= start:
                 module_stack.pop()
+            while pending_cpu_ops and pending_cpu_ops[0][0] <= start:
+                pending_cpu_ops.popleft()
 
             is_module = e.get("cat") == "python_function" and str(e.get("name", "")).startswith("nn.Module:")
             if is_module:
                 module_stack.append((e, end))
 
             ext_id = e.get("args", {}).get("External id")
-            if ext_id is not None and module_stack:
-                ext_to_module.setdefault(ext_id, module_stack[-1][0])
+            if ext_id is None or not module_stack:
+                continue
+            if e.get("cat") == "cpu_op":
+                pending_cpu_ops.append((end, ext_id))
+            ext_to_module.setdefault(ext_id, module_stack[-1][0])
 
     return ext_to_module, ext_id_to_cpuop
 
@@ -502,24 +509,29 @@ def build_fwdbwd_flow_index(events):
     return {"by_bwd_tid": dict(by_tid), "all": entries}
 
 
-def _find_enclosing_op(events_by_tid_sorted, tid, ts):
+def _find_enclosing_op(events_by_tid_sorted, ts_keys_by_tid, tid, ts):
     """Find the smallest cpu_op event on `tid` whose [ts, ts+dur] contains
     the timestamp. Returns event dict or None.
 
     `events_by_tid_sorted`: {tid: [event]} sorted by ts ascending.
+    `ts_keys_by_tid`: {tid: [event_ts]} aligned with events_by_tid_sorted.
     """
     cands = events_by_tid_sorted.get(tid, [])
     if not cands:
         return None
-    # Linear scan with early exit (events count per tid is bounded; OK).
+    keys = ts_keys_by_tid.get(tid)
+    if keys is None:
+        raise RuntimeError(f"missing cpu_op timestamp index for tid={tid!r}")
+    pos = bisect.bisect_right(keys, ts) - 1
     best = None
     best_dur = float("inf")
-    for ev in cands:
+    for i in range(pos, max(-1, pos - 50), -1):
+        ev = cands[i]
         ev_ts = ev.get("ts", 0.0)
-        if ev_ts > ts:
-            break
         dur = ev.get("dur") or 0.0
-        if ev_ts <= ts <= ev_ts + dur and dur < best_dur:
+        if ev_ts + dur < ts:
+            continue
+        if ev_ts <= ts and dur < best_dur:
             best = ev
             best_dur = dur
     return best
@@ -536,12 +548,16 @@ def _build_cpu_op_index_by_tid(events):
         if e.get("dur") is None:
             continue
         by_tid[e.get("tid")].append(e)
-    for tid in by_tid:
-        by_tid[tid].sort(key=lambda x: x.get("ts", 0.0))
-    return dict(by_tid)
+    result = {}
+    result_keys = {}
+    for tid, lst in by_tid.items():
+        lst.sort(key=lambda x: x.get("ts", 0.0))
+        result[tid] = lst
+        result_keys[tid] = [e.get("ts", 0.0) for e in lst]
+    return result, result_keys
 
 
-def _resolve_fwdbwd_scope(kernel_event, fwdbwd_index, cpu_op_by_tid, ext_id_to_cpuop):
+def _resolve_fwdbwd_scope(kernel_event, fwdbwd_index, cpu_op_by_tid, cpu_op_ts_keys_by_tid, ext_id_to_cpuop):
     """For a backward kernel event, find the corresponding forward scope time
     range.
 
@@ -567,7 +583,7 @@ def _resolve_fwdbwd_scope(kernel_event, fwdbwd_index, cpu_op_by_tid, ext_id_to_c
     for ent in cands:
         if ent["bwd_ts"] > bwd_kernel_ts:
             continue
-        bwd_op = _find_enclosing_op(cpu_op_by_tid, ent["bwd_tid"], ent["bwd_ts"])
+        bwd_op = _find_enclosing_op(cpu_op_by_tid, cpu_op_ts_keys_by_tid, ent["bwd_tid"], ent["bwd_ts"])
         if bwd_op is None:
             continue
         bwd_start = bwd_op.get("ts", 0.0)
@@ -578,7 +594,7 @@ def _resolve_fwdbwd_scope(kernel_event, fwdbwd_index, cpu_op_by_tid, ext_id_to_c
             # represent finer-grained scope.
     if chosen is None:
         return None
-    fwd_op = _find_enclosing_op(cpu_op_by_tid, chosen["fwd_tid"], chosen["fwd_ts"])
+    fwd_op = _find_enclosing_op(cpu_op_by_tid, cpu_op_ts_keys_by_tid, chosen["fwd_tid"], chosen["fwd_ts"])
     if fwd_op is None:
         return None
     fwd_start = fwd_op.get("ts", 0.0)
@@ -719,7 +735,10 @@ def build_kernel_attribution_table(events, step_infos, fwdbwd_index):
         no resolvable module parent chain is reported in debug stats or raises
         RuntimeError for inconsistent CPU parent chains.
     """
-    cpu_op_by_tid = _build_cpu_op_index_by_tid(events) if fwdbwd_index else {}
+    if fwdbwd_index:
+        cpu_op_by_tid, cpu_op_ts_keys_by_tid = _build_cpu_op_index_by_tid(events)
+    else:
+        cpu_op_by_tid, cpu_op_ts_keys_by_tid = {}, {}
     ext_to_module, ext_id_to_cpuop = _build_external_id_to_module_map(events)
     python_id_index = _build_python_id_index(events)
     module_events_by_tid = _build_module_index_by_tid(events)
@@ -778,7 +797,7 @@ def build_kernel_attribution_table(events, step_infos, fwdbwd_index):
         if is_bwd and fwdbwd_index and fwdbwd_index["all"]:
             # Backward kernel: resolve the forward scope via fwdbwd flow, then
             # pick the innermost forward module event to rebuild the fwd chain.
-            scope = _resolve_fwdbwd_scope(e, fwdbwd_index, cpu_op_by_tid, ext_id_to_cpuop)
+            scope = _resolve_fwdbwd_scope(e, fwdbwd_index, cpu_op_by_tid, cpu_op_ts_keys_by_tid, ext_id_to_cpuop)
             if scope is not None:
                 stats["bwd_via_flow_narrowed"] += 1
                 fwd_start, fwd_end, fwd_tid = scope
