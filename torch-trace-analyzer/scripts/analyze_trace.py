@@ -366,6 +366,8 @@ def overlap(a_start, a_end, b_start, b_end):
 
 
 def classify_kernel_phase(kernel_start, kernel_end, step_infos):
+    if not step_infos:
+        return "forward"
     matched_step = None
     for info in step_infos:
         step_start, step_end = info["step_interval"]
@@ -941,13 +943,15 @@ def _find_innermost_module_in_window(events, tid, start, end):
 
 
 def build_kernel_attribution_table(events, source_files, class_map, step_infos, fwdbwd_index):
-    """Step 2: for every kernel (and CPU op), decide which InstanceKey(s) it
-    belongs to and with what weight (weights sum to 1 per event).
+    """Step 2: for every kernel / GPU memcpy / GPU memset / CPU op, decide
+    which InstanceKey(s) it belongs to and with what weight (weights sum to 1
+    per event).
 
-    Returns (attribution, debug_stats):
-      attribution: {event_idx: {leaf_InstanceKey: (full_chain, weight)}}
-        - full_chain: complete InstanceKey list, outermost→leaf. full_chain[-1]
-          is the leaf key the entry is stored under.
+    Returns (kernel_attribution, cpu_attribution, debug_stats):
+      kernel_attribution: {event_idx: {leaf_InstanceKey: (full_chain, weight)}}
+        - only cat in {"kernel", "gpu_memcpy", "gpu_memset"}
+      cpu_attribution: {event_idx: {leaf_InstanceKey: (full_chain, weight)}}
+        - only cat == "cpu_op"
       debug_stats: counts dict
 
     Full-chain construction (design/timing_parent_chain.md, 2026-07-08):
@@ -963,15 +967,20 @@ def build_kernel_attribution_table(events, source_files, class_map, step_infos, 
         RuntimeError instead of falling back to a synthetic key.
     """
     if not source_files or not class_map:
-        return {}, {"total_kernels": 0, "fwd_attributed": 0, "bwd_attributed": 0,
-                    "cpu_attributed": 0, "fwd_unattributed": 0, "bwd_unattributed": 0,
-                    "bwd_via_flow_narrowed": 0, "total_kernel_dur_us": 0.0}
+        return (
+            {},
+            {},
+            {"total_kernels": 0, "fwd_attributed": 0, "bwd_attributed": 0,
+             "cpu_attributed": 0, "fwd_unattributed": 0, "bwd_unattributed": 0,
+             "bwd_via_flow_narrowed": 0, "total_kernel_dur_us": 0.0},
+        )
 
     cpu_op_by_tid = _build_cpu_op_index_by_tid(events) if fwdbwd_index else {}
     ext_to_module = _build_external_id_to_module_map(events)
     python_id_index = _build_python_id_index(events)
 
-    attribution = {}
+    kernel_attribution = {}
+    cpu_attribution = {}
     stats = {
         "total_kernels": 0, "fwd_attributed": 0, "bwd_attributed": 0,
         "cpu_attributed": 0, "fwd_unattributed": 0, "bwd_unattributed": 0,
@@ -979,7 +988,7 @@ def build_kernel_attribution_table(events, source_files, class_map, step_infos, 
         "total_kernel_dur_us": 0.0,
     }
 
-    def _store_from_module_chain(idx, leaf_event):
+    def _store_from_module_chain(target, idx, leaf_event):
         """Attribute an event via its runtime module parent chain (no inner
         frames). Returns True on success."""
         module_events = _collect_module_chain(leaf_event, python_id_index, include_leaf=True)
@@ -987,10 +996,10 @@ def build_kernel_attribution_table(events, source_files, class_map, step_infos, 
         if not full_chain:
             return False
         leaf = full_chain[-1]
-        attribution[idx] = {leaf: (full_chain, 1.0)}
+        target[idx] = {leaf: (full_chain, 1.0)}
         return True
 
-    def _store_from_frames(idx, leaf_event, chains):
+    def _store_from_frames(target, idx, leaf_event, chains):
         """Attribute via joined outer+inner frames across all stack chains.
         Weight per leaf = hit_count / total_hits. Returns True on success."""
         outer_frames = _collect_outer_frames(leaf_event, python_id_index)
@@ -1008,14 +1017,14 @@ def build_kernel_attribution_table(events, source_files, class_map, step_infos, 
             total_hits += 1
         if total_hits == 0:
             return False
-        attribution[idx] = {
+        target[idx] = {
             k: (full_chains[k], cnt / total_hits) for k, cnt in hit_counts.items()
         }
         return True
 
     # ---- kernels ----------------------------------------------------------
     for idx, e in enumerate(events):
-        if e.get("cat") != "kernel":
+        if e.get("cat") not in ("kernel", "gpu_memcpy", "gpu_memset"):
             continue
         dur = float(e.get("dur") or 0.0)
         if dur <= 0:
@@ -1033,7 +1042,7 @@ def build_kernel_attribution_table(events, source_files, class_map, step_infos, 
         if inner_chains:
             # Frame path: leaf module event (source of outer frames) via External id.
             leaf_event = ext_to_module.get(ext_id)
-            if _store_from_frames(idx, leaf_event, inner_chains):
+            if _store_from_frames(kernel_attribution, idx, leaf_event, inner_chains):
                 stats["bwd_attributed" if is_bwd else "fwd_attributed"] += 1
                 continue
 
@@ -1050,7 +1059,7 @@ def build_kernel_attribution_table(events, source_files, class_map, step_infos, 
         if leaf_event is None:
             leaf_event = ext_to_module.get(ext_id)
 
-        if _store_from_module_chain(idx, leaf_event):
+        if _store_from_module_chain(kernel_attribution, idx, leaf_event):
             stats["bwd_attributed" if is_bwd else "fwd_attributed"] += 1
             continue
 
@@ -1068,7 +1077,7 @@ def build_kernel_attribution_table(events, source_files, class_map, step_infos, 
         if py_parent is None or py_parent not in python_id_index:
             continue
         leaf_event = python_id_index[py_parent]
-        if _store_from_module_chain(idx, leaf_event):
+        if _store_from_module_chain(cpu_attribution, idx, leaf_event):
             stats["cpu_attributed"] += 1
         else:
             raise RuntimeError(
@@ -1076,22 +1085,23 @@ def build_kernel_attribution_table(events, source_files, class_map, step_infos, 
                 "but produced no InstanceKey chain." % (idx, py_parent)
             )
 
-    return attribution, stats
+    return kernel_attribution, cpu_attribution, stats
 
 
 # --------------------------------------------------------------------------
 # Step 3: bottom-up self/inclusive rollup
 # --------------------------------------------------------------------------
 
-def rollup_instance_timing(kernel_attribution, events, step_infos, class_map, roots=None):
-    """Step 3: aggregate kernel durations into per-InstanceKey self_us, then
-    compute inclusive_us by walking the InstanceKey ancestors chain.
+def rollup_instance_timing(kernel_attribution, cpu_attribution, events, step_infos, class_map, roots=None):
+    """Step 3: aggregate kernel durations into per-InstanceKey inclusive_us,
+    collect cpu_op durations into cpu_us, then compute bottom-up kernel-only
+    inclusive totals by walking the InstanceKey ancestors chain.
 
     Returns: {InstanceKey: instance_record}
     instance_record = {
         "class_name", "callsite_file", "callsite_line", "ancestors",
-        "self_us": {"forward","backward","optimize","other"},
         "inclusive_us": {"forward","backward","optimize","other"},
+        "cpu_us": {"forward","backward","optimize","other"},
         "child_keys": set,
     }
     """
@@ -1106,13 +1116,13 @@ def rollup_instance_timing(kernel_attribution, events, step_infos, class_map, ro
                 "callsite_file": csf,
                 "callsite_line": csl,
                 "ancestors": ancestors,
-                "self_us": {"forward": 0.0, "backward": 0.0, "optimize": 0.0, "other": 0.0},
                 "inclusive_us": {"forward": 0.0, "backward": 0.0, "optimize": 0.0, "other": 0.0},
+                "cpu_us": {"forward": 0.0, "backward": 0.0, "optimize": 0.0, "other": 0.0},
                 "child_keys": set(),
             }
         return timings[key]
 
-    # Phase A: self_us
+    # Phase A: kernel leaf inclusive_us
     for idx, weights in kernel_attribution.items():
         e = events[idx]
         dur = float(e.get("dur") or 0.0)
@@ -1124,12 +1134,27 @@ def rollup_instance_timing(kernel_attribution, events, step_infos, class_map, ro
             # entry == (full_chain, weight); rollup only needs the weight.
             w = entry[1]
             rec = _ensure(key)
-            rec["self_us"][phase] += dur * w
+            rec["inclusive_us"][phase] += dur * w
+
+    # Phase A2: cpu_us only (no bottom-up)
+    for idx, weights in cpu_attribution.items():
+        e = events[idx]
+        dur = float(e.get("dur") or 0.0)
+        ts = float(e.get("ts") or 0.0)
+        phase = classify_kernel_phase(ts, ts + dur, step_infos)
+        if phase not in ("forward", "backward", "optimize", "other"):
+            phase = "other"
+        for key, entry in weights.items():
+            w = entry[1]
+            rec = _ensure(key)
+            rec["cpu_us"][phase] += dur * w
 
     # Divide by num_steps for per-step average.
     for rec in timings.values():
-        for ph in rec["self_us"]:
-            rec["self_us"][ph] /= num_steps
+        for ph in rec["inclusive_us"]:
+            rec["inclusive_us"][ph] /= num_steps
+        for ph in rec["cpu_us"]:
+            rec["cpu_us"][ph] /= num_steps
 
     # Phase B: parent-child relationships from ancestors
     # parent of (cls, csf, csl, ancestors) = (parent_cls, parent_csf, parent_csl, ancestors[:-1])
@@ -1156,10 +1181,6 @@ def rollup_instance_timing(kernel_attribution, events, step_infos, class_map, ro
     def _depth(k):
         return len(k[3])
     sorted_keys = sorted(timings.keys(), key=_depth, reverse=True)
-    # Initialize inclusive = self
-    for k in timings:
-        for ph, v in timings[k]["self_us"].items():
-            timings[k]["inclusive_us"][ph] = v
     # Add children inclusive
     for k in sorted_keys:
         rec = timings[k]
@@ -1216,15 +1237,14 @@ def build_timing_panel_data(instance_timing, class_map, step_dur_us):
         csf = rec["callsite_file"]
         csl = rec["callsite_line"]
         anc = rec["ancestors"]
-        sus_fwd = rec["self_us"]["forward"]
-        sus_bwd = rec["self_us"]["backward"]
-        sus_opt = rec["self_us"]["optimize"]
-        sus_oth = rec["self_us"]["other"]
+        cpu_fwd = rec["cpu_us"]["forward"]
+        cpu_bwd = rec["cpu_us"]["backward"]
+        cpu_opt = rec["cpu_us"]["optimize"]
+        cpu_oth = rec["cpu_us"]["other"]
         inc_fwd = rec["inclusive_us"]["forward"]
         inc_bwd = rec["inclusive_us"]["backward"]
         inc_opt = rec["inclusive_us"]["optimize"]
         inc_oth = rec["inclusive_us"]["other"]
-        self_total = sus_fwd + sus_bwd + sus_opt + sus_oth
         inc_total = inc_fwd + inc_bwd + inc_opt + inc_oth
         runtime_name = (f"{cls}@{os.path.basename(csf)}:{csl}"
                         if csf and csf != "<wrapped>" and csl and csl > 0
@@ -1236,18 +1256,12 @@ def build_timing_panel_data(instance_timing, class_map, step_dur_us):
             "callsite_file": csf,
             "callsite_line": csl if (csl and csl > 0) else None,
             "ancestors": [list(a) for a in anc],
-            # Backwards-compat: forward_us/backward_us/total_us are EXCLUSIVE (self)
-            # values, matching the prior contract under the bottom-up rollup.
-            "forward_us": sus_fwd,
-            "backward_us": sus_bwd,
-            "optimize_us": sus_opt,
-            "other_us": sus_oth,
-            "total_us": self_total,
-            "self_us": self_total,
-            # New: inclusive values for downstream UI.
             "inclusive_us": inc_total,
             "inclusive_forward_us": inc_fwd,
             "inclusive_backward_us": inc_bwd,
+            "cpu_us": cpu_fwd + cpu_bwd + cpu_opt + cpu_oth,
+            "cpu_forward_us": cpu_fwd,
+            "cpu_backward_us": cpu_bwd,
         }
         by_class[cls].append(item)
 
@@ -1263,19 +1277,23 @@ def build_timing_panel_data(instance_timing, class_map, step_dur_us):
     class_durations = {}
     class_durations_fwd = {}
     class_durations_bwd = {}
+    class_cpu_durations = {}
     for cls, items in by_class.items():
         cls_fwd = sum(it.get("inclusive_forward_us", 0.0) for it in items)
         cls_bwd = sum(it.get("inclusive_backward_us", 0.0) for it in items)
         cls_total = sum(it.get("inclusive_us", 0.0) for it in items)
+        cls_cpu_total = sum(it.get("cpu_us", 0.0) for it in items)
         class_durations_fwd[cls] = cls_fwd
         class_durations_bwd[cls] = cls_bwd
         class_durations[cls] = cls_total
+        class_cpu_durations[cls] = cls_cpu_total
 
     return {
         "runtime_instance_timings_by_class": dict(by_class),
         "class_durations": class_durations,
         "class_durations_fwd": class_durations_fwd,
         "class_durations_bwd": class_durations_bwd,
+        "class_cpu_durations": class_cpu_durations,
     }
 
 
@@ -1288,18 +1306,20 @@ def build_instance_timing_pipeline(events, source_files, class_map, step_infos, 
       - _timing_pipeline_stats (debug)
     """
     fwdbwd_index = build_fwdbwd_flow_index(events)
-    attribution, stats = build_kernel_attribution_table(
+    kernel_attribution, cpu_attribution, stats = build_kernel_attribution_table(
         events, source_files, class_map, step_infos, fwdbwd_index,
     )
-    instance_timing = rollup_instance_timing(attribution, events, step_infos, class_map, roots=roots)
+    instance_timing = rollup_instance_timing(
+        kernel_attribution, cpu_attribution, events, step_infos, class_map, roots=roots,
+    )
     panel = build_timing_panel_data(instance_timing, class_map, step_dur_us)
     panel["_timing_pipeline_stats"] = stats
     num_steps = max(1, len(step_infos))
     panel["step_kernel_us"] = stats.get("total_kernel_dur_us", 0) / num_steps
     
     total_attributed_us = sum(
-        rec["self_us"]["forward"] + rec["self_us"]["backward"] + 
-        rec["self_us"]["optimize"] + rec["self_us"]["other"] 
+        rec["inclusive_us"]["forward"] + rec["inclusive_us"]["backward"] + 
+        rec["inclusive_us"]["optimize"] + rec["inclusive_us"]["other"] 
         for rec in instance_timing.values()
     )
     panel["unattributed_kernel_us"] = max(0, panel["step_kernel_us"] - total_attributed_us)
