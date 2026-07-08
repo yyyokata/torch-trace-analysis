@@ -744,6 +744,20 @@ def build_kernel_attribution_table(events, step_infos, fwdbwd_index):
         ts = float(e.get("ts") or 0.0)
         tid = e.get("tid")
         ext_id = e.get("args", {}).get("External id")
+        if ext_id is None:
+            stats.setdefault("skipped_no_ext", []).append({
+                "idx": idx,
+                "name": e.get("name"),
+                "cat": e.get("cat"),
+                "ts": e.get("ts"),
+                "tid": e.get("tid"),
+            })
+            continue
+        if ext_id not in ext_id_to_cpuop:
+            raise RuntimeError(
+                f"kernel idx={idx} name={e.get('name')!r} has ext_id={ext_id!r} "
+                f"but no corresponding CPU op found in ext_id_to_cpuop"
+            )
         cpu_op = ext_id_to_cpuop[ext_id]
         is_bwd = cpu_op["tid"] in bwd_tids
         stats["total_kernels"] += 1
@@ -763,16 +777,6 @@ def build_kernel_attribution_table(events, step_infos, fwdbwd_index):
 
         if _store_from_module_chain(kernel_attribution, idx, leaf_event):
             stats["bwd_attributed" if is_bwd else "fwd_attributed"] += 1
-            continue
-
-        if ext_id is None:
-            stats.setdefault("skipped_no_ext", []).append({
-                "idx": idx,
-                "name": e.get("name"),
-                "cat": e.get("cat"),
-                "ts": e.get("ts"),
-                "tid": e.get("tid"),
-            })
             continue
 
         # Has ext_id but still cannot attribute. Typical: optimizer/grad kernels
