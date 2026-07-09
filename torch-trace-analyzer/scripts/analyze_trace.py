@@ -794,6 +794,7 @@ def build_kernel_attribution_table(events, step_infos, fwdbwd_index):
         stats["total_kernel_dur_us"] += dur
 
         leaf_event = None
+        scope = None
         if is_bwd and fwdbwd_index and fwdbwd_index["all"]:
             # Backward kernel: resolve the forward scope via fwdbwd flow, then
             # pick the innermost forward module event to rebuild the fwd chain.
@@ -811,6 +812,7 @@ def build_kernel_attribution_table(events, step_infos, fwdbwd_index):
 
         # Has ext_id but still cannot attribute. Typical: optimizer/grad kernels
         # where dispatcher records External id but the module parent chain is broken.
+        _phase = classify_kernel_phase(ts, ts + dur, step_infos)
         stats.setdefault("skipped_no_module_chain", []).append({
             "idx": idx,
             "name": e.get("name"),
@@ -818,6 +820,9 @@ def build_kernel_attribution_table(events, step_infos, fwdbwd_index):
             "ts": e.get("ts"),
             "tid": e.get("tid"),
             "ext_id": ext_id,
+            "is_bwd": is_bwd,
+            "scope_found": scope is not None if is_bwd else False,
+            "phase": _phase,
         })
         stats["bwd_unattributed" if is_bwd else "fwd_unattributed"] += 1
         continue
@@ -1059,6 +1064,14 @@ def build_instance_timing_pipeline(events, step_infos, step_dur_us, roots=None):
     )
     panel = build_timing_panel_data(instance_timing, step_dur_us)
     panel["_timing_pipeline_stats"] = stats
+    # Summarize skipped_no_module_chain categories and avoid retaining the raw list.
+    skipped = stats.get("skipped_no_module_chain", [])
+    skip_summary = Counter()
+    for r in skipped:
+        key = f"cat={r['cat']} phase={r['phase']} is_bwd={r['is_bwd']} scope_found={r['scope_found']}"
+        skip_summary[key] += 1
+    stats["skipped_no_module_chain_summary"] = dict(skip_summary)
+    stats["skipped_no_module_chain"] = f"<list len={len(skipped)}>"
     num_steps = max(1, len(step_infos))
     panel["step_kernel_us"] = stats.get("total_kernel_dur_us", 0) / num_steps
     
