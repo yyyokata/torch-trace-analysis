@@ -621,13 +621,20 @@ def _parse_callfrom(callfrom):
 
 
 def _build_python_id_index(events):
-    """Index nn.Module python_function events by their ``Python id`` so we can
-    walk the runtime module parent chain via ``Python parent id``."""
+    """Index every python_function event by its ``Python id``.
+
+    We need every frame (not just ``nn.Module:`` frames) because real torch
+    profiler traces intersperse ``forward`` / ``_call_impl`` frames between
+    adjacent nn.Module events. Restricting the index to nn.Module events
+    breaks ``Python parent id`` walks on the first non-module hop and
+    collapses the module ancestor chain to just the leaf module.
+
+    Callers that only care about module frames must themselves filter the
+    walk output via ``name.startswith("nn.Module:")``.
+    """
     index = {}
     for e in events:
         if e.get("cat") != "python_function":
-            continue
-        if not str(e.get("name", "")).startswith("nn.Module:"):
             continue
         pid = e.get("args", {}).get("Python id")
         if pid is None:
@@ -638,21 +645,25 @@ def _build_python_id_index(events):
 
 def _collect_module_chain(leaf_event, python_id_index, include_leaf):
     """Walk ``Python parent id`` from ``leaf_event`` up to the outermost
-    module, returning the module events ordered outermost→leaf.
+    module, returning **only** the nn.Module events on the chain ordered
+    outermost→leaf. Intermediate frames (``forward``, ``_call_impl``, user
+    frames, etc.) are traversed but skipped from the result.
 
     ``include_leaf`` controls whether ``leaf_event`` itself is part of the
-    returned chain (False → stop at the leaf's parent)."""
+    returned chain (False → stop at the leaf's parent).
+    """
     if leaf_event is None:
         return []
     chain = []
-    if include_leaf:
+    if include_leaf and str(leaf_event.get("name", "")).startswith("nn.Module:"):
         chain.append(leaf_event)
     seen = set()
     pid = leaf_event.get("args", {}).get("Python parent id")
     while pid is not None and pid in python_id_index and pid not in seen:
         seen.add(pid)
         parent = python_id_index[pid]
-        chain.append(parent)
+        if str(parent.get("name", "")).startswith("nn.Module:"):
+            chain.append(parent)
         pid = parent.get("args", {}).get("Python parent id")
     chain.reverse()
     return chain
@@ -831,16 +842,28 @@ def build_kernel_attribution_table(events, step_infos, fwdbwd_index):
     for idx, e in enumerate(events):
         if e.get("cat") != "cpu_op":
             continue
+        # Prefer the runtime module parent chain via ``Python parent id``.
+        # Some trace variants (newer torch, some kineto configs) do not emit
+        # ``Python parent id`` on cpu_op events; in that case fall back to the
+        # temporal-nesting map built from module_stack scanning, which
+        # resolves the innermost enclosing nn.Module event by tid + ts window.
         py_parent = e.get("args", {}).get("Python parent id")
-        if py_parent is None or py_parent not in python_id_index:
+        leaf_event = None
+        if py_parent is not None and py_parent in python_id_index:
+            leaf_event = python_id_index[py_parent]
+        else:
+            ext_id = e.get("args", {}).get("External id")
+            if ext_id is not None:
+                leaf_event = ext_to_module.get(ext_id)
+        if leaf_event is None:
             continue
-        leaf_event = python_id_index[py_parent]
         if _store_from_module_chain(cpu_attribution, idx, leaf_event):
             stats["cpu_attributed"] += 1
         else:
             raise RuntimeError(
-                "CPU op idx=%d (Python parent id=%s) resolved to a module event "
-                "but produced no InstanceKey chain." % (idx, py_parent)
+                "CPU op idx=%d (Python parent id=%s, ext_id=%s) resolved to "
+                "a leaf event but produced no InstanceKey chain."
+                % (idx, py_parent, e.get("args", {}).get("External id"))
             )
 
     return kernel_attribution, cpu_attribution, stats
