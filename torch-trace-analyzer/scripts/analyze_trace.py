@@ -669,6 +669,47 @@ def _collect_module_chain(leaf_event, python_id_index, include_leaf):
     return chain
 
 
+_FRAMEWORK_PATH_PREFIXES = ("bytedance/lagrange_torch/",)
+
+
+def _is_framework_frame(callsite_file):
+    """Return True if the callsite belongs to a framework (non-user-model) module."""
+    if not callsite_file or not isinstance(callsite_file, str):
+        return False
+    normalized = callsite_file.replace("\\", "/")
+    return any(prefix in normalized for prefix in _FRAMEWORK_PATH_PREFIXES)
+
+
+
+def _strip_framework_prefix(module_events):
+    """Drop leading framework frames from an outermost→leaf module chain.
+
+    Frames after the first user frame (including interleaved framework frames)
+    are preserved. Returns (user_chain, framework_only) where framework_only
+    is True iff every frame has a parseable framework callsite and no user
+    frame exists in the chain.
+    """
+    first_user = None
+    saw_parseable = False
+    saw_unparseable = False
+    for i, m in enumerate(module_events):
+        callfrom = m.get("args", {}).get("CallFrom")
+        parsed = _parse_callfrom(callfrom)
+        if parsed is None:
+            saw_unparseable = True
+            continue
+        saw_parseable = True
+        if not _is_framework_frame(callfrom):
+            first_user = i
+            break
+    if first_user is None:
+        if saw_parseable and not saw_unparseable:
+            return [], True
+        return module_events, False
+    return module_events[first_user:], False
+
+
+
 def _build_instance_keys_from_module_chain(module_events):
     """Build a full InstanceKey chain directly from module events (used when no
     inner user frames exist, e.g. CPU ops or kernels without stack_traces).
@@ -762,18 +803,22 @@ def build_kernel_attribution_table(events, step_infos, fwdbwd_index):
         "cpu_attributed": 0, "fwd_unattributed": 0, "bwd_unattributed": 0,
         "bwd_via_flow_narrowed": 0,
         "total_kernel_dur_us": 0.0,
+        "framework_only": [],
     }
 
     def _store_from_module_chain(target, idx, leaf_event):
         """Attribute an event via its runtime module parent chain (no inner
-        frames). Returns True on success."""
+        frames). Returns (stored, framework_only)."""
         module_events = _collect_module_chain(leaf_event, python_id_index, include_leaf=True)
+        module_events, framework_only = _strip_framework_prefix(module_events)
+        if framework_only:
+            return False, True
         full_chain = _build_instance_keys_from_module_chain(module_events)
         if not full_chain:
-            return False
+            return False, False
         leaf = full_chain[-1]
         target[idx] = {leaf: (full_chain, 1.0)}
-        return True
+        return True, False
 
     # ---- kernels ----------------------------------------------------------
     for idx, e in enumerate(events):
@@ -817,8 +862,21 @@ def build_kernel_attribution_table(events, step_infos, fwdbwd_index):
         if leaf_event is None:
             leaf_event = ext_to_module.get(ext_id)
 
-        if _store_from_module_chain(kernel_attribution, idx, leaf_event):
+        stored, framework_only = _store_from_module_chain(kernel_attribution, idx, leaf_event)
+        if stored:
             stats["bwd_attributed" if is_bwd else "fwd_attributed"] += 1
+            continue
+        if framework_only:
+            stats["framework_only"].append({
+                "idx": idx,
+                "name": e.get("name"),
+                "cat": e.get("cat"),
+                "ts": e.get("ts"),
+                "tid": e.get("tid"),
+                "ext_id": ext_id,
+                "is_bwd": is_bwd,
+                "scope_found": scope is not None if is_bwd else False,
+            })
             continue
 
         # Has ext_id but still cannot attribute. Typical: optimizer/grad kernels
@@ -857,8 +915,11 @@ def build_kernel_attribution_table(events, step_infos, fwdbwd_index):
                 leaf_event = ext_to_module.get(ext_id)
         if leaf_event is None:
             continue
-        if _store_from_module_chain(cpu_attribution, idx, leaf_event):
+        stored, framework_only = _store_from_module_chain(cpu_attribution, idx, leaf_event)
+        if stored:
             stats["cpu_attributed"] += 1
+        elif framework_only:
+            continue
         else:
             raise RuntimeError(
                 "CPU op idx=%d (Python parent id=%s, ext_id=%s) resolved to "
@@ -1095,6 +1156,9 @@ def build_instance_timing_pipeline(events, step_infos, step_dur_us, roots=None):
         skip_summary[key] += 1
     stats["skipped_no_module_chain_summary"] = dict(skip_summary)
     stats["skipped_no_module_chain"] = f"<list len={len(skipped)}>"
+    framework_only = stats.get("framework_only", [])
+    stats["framework_only_count"] = len(framework_only)
+    stats["framework_only"] = f"<list len={len(framework_only)}>"
     num_steps = max(1, len(step_infos))
     panel["step_kernel_us"] = stats.get("total_kernel_dur_us", 0) / num_steps
     
