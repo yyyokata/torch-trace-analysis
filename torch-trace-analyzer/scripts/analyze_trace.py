@@ -449,7 +449,7 @@ def _build_external_id_to_module_map(events):
 # Restored from 9a103e3 after accidental deletion in 08cb9e3 (HTML cleanup).
 # --------------------------------------------------------------------------
 # Step 1: build_fwdbwd_flow_index           — pair fwdbwd flow events
-# Step 2: build_kernel_attribution_table    — kernel → InstanceKey weights
+# Step 2: build_kernel_attribution_table    — kernel → call_chain weights
 # Step 3: rollup_instance_timing            — bottom-up self/inclusive sum
 # Step 4: build_timing_panel_data           — instance + class output
 # Top-level entry: build_instance_timing_pipeline
@@ -603,7 +603,7 @@ def _resolve_fwdbwd_scope(kernel_event, fwdbwd_index, cpu_op_by_tid, cpu_op_ts_k
 
 
 # --------------------------------------------------------------------------
-# Step 2: kernel attribution to InstanceKey
+# Step 2: kernel attribution to call_chain
 # --------------------------------------------------------------------------
 
 _CALLFROM_RE = re.compile(r'^(.*):(\d+)$')
@@ -620,24 +620,7 @@ def _parse_callfrom(callfrom):
     return (os.path.basename(m.group(1)), int(m.group(2)))
 
 
-# InstanceKey: runtime-only identity for one nn.Module instance occurrence.
-#
-# Note: tuple subclass for backward-compatible indexing (key[0]..key[3])
-# across existing code/tests. The newly added `stack_frames` is the only field
-# appended at the end.
-from collections import namedtuple as _namedtuple
-
-
-InstanceKey = _namedtuple(
-    "InstanceKey",
-    [
-        "class_name",
-        "callsite_file",
-        "callsite_line",
-        "ancestors_tuple",
-        "stack_frames",
-    ],
-)
+# InstanceKey refactored to call_chain tuple.
 
 
 _STACK_FRAME_RE = re.compile(r'^\s*File "([^"]+)", line (\d+), in (.+)\s*$')
@@ -770,15 +753,12 @@ def _strip_framework_prefix(module_events):
 
 
 
-def _build_instance_keys_from_module_chain(module_events):
-    """Build a full InstanceKey chain directly from module events (used when no
-    inner user frames exist, e.g. CPU ops or kernels without stack_traces).
-
-    Each module contributes a key (class_name, callsite_file, callsite_line,
-    ancestors_tuple) using its own runtime class name and its own ``CallFrom``
-    as the callsite. ancestors_tuple is the preceding modules' callsites."""
-    keys = []
-    ancestors = []
+def _build_module_frames(module_events):
+    """Build a list of frames from module events.
+    Each frame is a tuple: (class_name, callsite_file, callsite_line, stack_frames)
+    where stack_frames is initially an empty tuple ().
+    """
+    frames = []
     for m in module_events:
         info = _normalize_runtime_module_name(m.get("name"))
         cls = info.get("class_name") if info else None
@@ -786,9 +766,8 @@ def _build_instance_keys_from_module_chain(module_events):
         if not cls or parsed is None:
             continue
         csf, csl = parsed
-        keys.append(InstanceKey(cls, csf, csl, tuple(ancestors), ()))
-        ancestors.append((csf, csl))
-    return keys
+        frames.append((cls, csf, csl, ()))
+    return frames
 
 
 def _build_module_index_by_tid(events):
@@ -827,13 +806,13 @@ def _find_innermost_module_in_window(module_events_by_tid, tid, start, end):
 
 def build_kernel_attribution_table(events, step_infos, fwdbwd_index):
     """Step 2: for every kernel / GPU memcpy / GPU memset / CPU op, decide
-    which InstanceKey(s) it belongs to and with what weight (weights sum to 1
+    which call_chain(s) it belongs to and with what weight (weights sum to 1
     per event).
 
     Returns (kernel_attribution, cpu_attribution, debug_stats):
-      kernel_attribution: {event_idx: {leaf_InstanceKey: (full_chain, weight)}}
+      kernel_attribution: {event_idx: {call_chain: (full_call_chain, weight)}}
         - only cat in {"kernel", "gpu_memcpy", "gpu_memset"}
-      cpu_attribution: {event_idx: {leaf_InstanceKey: (full_chain, weight)}}
+      cpu_attribution: {event_idx: {call_chain: (full_call_chain, weight)}}
         - only cat == "cpu_op"
       debug_stats: counts dict
 
@@ -843,9 +822,8 @@ def build_kernel_attribution_table(events, step_infos, fwdbwd_index):
       * backward kernels first use fwdbwd flow to recover the corresponding
         forward module scope, then fall back to the direct External id module
         chain when the flow scope is unavailable.
-      * ``<root>`` / ``<wrapped>`` sentinels are never produced; an event with
-        no resolvable module parent chain is reported in debug stats or raises
-        RuntimeError for inconsistent CPU parent chains.
+      * an event with no resolvable module parent chain is reported in debug
+        stats or raises RuntimeError for inconsistent CPU parent chains.
     """
     if fwdbwd_index:
         cpu_op_by_tid, cpu_op_ts_keys_by_tid = _build_cpu_op_index_by_tid(events)
@@ -871,7 +849,7 @@ def build_kernel_attribution_table(events, step_infos, fwdbwd_index):
 
         If `stack_traces` is a non-empty list, split one kernel event into N
         attributions (weight=1/N each), attaching the parsed stack frames to
-        the leaf InstanceKey via `stack_frames`.
+        the leaf frame of the call_chain.
 
         Returns (stored, framework_only).
         """
@@ -879,8 +857,8 @@ def build_kernel_attribution_table(events, step_infos, fwdbwd_index):
         module_events, framework_only = _strip_framework_prefix(module_events)
         if framework_only:
             return False, True
-        full_chain = _build_instance_keys_from_module_chain(module_events)
-        if not full_chain:
+        frames = _build_module_frames(module_events)
+        if not frames:
             return False, False
 
         weights = {}
@@ -888,25 +866,21 @@ def build_kernel_attribution_table(events, step_infos, fwdbwd_index):
         if traces:
             n = len(traces)
             w = 1.0 / float(n)
-            base_leaf = full_chain[-1]
+            base_leaf = frames[-1]
             for entry in traces:
                 stack_frames = tuple(_parse_stack_entry(entry))
-                leaf = InstanceKey(
-                    base_leaf.class_name,
-                    base_leaf.callsite_file,
-                    base_leaf.callsite_line,
-                    base_leaf.ancestors_tuple,
-                    stack_frames,
-                )
-                if leaf in weights:
-                    prev_chain, prev_w = weights[leaf]
+                # Create a new leaf frame with stack_frames
+                new_leaf = (base_leaf[0], base_leaf[1], base_leaf[2], stack_frames)
+                call_chain = tuple(frames[:-1] + [new_leaf])
+                if call_chain in weights:
+                    prev_chain, prev_w = weights[call_chain]
                     # Same full_chain; accumulate weight.
-                    weights[leaf] = (prev_chain, prev_w + w)
+                    weights[call_chain] = (prev_chain, prev_w + w)
                 else:
-                    weights[leaf] = (full_chain, w)
+                    weights[call_chain] = (call_chain, w)
         else:
-            leaf = full_chain[-1]
-            weights[leaf] = (full_chain, 1.0)
+            call_chain = tuple(frames)
+            weights[call_chain] = (call_chain, 1.0)
 
         target[idx] = weights
         return True, False
@@ -1017,7 +991,7 @@ def build_kernel_attribution_table(events, step_infos, fwdbwd_index):
         else:
             raise RuntimeError(
                 "CPU op idx=%d (Python parent id=%s, ext_id=%s) resolved to "
-                "a leaf event but produced no InstanceKey chain."
+                "a leaf event but produced no call_chain."
                 % (idx, py_parent, e.get("args", {}).get("External id"))
             )
 
@@ -1029,11 +1003,11 @@ def build_kernel_attribution_table(events, step_infos, fwdbwd_index):
 # --------------------------------------------------------------------------
 
 def rollup_instance_timing(kernel_attribution, cpu_attribution, events, step_infos, roots=None):
-    """Step 3: aggregate kernel durations into per-InstanceKey inclusive_us,
+    """Step 3: aggregate kernel durations into per-call_chain inclusive_us,
     collect cpu_op durations into cpu_us, then compute bottom-up kernel-only
-    inclusive totals by walking the InstanceKey ancestors chain.
+    inclusive totals by walking the call_chain prefixes.
 
-    Returns: {InstanceKey: instance_record}
+    Returns: {call_chain: instance_record}
     instance_record = {
         "class_name", "callsite_file", "callsite_line", "ancestors",
         "inclusive_us": {"forward","backward","optimize","other"},
@@ -1044,30 +1018,27 @@ def rollup_instance_timing(kernel_attribution, cpu_attribution, events, step_inf
     num_steps = max(1, len(step_infos))
     timings = {}
 
-    def _rollup_key(k: InstanceKey):
-        return (k.class_name, k.callsite_file, k.callsite_line, k.ancestors_tuple)
-
     def _ensure(key):
-        # key is the rollup key: (class_name, callsite_file, callsite_line, ancestors_tuple)
         if key not in timings:
-            class_name, csf, csl, ancestors = key
+            leaf = key[-1]
+            cls, csf, csl, _sf = leaf
             timings[key] = {
-                "class_name": class_name,
+                "class_name": cls,
                 "callsite_file": csf,
                 "callsite_line": csl,
-                "ancestors": ancestors,
+                "ancestors": key[:-1],
                 "inclusive_us": {"forward": 0.0, "backward": 0.0, "optimize": 0.0, "other": 0.0},
                 "cpu_us": {"forward": 0.0, "backward": 0.0, "optimize": 0.0, "other": 0.0},
                 "child_keys": set(),
-                # Set of distinct stack_frames tuples seen for this rollup key.
+                # Set of distinct stack_frames tuples seen for this call_chain.
                 "stack_frames_set": set(),
             }
         return timings[key]
 
     def _record_chain_relationships(weights):
-        for _leaf_key, entry in weights.items():
+        for _key, entry in weights.items():
             full_chain = entry[0]
-            chain_keys = [_rollup_key(k) for k in full_chain]
+            chain_keys = [full_chain[:i+1] for i in range(len(full_chain))]
             for parent_key, child_key in zip(chain_keys, chain_keys[1:]):
                 _ensure(parent_key)["child_keys"].add(child_key)
                 _ensure(child_key)
@@ -1084,10 +1055,10 @@ def rollup_instance_timing(kernel_attribution, cpu_attribution, events, step_inf
         for key, entry in weights.items():
             # entry == (full_chain, weight); rollup only needs the weight.
             w = entry[1]
-            rk = _rollup_key(key)
-            rec = _ensure(rk)
-            if key.stack_frames:
-                rec["stack_frames_set"].add(key.stack_frames)
+            rec = _ensure(key)
+            sf = key[-1][3]
+            if sf:
+                rec["stack_frames_set"].add(sf)
             rec["inclusive_us"][phase] += dur * w
 
     # Phase A2: cpu_us only (no bottom-up)
@@ -1101,10 +1072,10 @@ def rollup_instance_timing(kernel_attribution, cpu_attribution, events, step_inf
         _record_chain_relationships(weights)
         for key, entry in weights.items():
             w = entry[1]
-            rk = _rollup_key(key)
-            rec = _ensure(rk)
-            if key.stack_frames:
-                rec["stack_frames_set"].add(key.stack_frames)
+            rec = _ensure(key)
+            sf = key[-1][3]
+            if sf:
+                rec["stack_frames_set"].add(sf)
             rec["cpu_us"][phase] += dur * w
 
     # Divide by num_steps for per-step average.
@@ -1114,13 +1085,11 @@ def rollup_instance_timing(kernel_attribution, cpu_attribution, events, step_inf
         for ph in rec["cpu_us"]:
             rec["cpu_us"][ph] /= num_steps
 
-    # Phase B: parent-child relationships were recorded from runtime module
-    # chains carried in kernel_attribution / cpu_attribution entries.
+    # Phase B: parent-child relationships were recorded from call_chains.
 
     # Phase C: bottom-up sum (topological order — leaves first).
-    # Compute depth = len(ancestors); larger depth processed first.
     def _depth(k):
-        return len(k[3])
+        return len(k)
     sorted_keys = sorted(timings.keys(), key=_depth, reverse=True)
     # Add children inclusive
     for k in sorted_keys:
@@ -1137,12 +1106,12 @@ def rollup_instance_timing(kernel_attribution, cpu_attribution, events, step_inf
         # Find a primary root instance to receive orphans
         primary_root_key = None
         for k in timings:
-            if k[0] in roots and k[1] == "<root>":
+            if k[-1][0] in roots and k[-1][1] == "<root>":
                 primary_root_key = k
                 break
         if not primary_root_key:
             for k in timings:
-                if k[0] in roots:
+                if k[-1][0] in roots:
                     primary_root_key = k
                     break
         
@@ -1155,7 +1124,6 @@ def rollup_instance_timing(kernel_attribution, cpu_attribution, events, step_inf
             for k, rec in timings.items():
                 if k != primary_root_key and k not in all_children:
                     # This is an orphan! Add its inclusive time to primary root.
-                    # This ensures model-level total inclusive time is preserved.
                     for ph, v in rec["inclusive_us"].items():
                         timings[primary_root_key]["inclusive_us"][ph] += v
 
@@ -1187,6 +1155,8 @@ def build_timing_panel_data(instance_timing, step_dur_us):
         inc_opt = rec["inclusive_us"]["optimize"]
         inc_oth = rec["inclusive_us"]["other"]
         inc_total = inc_fwd + inc_bwd + inc_opt + inc_oth
+
+        # runtime_name 用 leaf 的 file/line
         runtime_name = (f"{cls}@{os.path.basename(csf)}:{csl}"
                         if csf and csf != "<wrapped>" and csl and csl > 0
                         else cls)
