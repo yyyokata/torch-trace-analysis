@@ -620,6 +620,64 @@ def _parse_callfrom(callfrom):
     return (os.path.basename(m.group(1)), int(m.group(2)))
 
 
+# InstanceKey: runtime-only identity for one nn.Module instance occurrence.
+#
+# Note: tuple subclass for backward-compatible indexing (key[0]..key[3])
+# across existing code/tests. The newly added `stack_frames` is the only field
+# appended at the end.
+from collections import namedtuple as _namedtuple
+
+
+InstanceKey = _namedtuple(
+    "InstanceKey",
+    [
+        "class_name",
+        "callsite_file",
+        "callsite_line",
+        "ancestors_tuple",
+        "stack_frames",
+    ],
+)
+
+
+_STACK_FRAME_RE = re.compile(r'^\s*File "([^"]+)", line (\d+), in (.+)\s*$')
+
+
+def _parse_stack_entry(entry: str):
+    """Parse one profiler `stack_traces` entry (Python traceback format).
+
+    Returns a list of (path, line, method) tuples in the original order.
+
+    Expected line format (one frame per line)::
+        File "path/to/file.py", line 123, in method
+
+    Indented source-code lines (e.g. "    x = ...") are skipped.
+    """
+    if not isinstance(entry, str):
+        raise TypeError(f"stack_traces entry must be str, got {type(entry)!r}")
+
+    frames = []
+    for raw in entry.splitlines():
+        line = raw.rstrip("\n")
+        if not line.strip():
+            continue
+        stripped = line.lstrip()
+        if stripped.startswith("Traceback"):
+            continue
+        # Source code line inside a traceback frame.
+        if line.startswith(" ") and not stripped.startswith("File "):
+            continue
+
+        m = _STACK_FRAME_RE.match(line)
+        if not m:
+            raise RuntimeError(f"unrecognized traceback frame line: {line!r}")
+        path = m.group(1)
+        lineno = int(m.group(2))
+        method = m.group(3)
+        frames.append((path, lineno, method))
+    return frames
+
+
 def _build_python_id_index(events):
     """Index every python_function event by its ``Python id``.
 
@@ -726,7 +784,7 @@ def _build_instance_keys_from_module_chain(module_events):
         if not cls or parsed is None:
             continue
         csf, csl = parsed
-        keys.append((cls, csf, csl, tuple(ancestors)))
+        keys.append(InstanceKey(cls, csf, csl, tuple(ancestors), ()))
         ancestors.append((csf, csl))
     return keys
 
@@ -806,9 +864,15 @@ def build_kernel_attribution_table(events, step_infos, fwdbwd_index):
         "framework_only": [],
     }
 
-    def _store_from_module_chain(target, idx, leaf_event):
-        """Attribute an event via its runtime module parent chain (no inner
-        frames). Returns (stored, framework_only)."""
+    def _store_from_module_chain(target, idx, leaf_event, stack_traces):
+        """Attribute an event via its runtime module parent chain.
+
+        If `stack_traces` is a non-empty list, split one kernel event into N
+        attributions (weight=1/N each), attaching the parsed stack frames to
+        the leaf InstanceKey via `stack_frames`.
+
+        Returns (stored, framework_only).
+        """
         module_events = _collect_module_chain(leaf_event, python_id_index, include_leaf=True)
         module_events, framework_only = _strip_framework_prefix(module_events)
         if framework_only:
@@ -816,8 +880,33 @@ def build_kernel_attribution_table(events, step_infos, fwdbwd_index):
         full_chain = _build_instance_keys_from_module_chain(module_events)
         if not full_chain:
             return False, False
-        leaf = full_chain[-1]
-        target[idx] = {leaf: (full_chain, 1.0)}
+
+        weights = {}
+        traces = stack_traces or []
+        if traces:
+            n = len(traces)
+            w = 1.0 / float(n)
+            base_leaf = full_chain[-1]
+            for entry in traces:
+                stack_frames = tuple(_parse_stack_entry(entry))
+                leaf = InstanceKey(
+                    base_leaf.class_name,
+                    base_leaf.callsite_file,
+                    base_leaf.callsite_line,
+                    base_leaf.ancestors_tuple,
+                    stack_frames,
+                )
+                if leaf in weights:
+                    prev_chain, prev_w = weights[leaf]
+                    # Same full_chain; accumulate weight.
+                    weights[leaf] = (prev_chain, prev_w + w)
+                else:
+                    weights[leaf] = (full_chain, w)
+        else:
+            leaf = full_chain[-1]
+            weights[leaf] = (full_chain, 1.0)
+
+        target[idx] = weights
         return True, False
 
     # ---- kernels ----------------------------------------------------------
@@ -862,7 +951,10 @@ def build_kernel_attribution_table(events, step_infos, fwdbwd_index):
         if leaf_event is None:
             leaf_event = ext_to_module.get(ext_id)
 
-        stored, framework_only = _store_from_module_chain(kernel_attribution, idx, leaf_event)
+        stack_traces = e.get("args", {}).get("stack", {}).get("stack_traces")
+        stored, framework_only = _store_from_module_chain(
+            kernel_attribution, idx, leaf_event, stack_traces
+        )
         if stored:
             stats["bwd_attributed" if is_bwd else "fwd_attributed"] += 1
             continue
@@ -915,7 +1007,7 @@ def build_kernel_attribution_table(events, step_infos, fwdbwd_index):
                 leaf_event = ext_to_module.get(ext_id)
         if leaf_event is None:
             continue
-        stored, framework_only = _store_from_module_chain(cpu_attribution, idx, leaf_event)
+        stored, framework_only = _store_from_module_chain(cpu_attribution, idx, leaf_event, None)
         if stored:
             stats["cpu_attributed"] += 1
         elif framework_only:
@@ -950,7 +1042,11 @@ def rollup_instance_timing(kernel_attribution, cpu_attribution, events, step_inf
     num_steps = max(1, len(step_infos))
     timings = {}
 
+    def _rollup_key(k: InstanceKey):
+        return (k.class_name, k.callsite_file, k.callsite_line, k.ancestors_tuple)
+
     def _ensure(key):
+        # key is the rollup key: (class_name, callsite_file, callsite_line, ancestors_tuple)
         if key not in timings:
             class_name, csf, csl, ancestors = key
             timings[key] = {
@@ -961,13 +1057,16 @@ def rollup_instance_timing(kernel_attribution, cpu_attribution, events, step_inf
                 "inclusive_us": {"forward": 0.0, "backward": 0.0, "optimize": 0.0, "other": 0.0},
                 "cpu_us": {"forward": 0.0, "backward": 0.0, "optimize": 0.0, "other": 0.0},
                 "child_keys": set(),
+                # Set of distinct stack_frames tuples seen for this rollup key.
+                "stack_frames_set": set(),
             }
         return timings[key]
 
     def _record_chain_relationships(weights):
         for _leaf_key, entry in weights.items():
             full_chain = entry[0]
-            for parent_key, child_key in zip(full_chain, full_chain[1:]):
+            chain_keys = [_rollup_key(k) for k in full_chain]
+            for parent_key, child_key in zip(chain_keys, chain_keys[1:]):
                 _ensure(parent_key)["child_keys"].add(child_key)
                 _ensure(child_key)
 
@@ -983,7 +1082,10 @@ def rollup_instance_timing(kernel_attribution, cpu_attribution, events, step_inf
         for key, entry in weights.items():
             # entry == (full_chain, weight); rollup only needs the weight.
             w = entry[1]
-            rec = _ensure(key)
+            rk = _rollup_key(key)
+            rec = _ensure(rk)
+            if key.stack_frames:
+                rec["stack_frames_set"].add(key.stack_frames)
             rec["inclusive_us"][phase] += dur * w
 
     # Phase A2: cpu_us only (no bottom-up)
@@ -997,7 +1099,10 @@ def rollup_instance_timing(kernel_attribution, cpu_attribution, events, step_inf
         _record_chain_relationships(weights)
         for key, entry in weights.items():
             w = entry[1]
-            rec = _ensure(key)
+            rk = _rollup_key(key)
+            rec = _ensure(rk)
+            if key.stack_frames:
+                rec["stack_frames_set"].add(key.stack_frames)
             rec["cpu_us"][phase] += dur * w
 
     # Divide by num_steps for per-step average.
@@ -1090,6 +1195,10 @@ def build_timing_panel_data(instance_timing, step_dur_us):
             "callsite_file": csf,
             "callsite_line": csl if (csl and csl > 0) else None,
             "ancestors": [list(a) for a in anc],
+            "stack_frames": [
+                [list(frame) for frame in sf]
+                for sf in sorted(rec.get("stack_frames_set", set()), key=lambda x: repr(x))
+            ],
             "inclusive_us": inc_total,
             "inclusive_forward_us": inc_fwd,
             "inclusive_backward_us": inc_bwd,
