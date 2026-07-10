@@ -606,6 +606,12 @@ def _resolve_fwdbwd_scope(kernel_event, fwdbwd_index, cpu_op_by_tid, cpu_op_ts_k
 # Step 2: kernel attribution to call_chain
 # --------------------------------------------------------------------------
 
+
+def _parse_path_to_basename(path: str) -> str:
+    """统一取路径的 basename，兼容 Linux/Windows 分隔符。"""
+    return os.path.basename(path.replace("\\", "/"))
+
+
 _CALLFROM_RE = re.compile(r'^(.*):(\d+)$')
 
 
@@ -617,7 +623,7 @@ def _parse_callfrom(callfrom):
     m = _CALLFROM_RE.match(callfrom.strip())
     if not m:
         return None
-    return (os.path.basename(m.group(1)), int(m.group(2)))
+    return (_parse_path_to_basename(m.group(1)), int(m.group(2)))
 
 
 # InstanceKey refactored to call_chain tuple.
@@ -659,7 +665,7 @@ def _parse_stack_entry(entry: str):
         path = m.group(1)
         lineno = int(m.group(2))
         method = m.group(3)
-        frames.append((path, lineno, method))
+        frames.append((_parse_path_to_basename(path), lineno, method))
     return frames
 
 
