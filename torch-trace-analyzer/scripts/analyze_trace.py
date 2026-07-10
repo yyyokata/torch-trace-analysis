@@ -670,7 +670,9 @@ def _parse_stack_entry(entry: str):
 
         m = _STACK_FRAME_RE.match(line)
         if not m:
-            raise RuntimeError(f"unrecognized traceback frame line: {line!r}")
+            if stripped.startswith("File "):
+                raise RuntimeError(f"unrecognized traceback frame line: {line!r}")
+            continue
         path = m.group(1)
         lineno = int(m.group(2))
         method = m.group(3)
