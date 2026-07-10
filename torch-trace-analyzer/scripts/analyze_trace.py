@@ -755,8 +755,7 @@ def _strip_framework_prefix(module_events):
 
 def _build_module_frames(module_events):
     """Build a list of frames from module events.
-    Each frame is a tuple: (class_name, callsite_file, callsite_line, stack_frames)
-    where stack_frames is initially an empty tuple ().
+    Each frame is a tuple: (class_name, file, line, None).
     """
     frames = []
     for m in module_events:
@@ -766,7 +765,7 @@ def _build_module_frames(module_events):
         if not cls or parsed is None:
             continue
         csf, csl = parsed
-        frames.append((cls, csf, csl, ()))
+        frames.append((cls, csf, csl, None))
     return frames
 
 
@@ -866,12 +865,12 @@ def build_kernel_attribution_table(events, step_infos, fwdbwd_index):
         if traces:
             n = len(traces)
             w = 1.0 / float(n)
-            base_leaf = frames[-1]
             for entry in traces:
-                stack_frames = tuple(_parse_stack_entry(entry))
-                # Create a new leaf frame with stack_frames
-                new_leaf = (base_leaf[0], base_leaf[1], base_leaf[2], stack_frames)
-                call_chain = tuple(frames[:-1] + [new_leaf])
+                stack_frames = _parse_stack_entry(entry)
+                # Flattened: python_frames + stack_frames
+                # Convert 3-tuple (file, line, method) to 4-tuple (None, file, line, method)
+                flattened_stack = [(None, f[0], f[1], f[2]) for f in stack_frames]
+                call_chain = tuple(frames + flattened_stack)
                 if call_chain in weights:
                     prev_chain, prev_w = weights[call_chain]
                     # Same full_chain; accumulate weight.
@@ -1021,7 +1020,7 @@ def rollup_instance_timing(kernel_attribution, cpu_attribution, events, step_inf
     def _ensure(key):
         if key not in timings:
             leaf = key[-1]
-            cls, csf, csl, _sf = leaf
+            cls, csf, csl, _meth = leaf
             timings[key] = {
                 "class_name": cls,
                 "callsite_file": csf,
@@ -1030,8 +1029,7 @@ def rollup_instance_timing(kernel_attribution, cpu_attribution, events, step_inf
                 "inclusive_us": {"forward": 0.0, "backward": 0.0, "optimize": 0.0, "other": 0.0},
                 "cpu_us": {"forward": 0.0, "backward": 0.0, "optimize": 0.0, "other": 0.0},
                 "child_keys": set(),
-                # Set of distinct stack_frames tuples seen for this call_chain.
-                "stack_frames_set": set(),
+                "call_chain": key,
             }
         return timings[key]
 
@@ -1056,9 +1054,6 @@ def rollup_instance_timing(kernel_attribution, cpu_attribution, events, step_inf
             # entry == (full_chain, weight); rollup only needs the weight.
             w = entry[1]
             rec = _ensure(key)
-            sf = key[-1][3]
-            if sf:
-                rec["stack_frames_set"].add(sf)
             rec["inclusive_us"][phase] += dur * w
 
     # Phase A2: cpu_us only (no bottom-up)
@@ -1167,10 +1162,6 @@ def build_timing_panel_data(instance_timing, step_dur_us):
             "callsite_file": csf,
             "callsite_line": csl if (csl and csl > 0) else None,
             "ancestors": [list(a) for a in anc],
-            "stack_frames": [
-                [list(frame) for frame in sf]
-                for sf in sorted(rec.get("stack_frames_set", set()), key=lambda x: repr(x))
-            ],
             "inclusive_us": inc_total,
             "inclusive_forward_us": inc_fwd,
             "inclusive_backward_us": inc_bwd,
