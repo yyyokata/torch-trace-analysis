@@ -3175,6 +3175,24 @@ def main():
     events = data.get("traceEvents", [])
     print(f"  共 {len(events)} 个事件")
 
+    if args.timing_json:
+        # timing panel 为 runtime-only 导出：不依赖源码/AST/DAG，也不走后续
+        # 完整分析路径，直接在此处理并返回。
+        print("  正在构建 timing panel（runtime-only）...")
+        _, _main_events, _children = build_main_thread_hierarchy(events)
+        _step_infos = extract_step_phase_intervals(_main_events, _children)
+        _psteps = [
+            e for e in events
+            if e.get("cat") == "user_annotation" and "ProfilerStep" in str(e.get("name", ""))
+        ]
+        _nsteps = len(_psteps)
+        _step_dur = (sum(e.get("dur", 0) for e in _psteps) / _nsteps) if _nsteps else 0
+        timing_panel = build_instance_timing_pipeline(events, _step_infos, _step_dur)
+        with open(args.timing_json, "w", encoding="utf-8") as _f:
+            json.dump(timing_panel, _f, ensure_ascii=False, indent=2)
+        print(f"  timing panel 已保存到: {args.timing_json}")
+        return
+
     meta = extract_metadata(data, events)
 
     trace_type = detect_trace_type(events)
@@ -3265,15 +3283,6 @@ def main():
             json.dump(result, f, indent=2, ensure_ascii=False)
         print(f"  JSON 结果已保存到: {args.json_output}")
 
-    if args.timing_json:
-        print("  正在构建 timing panel...")
-        _, main_events, children = build_main_thread_hierarchy(events)
-        step_infos = extract_step_phase_intervals(main_events, children)
-        timing_panel = build_instance_timing_pipeline(events, step_infos, step_dur_us)
-        with open(args.timing_json, "w", encoding="utf-8") as _f:
-            json.dump(timing_panel, _f, ensure_ascii=False, indent=2)
-        print(f"  timing panel 已保存到: {args.timing_json}")
-
     _emit_ab_summary_if_enabled(args)
 
 
@@ -3296,5 +3305,9 @@ def _emit_ab_summary_if_enabled(args):
         print(f"  [PR3] evaluator status saved to: {report}")
     except Exception as e:
         print(f"  ⚠️ failed to write evaluator status report: {e}")
+
+
+if __name__ == "__main__":
+    main()
 
 
