@@ -2187,6 +2187,13 @@ function showGroupPanel(g) {
             + '</div>';
     }
 
+    if (g.timing) {
+        bodyHtml += '<div class="side-panel-section"><h4>Runtime Timing (inclusive)</h4>'
+            + renderTimingRow('Inclusive Forward', Number(g.timing.inclusive_forward_us || 0) / 1000.0, 'runtime_inclusive')
+            + renderTimingRow('Inclusive Backward', Number(g.timing.inclusive_backward_us || 0) / 1000.0, 'runtime_inclusive')
+            + '</div>';
+    }
+
     if (g.src_file) {
         const startLine = g.src_start_line || '';
         const endLine = g.src_end_line || '';
@@ -2223,7 +2230,8 @@ function timingHelpText(kind) {
         kernel: 'Kernel time. The cumulative GPU kernel time attributed to this module instance (forward + backward + other-phase kernels). Excludes optimizer kernels and host walltime.',
         forward: 'Forward time. GPU kernel time classified into the forward phase for this module instance.',
         backward: 'Backward time. GPU kernel time classified into the backward phase for this module instance.',
-        other: 'Other-phase kernel time. GPU kernel time attributed to this module that is neither forward nor backward (e.g. communication or fallback).'
+        other: 'Other-phase kernel time. GPU kernel time attributed to this module that is neither forward nor backward (e.g. communication or fallback).',
+        runtime_inclusive: 'Runtime timing provided by the backend. Inclusive module runtime aggregated from matched runtime instances; displayed directly from g.timing without frontend-side aggregation.'
     };
     return help[kind] || '';
 }
@@ -2320,6 +2328,12 @@ function showSourcePanel(g) {
             renderTimingRow('Forward', fwdMs, 'forward') +
             renderTimingRow('Backward', bwdMs, 'backward') +
             renderTimingRow('Other', otherMs, 'other') +
+            '</div>';
+    }
+    if (g.timing) {
+        bodyHtml += '<div class="side-panel-section"><h4>Runtime Timing (inclusive)</h4>' +
+            renderTimingRow('Inclusive Forward', Number(g.timing.inclusive_forward_us || 0) / 1000.0, 'runtime_inclusive') +
+            renderTimingRow('Inclusive Backward', Number(g.timing.inclusive_backward_us || 0) / 1000.0, 'runtime_inclusive') +
             '</div>';
     }
 
