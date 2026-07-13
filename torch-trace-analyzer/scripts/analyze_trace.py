@@ -1249,6 +1249,91 @@ def build_instance_timing_pipeline(events, step_infos, step_dur_us, roots=None):
     return panel
 
 
+def attach_timing_to_dag_groups(adapted: dict, panel: dict) -> list:
+    """将 timing panel 数据注入 DAG adapted dict 的 groups。
+
+    原地修改 adapted["groups"] 中每个 group，为命中的 group 注入 "timing" 字段：
+        group["timing"] = {"inclusive_forward_us": float, "inclusive_backward_us": float}
+    未命中的 group 不注入 timing 字段（不填默认 0）。
+
+    匹配规则：
+    - 主键：(basename(callsite_file), callsite_line) vs (basename(src_file), src_start_line)
+    - 优先匹配 leaf（call_chain[-1]，即 callsite），失败时逐层回退到 ancestors（innermost→outermost）
+    - 相同完整帧序列缓存匹配结果
+    - 一个 loc 命中多个 group 时均分（weight = 1/len(matched)）
+    - src_file 或 src_start_line 缺失的 group raise RuntimeError
+
+    返回 warning 字符串列表。
+    """
+    import os
+    from collections import defaultdict
+
+    dag_loc_index: dict = defaultdict(list)
+    for g in adapted.get("groups", []):
+        sf = g.get("src_file")
+        sl = g.get("src_start_line")
+        if not sf or sl is None:
+            raise RuntimeError(
+                f"group missing src_file/src_start_line: {g.get('label')!r}"
+            )
+        dag_loc_index[(os.path.basename(sf), int(sl))].append(g)
+
+    def _match_frames(frames_to_try):
+        for depth, (f, l) in enumerate(frames_to_try):
+            if not f or not l:
+                continue
+            matched = dag_loc_index.get((f, l))
+            if matched:
+                return matched, depth
+        return None, -1
+
+    match_cache: dict = {}
+    warnings_out: list = []
+
+    for cls, items in panel.get("runtime_instance_timings_by_class", {}).items():
+        for item in items:
+            leaf_file = os.path.basename(item.get("callsite_file") or "")
+            leaf_line = item.get("callsite_line") or 0
+            anc_frames = [
+                (os.path.basename(a[1] or ""), a[2] or 0)
+                for a in reversed(item.get("ancestors", []))
+            ]
+            frames_to_try = tuple([(leaf_file, leaf_line)] + anc_frames)
+
+            if frames_to_try not in match_cache:
+                matched, depth = _match_frames(frames_to_try)
+                match_cache[frames_to_try] = (matched, depth)
+            matched, depth = match_cache[frames_to_try]
+
+            csf = item.get("callsite_file", "")
+            csl = item.get("callsite_line", 0)
+
+            if matched is None:
+                warnings_out.append(
+                    f"WARN full-stack-miss: {cls}@{csf}:{csl}"
+                )
+                continue
+
+            if depth > 0:
+                warnings_out.append(
+                    f"WARN leaf-miss fallback depth={depth}: {cls}@{csf}:{csl}"
+                    f" → matched {frames_to_try[depth]}"
+                )
+
+            weight = 1.0 / len(matched)
+            fwd = item.get("inclusive_forward_us", 0.0) * weight
+            bwd = item.get("inclusive_backward_us", 0.0) * weight
+            for g in matched:
+                t = g.setdefault(
+                    "timing",
+                    {"inclusive_forward_us": 0.0, "inclusive_backward_us": 0.0},
+                )
+                t["inclusive_forward_us"] += fwd
+                t["inclusive_backward_us"] += bwd
+
+    return warnings_out
+
+
 # --------------------------------------------------------------------------
 # Coverage summary — diagnostics over DAG groups
 # --------------------------------------------------------------------------
@@ -3060,6 +3145,8 @@ def main():
     parser.add_argument("--output", "-o", type=str, default=None, help="输出 Markdown 报告文件路径")
     parser.add_argument("--no-tree", action="store_true", help="不输出 Module 层级树")
     parser.add_argument("--json-output", type=str, default=None, help="输出 JSON 格式分析结果")
+    parser.add_argument("--timing-json", type=str, default=None,
+                        help="输出 timing panel JSON 文件路径（含 runtime_instance_timings_by_class 等字段）")
     parser.add_argument("--code-path", type=str, default=None, help="模型源码路径（目录或 .tar.gz）")
     parser.add_argument("--screenshot", action="store_true", help="生成 Chrome Tracing 可视化截图")
     parser.add_argument("--html-flowchart", type=str, default=None, help="生成 HTML 模块流程图路径")
@@ -3177,6 +3264,15 @@ def main():
         with open(args.json_output, "w") as f:
             json.dump(result, f, indent=2, ensure_ascii=False)
         print(f"  JSON 结果已保存到: {args.json_output}")
+
+    if args.timing_json:
+        print("  正在构建 timing panel...")
+        _, main_events, children = build_main_thread_hierarchy(events)
+        step_infos = extract_step_phase_intervals(main_events, children)
+        timing_panel = build_instance_timing_pipeline(events, step_infos, step_dur_us)
+        with open(args.timing_json, "w", encoding="utf-8") as _f:
+            json.dump(timing_panel, _f, ensure_ascii=False, indent=2)
+        print(f"  timing panel 已保存到: {args.timing_json}")
 
     _emit_ab_summary_if_enabled(args)
 
