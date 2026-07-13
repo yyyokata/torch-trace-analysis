@@ -3140,31 +3140,15 @@ def __getattr__(name):  # noqa: D401 (PEP 562 module-level __getattr__)
 
 def main():
     parser = argparse.ArgumentParser(description="分析 PyTorch 训练 trace JSON 文件")
-    parser.add_argument("trace_file", nargs="?", default=None, help="trace JSON 文件路径 (可选，若仅生成源码流程图则不需要)")
-    parser.add_argument("--max-level", type=int, default=None, help="最大显示的 Module 层级深度")
-    parser.add_argument("--output", "-o", type=str, default=None, help="输出 Markdown 报告文件路径")
-    parser.add_argument("--no-tree", action="store_true", help="不输出 Module 层级树")
-    parser.add_argument("--json-output", type=str, default=None, help="输出 JSON 格式分析结果")
+    parser.add_argument("trace_file", nargs="?", default=None, help="trace JSON 文件路径")
     parser.add_argument("--timing-json", type=str, default=None,
                         help="输出 timing panel JSON 文件路径（含 runtime_instance_timings_by_class 等字段）")
-    parser.add_argument("--code-path", type=str, default=None, help="模型源码路径（目录或 .tar.gz）")
-    parser.add_argument("--screenshot", action="store_true", help="生成 Chrome Tracing 可视化截图")
-    parser.add_argument("--html-flowchart", type=str, default=None, help="生成 HTML 模块流程图路径")
-    parser.add_argument("--use-new-eval", action="store_true",
-                        help="兼容旧脚本参数；静态分析代码已移除，该参数仅保留 CLI 兼容性")
     parser.add_argument("--ab-eval-report", type=str, default=None,
-                        help="写入当前求值器状态摘要 JSON（静态分析代码清理后仅保留 CLI 兼容性）")
+                        help="写入当前求值器状态摘要 JSON")
     args = parser.parse_args()
 
     global USE_NEW_EVAL
     USE_NEW_EVAL = True
-    if args.use_new_eval:
-        print("  [cleanup] --use-new-eval 已保留为兼容参数；当前不再包含静态分析求值器")
-
-    if args.html_flowchart:
-        raise NotImplementedError(
-            "static HTML flowchart generation has been removed in feat/static-cleanup"
-        )
 
     if not args.trace_file:
         print("  ❌ 错误: 需要提供 trace 文件路径")
@@ -3192,96 +3176,6 @@ def main():
             json.dump(timing_panel, _f, ensure_ascii=False, indent=2)
         print(f"  timing panel 已保存到: {args.timing_json}")
         return
-
-    meta = extract_metadata(data, events)
-
-    trace_type = detect_trace_type(events)
-    if trace_type != "training":
-        print(f"  ⚠️ 检测到这是 {trace_type} trace，当前 skill 仅支持训练 trace 分析")
-        print("  如确认是训练 trace，将继续分析")
-
-    has_code_loc, has_stack_traces = detect_enhanced_trace(events)
-    is_enhanced = has_code_loc and has_stack_traces
-    if is_enhanced:
-        print("  检测到增强 trace（含 Code Location 和 stack_traces）")
-        if not args.code_path:
-            print("  ❌ 错误: 增强 trace 需要提供模型源码才能进行源码级分析")
-            print("  请通过 --code-path 参数提供模型源码目录或 tar.gz 压缩包")
-            print("  示例: python3 scripts/analyze_trace.py trace.json --code-path code_commit.tar.gz")
-            sys.exit(1)
-
-    source_files = {}
-    if args.code_path:
-        print(f"  正在加载模型源码: {args.code_path}")
-        source_files = load_model_code(args.code_path)
-        print(f"  加载了 {len(source_files)} 个源文件: {', '.join(sorted(source_files.keys())[:10])}")
-        if len(source_files) > 10:
-            print(f"    ... 等共 {len(source_files)} 个文件")
-
-    profiler_steps = []
-    for e in events:
-        if e.get("cat") == "user_annotation" and "ProfilerStep" in e.get("name", ""):
-            profiler_steps.append({"ts": e["ts"], "dur": e.get("dur", 0), "end": e["ts"] + e.get("dur", 0)})
-    profiler_steps.sort(key=lambda x: x["ts"])
-    num_steps = len(profiler_steps)
-
-    if num_steps > 0:
-        step_dur_us = sum(s["dur"] for s in profiler_steps) / num_steps
-    else:
-        step_dur_us = 0
-        for e in events:
-            if e.get("cat") == "Trace":
-                step_dur_us = e.get("dur", 0)
-                break
-        if step_dur_us == 0:
-            ts_vals = [e.get("ts", 0) for e in events if e.get("ph") == "X"]
-            end_vals = [e.get("ts", 0) + e.get("dur", 0) for e in events if e.get("ph") == "X"]
-            if ts_vals and end_vals:
-                step_dur_us = max(end_vals) - min(ts_vals)
-
-    print(f"  ProfilerStep 数量: {num_steps}")
-    print(f"  平均 Step 耗时: {format_duration(step_dur_us)}")
-
-    print("  正在构建事件调用关系...")
-    build_parent_index(events)
-    thread_indices = add_func_call_parent(events)
-
-    print("  正在分析线程结构...")
-    thread_info = classify_threads(events, meta)
-
-    step_decomp = analyze_step_decomposition(events, thread_info, profiler_steps)
-
-    src_info = None
-
-    print("  正在构建 Module 层级...")
-    module_tree, root_modules, mod_info = build_module_hierarchy(events, source_files)
-
-    if args.output:
-        print(f"  正在生成 Markdown 报告: {args.output}")
-        report = generate_markdown_report(
-            meta, thread_info, module_tree, mod_info, step_dur_us,
-            step_decomp=step_decomp, source_hotspots=src_info
-        )
-        with open(args.output, "w", encoding="utf-8") as f:
-            f.write(report)
-        print(f"  Markdown 报告已保存到: {args.output}")
-    else:
-        print_summary(meta, thread_info, module_tree, mod_info, step_dur_us,
-                      max_level=args.max_level, show_tree=(not args.no_tree),
-                      step_decomp=step_decomp, source_hotspots=src_info)
-
-    if args.json_output:
-        result = {
-            "metadata": meta,
-            "step_dur_us": step_dur_us,
-            "step_decomposition": step_decomp,
-            "source_hotspots": src_info,
-            "module_tree": module_tree,
-            "module_info": mod_info,
-        }
-        with open(args.json_output, "w") as f:
-            json.dump(result, f, indent=2, ensure_ascii=False)
-        print(f"  JSON 结果已保存到: {args.json_output}")
 
     _emit_ab_summary_if_enabled(args)
 
