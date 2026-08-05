@@ -475,7 +475,7 @@ def build_fwdbwd_flow_index(events):
     look up the enclosing forward/backward op by interval-containment.
     """
     if not events:
-        return {"by_bwd_tid": {}, "all": []}
+        return {"by_bwd_tid": {}, "bwd_ts_keys_by_tid": {}, "all": []}
     pairs = {}
     for e in events:
         if e.get("cat") != "fwdbwd":
@@ -506,7 +506,8 @@ def build_fwdbwd_flow_index(events):
     by_tid = defaultdict(list)
     for ent in entries:
         by_tid[ent["bwd_tid"]].append(ent)
-    return {"by_bwd_tid": dict(by_tid), "all": entries}
+    bwd_ts_keys_by_tid = {tid: [ent["bwd_ts"] for ent in ents] for tid, ents in by_tid.items()}
+    return {"by_bwd_tid": dict(by_tid), "bwd_ts_keys_by_tid": bwd_ts_keys_by_tid, "all": entries}
 
 
 def _find_enclosing_op(events_by_tid_sorted, ts_keys_by_tid, tid, ts):
@@ -580,9 +581,10 @@ def _resolve_fwdbwd_scope(kernel_event, fwdbwd_index, cpu_op_by_tid, cpu_op_ts_k
     # Strategy: pick the entry with the largest bwd_ts <= kernel_ts whose
     # enclosing bwd op covers the kernel.
     chosen = None
-    for ent in cands:
-        if ent["bwd_ts"] > bwd_kernel_ts:
-            continue
+    keys = fwdbwd_index["bwd_ts_keys_by_tid"][bwd_kernel_tid]
+    pos = bisect.bisect_right(keys, bwd_kernel_ts)
+    for i in range(pos - 1, -1, -1):
+        ent = cands[i]
         bwd_op = _find_enclosing_op(cpu_op_by_tid, cpu_op_ts_keys_by_tid, ent["bwd_tid"], ent["bwd_ts"])
         if bwd_op is None:
             continue
@@ -590,8 +592,7 @@ def _resolve_fwdbwd_scope(kernel_event, fwdbwd_index, cpu_op_by_tid, cpu_op_ts_k
         bwd_end = bwd_start + (bwd_op.get("dur") or 0.0)
         if bwd_start <= bwd_kernel_ts <= bwd_end:
             chosen = ent
-            # Don't break — later entries (same op) override since they
-            # represent finer-grained scope.
+            break
     if chosen is None:
         return None
     fwd_op = _find_enclosing_op(cpu_op_by_tid, cpu_op_ts_keys_by_tid, chosen["fwd_tid"], chosen["fwd_ts"])
@@ -735,25 +736,29 @@ def _build_module_index_by_tid(events):
         if not str(e.get("name", "")).startswith("nn.Module:"):
             continue
         by_tid[e.get("tid")].append(e)
-    for tid in by_tid:
-        by_tid[tid].sort(key=lambda x: x.get("ts", 0.0))
-    return dict(by_tid)
+    result = {}
+    ts_keys = {}
+    for tid, evs in by_tid.items():
+        evs.sort(key=lambda x: x.get("ts", 0.0))
+        result[tid] = evs
+        ts_keys[tid] = [float(e.get("ts", 0.0)) for e in evs]
+    return result, ts_keys
 
 
-def _find_innermost_module_in_window(module_events_by_tid, tid, start, end):
+def _find_innermost_module_in_window(module_events_by_tid, module_ts_keys_by_tid, tid, start, end):
     """Among nn.Module python_function events on ``tid`` whose interval
     intersects [start, end], return the innermost one (smallest duration)."""
+    events = module_events_by_tid.get(tid, [])
+    keys = module_ts_keys_by_tid.get(tid, [])
+    right = bisect.bisect_right(keys, end)
     best = None
     best_dur = None
-    for e in module_events_by_tid.get(tid, []):
+    for i in range(right - 1, -1, -1):
+        e = events[i]
         ts = e.get("ts")
-        if ts is None:
-            continue
-        if ts > end:
-            break
         dur = e.get("dur") or 0.0
         if ts + dur < start:
-            continue
+            break
         if best is None or dur < best_dur:
             best = e
             best_dur = dur
@@ -786,7 +791,7 @@ def build_kernel_attribution_table(events, step_infos, fwdbwd_index):
     else:
         cpu_op_by_tid, cpu_op_ts_keys_by_tid = {}, {}
     ext_to_module, ext_id_to_cpuop = _build_external_id_to_module_map(events)
-    module_events_by_tid = _build_module_index_by_tid(events)
+    module_events_by_tid, module_ts_keys_by_tid = _build_module_index_by_tid(events)
     bwd_tids = set((fwdbwd_index or {}).get("by_bwd_tid", {}).keys())
 
     kernel_attribution = {}
@@ -877,7 +882,8 @@ def build_kernel_attribution_table(events, step_infos, fwdbwd_index):
             if scope is not None:
                 stats["bwd_via_flow_narrowed"] += 1
                 fwd_start, fwd_end, fwd_tid = scope
-                leaf_event = _find_innermost_module_in_window(module_events_by_tid, fwd_tid, fwd_start, fwd_end)
+                leaf_event = _find_innermost_module_in_window(
+                    module_events_by_tid, module_ts_keys_by_tid, fwd_tid, fwd_start, fwd_end)
                 if leaf_event is not None:
                     leaf_ext_id = leaf_event.get("args", {}).get("External id")
                     module_events = ext_to_module.get(leaf_ext_id)
