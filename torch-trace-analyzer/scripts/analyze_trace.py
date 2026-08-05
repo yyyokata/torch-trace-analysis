@@ -10,10 +10,11 @@ import copy
 import tarfile
 import argparse
 import bisect
+import logging
 import subprocess
 import textwrap
 import tokenize
-from collections import Counter, defaultdict, deque
+from collections import Counter, defaultdict
 
 # ---------------------------------------------------------------------------
 # Module identity registration.
@@ -404,42 +405,68 @@ def _normalize_runtime_module_name(mod_name):
 
 
 def _build_external_id_to_module_map(events):
-    by_tid = defaultdict(list)
+    """Map each CPU op External id to the active module chain at its origin.
+
+    The CPU op is the launch-side anchor.  Kernel/autograd worker threads must
+    never contribute their own module stack to this mapping.  When the CPU op
+    tid itself has no active module, its nearest indexed Python parent supplies
+    the original Python thread.
+    """
+    module_events_by_tid, module_ts_keys_by_tid = _build_module_index_by_tid(events)
+    python_id_index = _build_python_id_index(events)
     ext_id_to_cpuop = {}
     ext_to_module = {}
+
     for e in events:
-        if e.get("ph") != "X" or e.get("dur") is None:
+        if e.get("cat") != "cpu_op":
             continue
-        if e.get("cat") == "kernel":
+        ext_id = e.get("args", {}).get("External id")
+        if ext_id is None:
             continue
-        by_tid[e.get("tid")].append(e)
-        if e.get("cat") == "cpu_op":
-            ext_id = e.get("args", {}).get("External id")
-            if ext_id is not None:
-                ext_id_to_cpuop.setdefault(ext_id, e)
+        if ext_id in ext_id_to_cpuop:
+            logging.warning(
+                "timing attribution skip reason=duplicate_cpu_op_external_id ext_id=%r",
+                ext_id,
+            )
+            continue
 
-    for tid, tid_events in by_tid.items():
-        tid_events.sort(key=lambda e: (e["ts"], -(e.get("dur") or 0), 0 if e.get("cat") == "python_function" else 1))
-        module_stack = []
-        pending_cpu_ops = deque()
-        for e in tid_events:
-            start = e["ts"]
-            end = start + (e.get("dur") or 0)
-            while module_stack and module_stack[-1][1] <= start:
-                module_stack.pop()
-            while pending_cpu_ops and pending_cpu_ops[0][0] <= start:
-                pending_cpu_ops.popleft()
+        ts = e.get("ts")
+        if ts is None:
+            logging.warning(
+                "timing attribution skip reason=cpu_op_missing_timestamp ext_id=%r",
+                ext_id,
+            )
+            continue
+        ext_id_to_cpuop[ext_id] = e
+        origin_tid = e.get("tid")
+        module_events = _find_active_module_chain_at(
+            module_events_by_tid, module_ts_keys_by_tid, origin_tid, ts)
+        if not module_events:
+            parent_id = e.get("args", {}).get("Python parent id")
+            if parent_id is not None:
+                parent_event = python_id_index.get(parent_id)
+                if parent_event is None:
+                    logging.warning(
+                        "timing attribution skip reason=missing_python_parent "
+                        "ext_id=%r parent_id=%r",
+                        ext_id,
+                        parent_id,
+                    )
+                    continue
+                origin_tid = parent_event.get("tid")
+                if origin_tid is None:
+                    logging.warning(
+                        "timing attribution skip reason=python_parent_missing_tid "
+                        "ext_id=%r parent_id=%r",
+                        ext_id,
+                        parent_id,
+                    )
+                    continue
+                module_events = _find_active_module_chain_at(
+                    module_events_by_tid, module_ts_keys_by_tid, origin_tid, ts)
 
-            is_module = e.get("cat") == "python_function" and str(e.get("name", "")).startswith("nn.Module:")
-            if is_module:
-                module_stack.append((e, end))
-
-            ext_id = e.get("args", {}).get("External id")
-            if ext_id is None or not module_stack:
-                continue
-            if e.get("cat") == "cpu_op":
-                pending_cpu_ops.append((end, ext_id))
-            ext_to_module.setdefault(ext_id, [module_event for module_event, _ in module_stack])
+        if module_events:
+            ext_to_module[ext_id] = module_events
 
     return ext_to_module, ext_id_to_cpuop
 
@@ -522,7 +549,10 @@ def _find_enclosing_op(events_by_tid_sorted, ts_keys_by_tid, tid, ts):
         return None
     keys = ts_keys_by_tid.get(tid)
     if keys is None:
-        raise RuntimeError(f"missing cpu_op timestamp index for tid={tid!r}")
+        logging.warning(
+            "timing attribution skip reason=missing_cpu_op_timestamp_index tid=%r", tid
+        )
+        return None
     pos = bisect.bisect_right(keys, ts) - 1
     best = None
     best_dur = float("inf")
@@ -546,7 +576,12 @@ def _build_cpu_op_index_by_tid(events):
     for e in events:
         if e.get("cat") != "cpu_op":
             continue
-        if e.get("dur") is None:
+        if e.get("ts") is None or e.get("dur") is None:
+            logging.warning(
+                "timing attribution skip reason=cpu_op_missing_ts_or_dur name=%r tid=%r",
+                e.get("name"),
+                e.get("tid"),
+            )
             continue
         by_tid[e.get("tid")].append(e)
     result = {}
@@ -558,49 +593,186 @@ def _build_cpu_op_index_by_tid(events):
     return result, result_keys
 
 
-def _resolve_fwdbwd_scope(kernel_event, fwdbwd_index, cpu_op_by_tid, cpu_op_ts_keys_by_tid, ext_id_to_cpuop):
-    """For a backward kernel event, find the corresponding forward scope time
-    range.
-
-    Returns (fwd_start, fwd_end, fwd_tid) or None.
-    """
-    bwd_kernel_ts = float(kernel_event.get("ts") or 0.0)
-    bwd_kernel_tid = kernel_event.get("tid")
-    cands = fwdbwd_index["by_bwd_tid"].get(bwd_kernel_tid, [])
-    if not cands:
-        ext_id = kernel_event.get("args", {}).get("External id")
-        cpu_op = ext_id_to_cpuop.get(ext_id) if ext_id is not None else None
-        if cpu_op is None:
-            return None
-        bwd_kernel_tid = cpu_op.get("tid")
-        bwd_kernel_ts = float(cpu_op.get("ts") or 0.0)
-        cands = fwdbwd_index["by_bwd_tid"].get(bwd_kernel_tid, [])
-        if not cands:
-            return None
-    # Find the fwdbwd entry whose enclosing backward op contains bwd_kernel_ts.
-    # Strategy: pick the entry with the largest bwd_ts <= kernel_ts whose
-    # enclosing bwd op covers the kernel.
-    chosen = None
-    keys = fwdbwd_index["bwd_ts_keys_by_tid"][bwd_kernel_tid]
-    pos = bisect.bisect_right(keys, bwd_kernel_ts)
-    for i in range(pos - 1, -1, -1):
-        ent = cands[i]
-        bwd_op = _find_enclosing_op(cpu_op_by_tid, cpu_op_ts_keys_by_tid, ent["bwd_tid"], ent["bwd_ts"])
-        if bwd_op is None:
+def _build_autograd_evaluate_index(cpu_op_by_tid):
+    """Index outer autograd evaluate_function scopes by tid and start time."""
+    prefix = "autograd::engine::evaluate_function: "
+    result = {}
+    for tid, cpu_ops in cpu_op_by_tid.items():
+        evaluate_ops = [
+            e for e in cpu_ops
+            if str(e.get("name", "")).startswith(prefix)
+        ]
+        if not evaluate_ops:
             continue
-        bwd_start = bwd_op.get("ts", 0.0)
-        bwd_end = bwd_start + (bwd_op.get("dur") or 0.0)
-        if bwd_start <= bwd_kernel_ts <= bwd_end:
-            chosen = ent
+        starts = []
+        prefix_max_ends = []
+        max_end = float("-inf")
+        for e in evaluate_ops:
+            ts = e.get("ts")
+            dur = e.get("dur")
+            if ts is None or dur is None:
+                logging.warning(
+                    "timing attribution skip reason=evaluate_missing_ts_or_dur tid=%r name=%r",
+                    tid,
+                    e.get("name"),
+                )
+                continue
+            end = ts + dur
+            starts.append(ts)
+            max_end = max(max_end, end)
+            prefix_max_ends.append(max_end)
+        result[tid] = {
+            "events": evaluate_ops,
+            "ts_keys": starts,
+            "prefix_max_ends": prefix_max_ends,
+        }
+    return result
+
+
+def _find_unique_enclosing_autograd_evaluate(evaluate_index, tid, ts):
+    """Return the unique outer autograd evaluate scope containing ``ts``.
+
+    Zero or multiple matches are explicitly un-attributable and return None.
+    """
+    slot = evaluate_index.get(tid)
+    if slot is None:
+        return None
+    pos = bisect.bisect_right(slot["ts_keys"], ts) - 1
+    matches = []
+    for i in range(pos, -1, -1):
+        if slot["prefix_max_ends"][i] < ts:
             break
-    if chosen is None:
+        candidate = slot["events"][i]
+        if candidate["ts"] + candidate["dur"] >= ts:
+            matches.append(candidate)
+    if len(matches) != 1:
         return None
-    fwd_op = _find_enclosing_op(cpu_op_by_tid, cpu_op_ts_keys_by_tid, chosen["fwd_tid"], chosen["fwd_ts"])
+    return matches[0]
+
+
+def _resolve_fwdbwd_scope(
+    kernel_event,
+    fwdbwd_index,
+    cpu_op_by_tid,
+    cpu_op_ts_keys_by_tid,
+    ext_id_to_cpuop,
+    autograd_evaluate_index,
+):
+    """Resolve a backward kernel through its CPU op's unique outer autograd
+    evaluate_function scope and the unique validated fwdbwd flow in that scope.
+    """
+    import logging
+
+    ext_id = kernel_event.get("args", {}).get("External id")
+    if ext_id is None or ext_id not in ext_id_to_cpuop:
+        logging.warning(
+            "fwdbwd_scope failure ext_id=%r reason=no_corresponding_cpu_op", ext_id
+        )
+        return None
+    cpu_op = ext_id_to_cpuop[ext_id]
+    bwd_tid = cpu_op.get("tid")
+    bwd_ts = cpu_op.get("ts")
+    if bwd_ts is None:
+        logging.warning(
+            "fwdbwd_scope failure ext_id=%r reason=backward_cpu_op_missing_timestamp",
+            ext_id,
+        )
+        return None
+
+    outer = _find_unique_enclosing_autograd_evaluate(
+        autograd_evaluate_index, bwd_tid, bwd_ts)
+    if outer is None:
+        logging.warning(
+            "fwdbwd_scope failure ext_id=%r reason=non_unique_or_missing_outer_evaluate "
+            "tid=%r ts=%r",
+            ext_id,
+            bwd_tid,
+            bwd_ts,
+        )
+        return None
+    outer_start = outer["ts"]
+    outer_end = outer_start + outer["dur"]
+    cands = fwdbwd_index["by_bwd_tid"].get(bwd_tid, [])
+    keys = fwdbwd_index["bwd_ts_keys_by_tid"].get(bwd_tid)
+    if keys is None:
+        logging.warning(
+            "fwdbwd_scope failure ext_id=%r reason=missing_fwdbwd_timestamp_index tid=%r",
+            ext_id,
+            bwd_tid,
+        )
+        return None
+    left = bisect.bisect_left(keys, outer_start)
+    right = bisect.bisect_right(keys, outer_end)
+    scoped_flows = cands[left:right]
+    if len(scoped_flows) != 1:
+        logging.warning(
+            "fwdbwd_scope failure ext_id=%r reason=non_unique_scoped_flow "
+            "outer=%r tid=%r flow_count=%d",
+            ext_id,
+            outer.get("name"),
+            bwd_tid,
+            len(scoped_flows),
+        )
+        return None
+    chosen = scoped_flows[0]
+
+    inner = _find_enclosing_op(
+        cpu_op_by_tid, cpu_op_ts_keys_by_tid, bwd_tid, chosen["bwd_ts"])
+    if inner is None:
+        logging.warning(
+            "fwdbwd_scope failure flow_id=%r reason=no_enclosing_backward_cpu_op",
+            chosen["flow_id"],
+        )
+        return None
+    prefix = "autograd::engine::evaluate_function: "
+    outer_node_name = str(outer.get("name", ""))[len(prefix):]
+    if inner.get("name") != outer_node_name:
+        logging.warning(
+            "fwdbwd_scope failure flow_id=%r reason=inner_outer_node_mismatch "
+            "inner=%r outer=%r",
+            chosen["flow_id"],
+            inner.get("name"),
+            outer_node_name,
+        )
+        return None
+    outer_seq = outer.get("args", {}).get("Sequence number")
+    inner_seq = inner.get("args", {}).get("Sequence number")
+    if inner_seq is None:
+        logging.warning(
+            "fwdbwd_scope failure flow_id=%r reason=inner_backward_sequence_missing",
+            chosen["flow_id"],
+        )
+        return None
+    if outer_seq is not None and outer_seq != inner_seq:
+        logging.warning(
+            "fwdbwd_scope failure flow_id=%r reason=outer_inner_sequence_mismatch "
+            "outer=%r inner=%r",
+            chosen["flow_id"],
+            outer_seq,
+            inner_seq,
+        )
+        return None
+
+    fwd_op = _find_enclosing_op(
+        cpu_op_by_tid, cpu_op_ts_keys_by_tid, chosen["fwd_tid"], chosen["fwd_ts"])
     if fwd_op is None:
+        logging.warning(
+            "fwdbwd_scope failure flow_id=%r reason=no_enclosing_forward_cpu_op",
+            chosen["flow_id"],
+        )
         return None
-    fwd_start = fwd_op.get("ts", 0.0)
-    fwd_end = fwd_start + (fwd_op.get("dur") or 0.0)
-    return (fwd_start, fwd_end, chosen["fwd_tid"])
+    fwd_seq = fwd_op.get("args", {}).get("Sequence number")
+    if fwd_seq is None or fwd_seq != inner_seq:
+        logging.warning(
+            "fwdbwd_scope failure flow_id=%r reason=forward_backward_sequence_mismatch "
+            "forward=%r backward=%r",
+            chosen["flow_id"],
+            fwd_seq,
+            inner_seq,
+        )
+        return None
+    fwd_start = fwd_op["ts"]
+    return (fwd_start, fwd_start + fwd_op["dur"], chosen["fwd_tid"])
 
 
 # --------------------------------------------------------------------------
@@ -644,7 +816,11 @@ def _parse_stack_entry(entry: str):
     Indented source-code lines (e.g. "    x = ...") are skipped.
     """
     if not isinstance(entry, str):
-        raise TypeError(f"stack_traces entry must be str, got {type(entry)!r}")
+        logging.warning(
+            "timing attribution skip reason=invalid_stack_trace_entry_type type=%r",
+            type(entry),
+        )
+        return []
 
     frames = []
     for raw in entry.splitlines():
@@ -661,7 +837,10 @@ def _parse_stack_entry(entry: str):
         m = _STACK_FRAME_RE.match(line)
         if not m:
             if stripped.startswith("File "):
-                raise RuntimeError(f"unrecognized traceback frame line: {line!r}")
+                logging.warning(
+                    "timing attribution skip reason=unrecognized_traceback_frame line=%r",
+                    line,
+                )
             continue
         path = m.group(1)
         lineno = int(m.group(2))
@@ -735,6 +914,13 @@ def _build_module_index_by_tid(events):
             continue
         if not str(e.get("name", "")).startswith("nn.Module:"):
             continue
+        if e.get("ts") is None or e.get("dur") is None:
+            logging.warning(
+                "timing attribution skip reason=module_missing_ts_or_dur name=%r tid=%r",
+                e.get("name"),
+                e.get("tid"),
+            )
+            continue
         by_tid[e.get("tid")].append(e)
     result = {}
     ts_keys = {}
@@ -743,6 +929,94 @@ def _build_module_index_by_tid(events):
         result[tid] = evs
         ts_keys[tid] = [float(e.get("ts", 0.0)) for e in evs]
     return result, ts_keys
+
+
+def _build_python_id_index(events):
+    """Index every python_function event by its Python id."""
+    index = {}
+    for e in events:
+        if e.get("cat") != "python_function":
+            continue
+        python_id = e.get("args", {}).get("Python id")
+        if python_id is None:
+            continue
+        if python_id in index:
+            logging.warning(
+                "timing attribution skip reason=duplicate_python_id python_id=%r",
+                python_id,
+            )
+            continue
+        index[python_id] = e
+    return index
+
+
+def _collect_module_chain(leaf_event, python_id_index):
+    """Return the validated Python-parent module chain, outermost to leaf.
+
+    Invalid or incomplete trace chains are warned about and return ``None``.
+    """
+    if leaf_event is None:
+        logging.warning("timing attribution skip reason=missing_module_leaf")
+        return None
+    chain = []
+    current = leaf_event
+    seen = set()
+    while True:
+        python_id = current.get("args", {}).get("Python id")
+        if python_id is not None:
+            if python_id in seen:
+                logging.warning(
+                    "timing attribution skip reason=python_parent_cycle python_id=%r",
+                    python_id,
+                )
+                return None
+            seen.add(python_id)
+        if str(current.get("name", "")).startswith("nn.Module:"):
+            chain.append(current)
+        parent_id = current.get("args", {}).get("Python parent id")
+        if parent_id is None:
+            break
+        if parent_id not in python_id_index:
+            logging.warning(
+                "timing attribution skip reason=python_parent_chain_missing parent_id=%r",
+                parent_id,
+            )
+            return None
+        current = python_id_index[parent_id]
+    chain.reverse()
+    if not chain:
+        logging.warning("timing attribution skip reason=python_chain_has_no_module")
+        return None
+    return chain
+
+
+def _find_active_module_chain_at(module_events_by_tid, module_ts_keys_by_tid, tid, ts):
+    """Return all nn.Module intervals active at ``ts`` on ``tid``."""
+    events = module_events_by_tid.get(tid)
+    if not events:
+        return []
+    keys = module_ts_keys_by_tid.get(tid)
+    if keys is None:
+        logging.warning(
+            "timing attribution skip reason=missing_module_timestamp_index tid=%r", tid
+        )
+        return []
+    right = bisect.bisect_right(keys, ts)
+    active = []
+    for event in events[:right]:
+        start = event.get("ts")
+        duration = event.get("dur")
+        if start is None or duration is None:
+            logging.warning(
+                "timing attribution skip reason=module_missing_ts_or_dur tid=%r name=%r",
+                tid,
+                event.get("name"),
+            )
+            continue
+        if start <= ts <= start + duration:
+            active.append(event)
+    active.sort(key=lambda event: (event["ts"], -(event["dur"])))
+    return active
 
 
 def _find_innermost_module_in_window(module_events_by_tid, module_ts_keys_by_tid, tid, start, end):
@@ -758,7 +1032,7 @@ def _find_innermost_module_in_window(module_events_by_tid, module_ts_keys_by_tid
         ts = e.get("ts")
         dur = e.get("dur") or 0.0
         if ts + dur < start:
-            break
+            continue
         if best is None or dur < best_dur:
             best = e
             best_dur = dur
@@ -780,17 +1054,20 @@ def build_kernel_attribution_table(events, step_infos, fwdbwd_index):
     Full-chain construction (runtime-only):
       * every attributed event is mapped through the runtime nn.Module event
         chain using ``Python id`` / ``Python parent id`` and ``CallFrom``.
-      * backward kernels first use fwdbwd flow to recover the corresponding
-        forward module scope, then fall back to the direct External id module
-        chain when the flow scope is unavailable.
-      * an event with no resolvable module parent chain is reported in debug
-        stats or raises RuntimeError for inconsistent CPU parent chains.
+      * backward kernels use fwdbwd flow to recover the corresponding forward
+        module leaf and then walk that leaf's validated Python parent chain.
+      * mappings with missing or invalid flow/module-chain evidence emit a warning
+        and are explicitly skipped; they are never redirected to another External
+        id chain.
     """
     if fwdbwd_index:
         cpu_op_by_tid, cpu_op_ts_keys_by_tid = _build_cpu_op_index_by_tid(events)
+        autograd_evaluate_index = _build_autograd_evaluate_index(cpu_op_by_tid)
     else:
         cpu_op_by_tid, cpu_op_ts_keys_by_tid = {}, {}
+        autograd_evaluate_index = {}
     ext_to_module, ext_id_to_cpuop = _build_external_id_to_module_map(events)
+    python_id_index = _build_python_id_index(events)
     module_events_by_tid, module_ts_keys_by_tid = _build_module_index_by_tid(events)
     bwd_tids = set((fwdbwd_index or {}).get("by_bwd_tid", {}).keys())
 
@@ -800,6 +1077,7 @@ def build_kernel_attribution_table(events, step_infos, fwdbwd_index):
         "total_kernels": 0, "fwd_attributed": 0, "bwd_attributed": 0,
         "cpu_attributed": 0, "fwd_unattributed": 0, "bwd_unattributed": 0,
         "bwd_via_flow_narrowed": 0,
+        "skipped_outside_evaluate": 0,
         "total_kernel_dur_us": 0.0,
         "framework_only": [],
     }
@@ -864,10 +1142,16 @@ def build_kernel_attribution_table(events, step_infos, fwdbwd_index):
             })
             continue
         if ext_id not in ext_id_to_cpuop:
-            raise RuntimeError(
-                f"kernel idx={idx} name={e.get('name')!r} has ext_id={ext_id!r} "
-                f"but no corresponding CPU op found in ext_id_to_cpuop"
+            logging.warning(
+                "timing attribution skip reason=kernel_missing_cpu_op idx=%d name=%r ext_id=%r",
+                idx,
+                e.get("name"),
+                ext_id,
             )
+            stats.setdefault("skipped_missing_cpu_op", []).append({
+                "idx": idx, "name": e.get("name"), "ext_id": ext_id,
+            })
+            continue
         cpu_op = ext_id_to_cpuop[ext_id]
         is_bwd = cpu_op["tid"] in bwd_tids
         stats["total_kernels"] += 1
@@ -876,19 +1160,77 @@ def build_kernel_attribution_table(events, step_infos, fwdbwd_index):
         module_events = None
         scope = None
         if is_bwd and fwdbwd_index and fwdbwd_index["all"]:
-            # Backward kernel: resolve the forward scope via fwdbwd flow, then
-            # use the active module-stack snapshot of its innermost module.
-            scope = _resolve_fwdbwd_scope(e, fwdbwd_index, cpu_op_by_tid, cpu_op_ts_keys_by_tid, ext_id_to_cpuop)
-            if scope is not None:
-                stats["bwd_via_flow_narrowed"] += 1
-                fwd_start, fwd_end, fwd_tid = scope
-                leaf_event = _find_innermost_module_in_window(
-                    module_events_by_tid, module_ts_keys_by_tid, fwd_tid, fwd_start, fwd_end)
-                if leaf_event is not None:
-                    leaf_ext_id = leaf_event.get("args", {}).get("External id")
-                    module_events = ext_to_module.get(leaf_ext_id)
-        if module_events is None:
+            # Backward attribution is defined by the forward leaf selected by
+            # fwdbwd flow.  nn.Module events do not carry External id, so walk
+            # that leaf's Python parent chain directly.
+            scope = _resolve_fwdbwd_scope(
+                e, fwdbwd_index, cpu_op_by_tid, cpu_op_ts_keys_by_tid,
+                ext_id_to_cpuop, autograd_evaluate_index)
+            if scope is None:
+                stats["skipped_outside_evaluate"] += 1
+                continue
+            stats["bwd_via_flow_narrowed"] += 1
+            fwd_start, fwd_end, fwd_tid = scope
+            leaf_event = _find_innermost_module_in_window(
+                module_events_by_tid, module_ts_keys_by_tid, fwd_tid, fwd_start, fwd_end)
+            if leaf_event is None:
+                logging.warning(
+                    "timing attribution skip reason=forward_scope_no_module_leaf "
+                    "idx=%d ext_id=%r scope=(%r,%r,tid=%r)",
+                    idx,
+                    ext_id,
+                    fwd_start,
+                    fwd_end,
+                    fwd_tid,
+                )
+                stats.setdefault("skipped_no_module_chain", []).append({
+                    "idx": idx,
+                    "name": e.get("name"),
+                    "cat": e.get("cat"),
+                    "ts": e.get("ts"),
+                    "tid": e.get("tid"),
+                    "ext_id": ext_id,
+                    "is_bwd": True,
+                    "scope_found": True,
+                    "phase": classify_kernel_phase(ts, ts + dur, step_infos),
+                    "reason": "forward_scope_no_module_leaf",
+                })
+                stats["bwd_unattributed"] += 1
+                continue
+            module_events = _collect_module_chain(leaf_event, python_id_index)
+            if module_events is None:
+                stats.setdefault("skipped_no_module_chain", []).append({
+                    "idx": idx,
+                    "name": e.get("name"),
+                    "cat": e.get("cat"),
+                    "ts": e.get("ts"),
+                    "tid": e.get("tid"),
+                    "ext_id": ext_id,
+                    "is_bwd": True,
+                    "scope_found": True,
+                    "phase": classify_kernel_phase(ts, ts + dur, step_infos),
+                    "reason": "invalid_python_module_chain",
+                })
+                stats["bwd_unattributed"] += 1
+                continue
+        else:
             module_events = ext_to_module.get(ext_id)
+            if module_events is None:
+                _phase = classify_kernel_phase(ts, ts + dur, step_infos)
+                stats.setdefault("skipped_no_module_chain", []).append({
+                    "idx": idx,
+                    "name": e.get("name"),
+                    "cat": e.get("cat"),
+                    "ts": e.get("ts"),
+                    "tid": e.get("tid"),
+                    "ext_id": ext_id,
+                    "is_bwd": False,
+                    "scope_found": False,
+                    "phase": _phase,
+                    "reason": "cpu_origin_has_no_module_chain",
+                })
+                stats["fwd_unattributed"] += 1
+                continue
 
         stack_traces = e.get("args", {}).get("stack", {}).get("stack_traces")
         stored, framework_only = _store_from_module_chain(
@@ -941,11 +1283,13 @@ def build_kernel_attribution_table(events, step_infos, fwdbwd_index):
         elif framework_only:
             continue
         else:
-            raise RuntimeError(
-                "CPU op idx=%d (ext_id=%s) resolved to an active module stack "
-                "but produced no call_chain."
-                % (idx, ext_id)
+            logging.warning(
+                "timing attribution skip reason=cpu_module_stack_no_call_chain "
+                "idx=%d ext_id=%r",
+                idx,
+                ext_id,
             )
+            continue
 
     return kernel_attribution, cpu_attribution, stats
 
