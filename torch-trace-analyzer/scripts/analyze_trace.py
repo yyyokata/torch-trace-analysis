@@ -1258,8 +1258,8 @@ def attach_timing_to_dag_groups(adapted: dict, panel: dict) -> list:
 
     匹配规则：
     - 主键：(basename(callsite_file), callsite_line) vs (basename(src_file), src_start_line)
-    - 优先匹配 leaf（call_chain[-1]，即 callsite），失败时逐层回退到 ancestors（innermost→outermost）
-    - 相同完整帧序列缓存匹配结果
+    - 只匹配 leaf（callsite），不再回退到 ancestors
+    - 相同 leaf loc 缓存匹配结果
     - 一个 loc 命中多个 group 时均分（weight = 1/len(matched)）
     - src_file 或 src_start_line 缺失的 group raise RuntimeError
 
@@ -1278,15 +1278,6 @@ def attach_timing_to_dag_groups(adapted: dict, panel: dict) -> list:
             )
         dag_loc_index[(os.path.basename(sf), int(sl))].append(g)
 
-    def _match_frames(frames_to_try):
-        for depth, (f, l) in enumerate(frames_to_try):
-            if not f or not l:
-                continue
-            matched = dag_loc_index.get((f, l))
-            if matched:
-                return matched, depth
-        return None, -1
-
     match_cache: dict = {}
     warnings_out: list = []
 
@@ -1294,31 +1285,18 @@ def attach_timing_to_dag_groups(adapted: dict, panel: dict) -> list:
         for item in items:
             leaf_file = os.path.basename(item.get("callsite_file") or "")
             leaf_line = item.get("callsite_line") or 0
-            anc_frames = [
-                (os.path.basename(a[1] or ""), a[2] or 0)
-                for a in reversed(item.get("ancestors", []))
-            ]
-            frames_to_try = tuple([(leaf_file, leaf_line)] + anc_frames)
+            loc_key = (leaf_file, leaf_line)
 
-            if frames_to_try not in match_cache:
-                matched, depth = _match_frames(frames_to_try)
-                match_cache[frames_to_try] = (matched, depth)
-            matched, depth = match_cache[frames_to_try]
+            if loc_key not in match_cache:
+                match_cache[loc_key] = dag_loc_index.get(loc_key)
+            matched = match_cache[loc_key]
 
             csf = item.get("callsite_file", "")
             csl = item.get("callsite_line", 0)
 
             if matched is None:
-                warnings_out.append(
-                    f"WARN full-stack-miss: {cls}@{csf}:{csl}"
-                )
+                warnings_out.append(f"WARN leaf-miss: {cls}@{csf}:{csl}")
                 continue
-
-            if depth > 0:
-                warnings_out.append(
-                    f"WARN leaf-miss fallback depth={depth}: {cls}@{csf}:{csl}"
-                    f" → matched {frames_to_try[depth]}"
-                )
 
             weight = 1.0 / len(matched)
             fwd = item.get("inclusive_forward_us", 0.0) * weight
