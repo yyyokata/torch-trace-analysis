@@ -1301,10 +1301,14 @@ def attach_timing_to_dag_groups(adapted: dict, panel: dict) -> list:
                 warnings_out.append(f"WARN leaf-miss: {cls}@{csf}:{csl}")
                 continue
 
-            weight = 1.0 / len(matched)
+            eligible = [g for g in matched if g.get("synthetic_type") is None]
+            if not eligible:
+                continue
+
+            weight = 1.0 / len(eligible)
             fwd = item.get("inclusive_forward_us", 0.0) * weight
             bwd = item.get("inclusive_backward_us", 0.0) * weight
-            for g in matched:
+            for g in eligible:
                 t = g.setdefault(
                     "direct_timing",
                     {"inclusive_forward_us": 0.0, "inclusive_backward_us": 0.0},
