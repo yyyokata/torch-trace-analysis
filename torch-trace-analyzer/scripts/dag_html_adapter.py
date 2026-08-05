@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+import os
 
 
 _REQUIRED_TOP_LEVEL_FIELDS = (
@@ -49,7 +50,12 @@ class _BuiltNode:
 def adapt_serialized_dag(serialized: dict, model_id: str, mode: str) -> dict:
     _validate_serialized_top_level(serialized)
     state = _AdapterState()
-    root_groups, _top_level_leaves, _ = _walk_serialized_level(serialized, depth=0, state=state)
+    root_groups, _top_level_leaves, _ = _walk_serialized_level(
+        serialized,
+        depth=0,
+        state=state,
+        parent_chain=[],
+    )
     if not root_groups:
         raise RuntimeError("serialized DAG has no root groups")
 
@@ -95,6 +101,7 @@ def _walk_serialized_level(
     serialized: dict,
     depth: int,
     state: _AdapterState,
+    parent_chain: list[list[object]],
 ) -> tuple[list[dict], list[dict], list[dict]]:
     _validate_serialized_top_level(serialized)
     _record_serialized_node_ids(serialized, state)
@@ -126,6 +133,7 @@ def _walk_serialized_level(
             state=state,
             node_entry_by_id=node_entry_by_id,
             visiting=set(),
+            parent_chain=parent_chain,
         )
         if built.kind == "group":
             direct_groups.append(built.payload)
@@ -160,6 +168,7 @@ def _build_structured_node(
     state: _AdapterState,
     node_entry_by_id: dict[int, dict],
     visiting: set[int],
+    parent_chain: list[list[object]],
 ) -> _BuiltNode:
     node_id = _require_field(entry, "node_id")
     if node_id in visiting:
@@ -173,6 +182,7 @@ def _build_structured_node(
             state=state,
             node_entry_by_id=node_entry_by_id,
             visiting=visiting,
+            parent_chain=parent_chain,
         )
         visiting.remove(node_id)
         return _BuiltNode(kind="group", payload=group)
@@ -194,12 +204,21 @@ def _build_group_node(
     state: _AdapterState,
     node_entry_by_id: dict[int, dict],
     visiting: set[int],
+    parent_chain: list[list[object]],
 ) -> dict:
     node_id = _require_field(entry, "node_id")
     label = _require_field(entry, "label")
     class_name = entry.get("class_name") or ""
     attr_name = entry.get("attr_name") or ""
     location_fields = _call_loc_to_src_fields(entry.get("call_loc"))
+
+    src_file = location_fields.get("src_file")
+    src_start_line = location_fields.get("src_start_line")
+    if src_file is None or src_start_line is None:
+        raise RuntimeError(
+            f"group node {node_id} missing src_file/src_start_line (label={label!r})"
+        )
+    dag_chain = [*parent_chain, [os.path.basename(src_file), src_start_line]]
 
     children_nodes: list[int] = []
     children_group_ids: list[int] = []
@@ -221,6 +240,7 @@ def _build_group_node(
                 state=state,
                 node_entry_by_id=node_entry_by_id,
                 visiting=visiting,
+                parent_chain=dag_chain,
             )
             _assign_parent_group(state, child_id, node_id)
             if built.kind == "group":
@@ -236,7 +256,12 @@ def _build_group_node(
         inner_dag = entry.get("inner_dag")
         if inner_dag is None:
             raise RuntimeError(f"group node {node_id} missing inner_dag")
-        child_groups, child_leaves, call_order = _walk_serialized_level(inner_dag, depth=depth + 1, state=state)
+        child_groups, child_leaves, call_order = _walk_serialized_level(
+            inner_dag,
+            depth=depth + 1,
+            state=state,
+            parent_chain=dag_chain,
+        )
         in_ports, out_ports = _collect_group_ports(inner_dag, state=state, parent_id=node_id)
         for group in child_groups:
             _assign_parent_group(state, group["id"], node_id)
@@ -254,6 +279,7 @@ def _build_group_node(
         "def_loc": entry.get("def_loc"),
         "class_def_loc": entry.get("class_def_loc"),
         "depth": depth,
+        "dag_chain": dag_chain,
         "node_type": node_type,
         "is_synthetic": entry.get("is_synthetic", False),
         "synthetic_type": entry.get("synthetic_type"),
