@@ -1208,11 +1208,11 @@ def _build_filtered_dag_chain(group: dict) -> tuple[tuple[str, int], ...]:
         raise RuntimeError(f"group has invalid dag_chain: {group.get('label')!r}")
     normalized = []
     for index, frame in enumerate(dag_chain):
-        normalized_frame = _require_chain_frame(
+        if isinstance(frame, (list, tuple)) and len(frame) >= 2 and frame[-2] == "<container>":
+            continue
+        normalized.append(_require_chain_frame(
             frame, context=f"group {group.get('label')!r} dag_chain[{index}]",
-        )
-        if normalized_frame[0] != "<container>":
-            normalized.append(normalized_frame)
+        ))
     if not normalized:
         raise RuntimeError(f"group has empty filtered dag_chain: {group.get('label')!r}")
     return tuple(normalized)
