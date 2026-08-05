@@ -1252,7 +1252,10 @@ def build_instance_timing_pipeline(events, step_infos, step_dur_us, roots=None):
 def attach_timing_to_dag_groups(adapted: dict, panel: dict) -> list:
     """将 timing panel 数据注入 DAG adapted dict 的 groups。
 
-    原地修改 adapted["groups"] 中每个 group，为命中的 group 注入 "timing" 字段：
+    原地修改 adapted["groups"] 中每个 group。命中 leaf callsite 的 group 写入
+    "direct_timing" 字段；随后执行 downward rollup，将前端消费的最终结果写回
+    "timing" 字段：
+        group["direct_timing"] = {"inclusive_forward_us": float, "inclusive_backward_us": float}
         group["timing"] = {"inclusive_forward_us": float, "inclusive_backward_us": float}
     未命中的 group 不注入 timing 字段（不填默认 0）。
 
@@ -1303,13 +1306,70 @@ def attach_timing_to_dag_groups(adapted: dict, panel: dict) -> list:
             bwd = item.get("inclusive_backward_us", 0.0) * weight
             for g in matched:
                 t = g.setdefault(
-                    "timing",
+                    "direct_timing",
                     {"inclusive_forward_us": 0.0, "inclusive_backward_us": 0.0},
                 )
                 t["inclusive_forward_us"] += fwd
                 t["inclusive_backward_us"] += bwd
 
+    rollup_timing_to_dag_groups(adapted)
     return warnings_out
+
+
+def rollup_timing_to_dag_groups(adapted: dict) -> dict:
+    """Downward rollup DAG group timing.
+
+    规则：
+    - 有 direct_timing：group["timing"] 直接取 direct_timing
+    - 无 direct_timing：group["timing"] 取所有 children_group_ids 递归结果之和
+    - 若本 group 与子树均无 timing：不写入 group["timing"]
+
+    不防多父，不防循环，按当前 DAG 数据约定直接递归。
+    """
+
+    group_index = {g.get("id"): g for g in adapted.get("groups", [])}
+
+    def _clone_timing(timing: dict) -> dict:
+        return {
+            "inclusive_forward_us": float(timing.get("inclusive_forward_us", 0.0)),
+            "inclusive_backward_us": float(timing.get("inclusive_backward_us", 0.0)),
+        }
+
+    def _sum_timing(lhs: dict, rhs: dict) -> dict:
+        lhs["inclusive_forward_us"] += float(rhs.get("inclusive_forward_us", 0.0))
+        lhs["inclusive_backward_us"] += float(rhs.get("inclusive_backward_us", 0.0))
+        return lhs
+
+    def _post_order(group: dict):
+        direct = group.get("direct_timing")
+        if direct is not None:
+            rolled = _clone_timing(direct)
+            group["timing"] = rolled
+            return rolled
+
+        total = None
+        for child_group_id in group.get("children_group_ids", []) or []:
+            child = group_index.get(child_group_id)
+            if child is None:
+                continue
+            child_timing = _post_order(child)
+            if child_timing is None:
+                continue
+            if total is None:
+                total = _clone_timing(child_timing)
+            else:
+                _sum_timing(total, child_timing)
+
+        if total is None:
+            group.pop("timing", None)
+            return None
+
+        group["timing"] = total
+        return total
+
+    for group in adapted.get("groups", []):
+        _post_order(group)
+    return adapted
 
 
 # --------------------------------------------------------------------------
