@@ -439,7 +439,7 @@ def _build_external_id_to_module_map(events):
                 continue
             if e.get("cat") == "cpu_op":
                 pending_cpu_ops.append((end, ext_id))
-            ext_to_module.setdefault(ext_id, module_stack[-1][0])
+            ext_to_module.setdefault(ext_id, [module_event for module_event, _ in module_stack])
 
     return ext_to_module, ext_id_to_cpuop
 
@@ -669,55 +669,6 @@ def _parse_stack_entry(entry: str):
     return frames
 
 
-def _build_python_id_index(events):
-    """Index every python_function event by its ``Python id``.
-
-    We need every frame (not just ``nn.Module:`` frames) because real torch
-    profiler traces intersperse ``forward`` / ``_call_impl`` frames between
-    adjacent nn.Module events. Restricting the index to nn.Module events
-    breaks ``Python parent id`` walks on the first non-module hop and
-    collapses the module ancestor chain to just the leaf module.
-
-    Callers that only care about module frames must themselves filter the
-    walk output via ``name.startswith("nn.Module:")``.
-    """
-    index = {}
-    for e in events:
-        if e.get("cat") != "python_function":
-            continue
-        pid = e.get("args", {}).get("Python id")
-        if pid is None:
-            continue
-        index.setdefault(pid, e)
-    return index
-
-
-def _collect_module_chain(leaf_event, python_id_index, include_leaf):
-    """Walk ``Python parent id`` from ``leaf_event`` up to the outermost
-    module, returning **only** the nn.Module events on the chain ordered
-    outermost→leaf. Intermediate frames (``forward``, ``_call_impl``, user
-    frames, etc.) are traversed but skipped from the result.
-
-    ``include_leaf`` controls whether ``leaf_event`` itself is part of the
-    returned chain (False → stop at the leaf's parent).
-    """
-    if leaf_event is None:
-        return []
-    chain = []
-    if include_leaf and str(leaf_event.get("name", "")).startswith("nn.Module:"):
-        chain.append(leaf_event)
-    seen = set()
-    pid = leaf_event.get("args", {}).get("Python parent id")
-    while pid is not None and pid in python_id_index and pid not in seen:
-        seen.add(pid)
-        parent = python_id_index[pid]
-        if str(parent.get("name", "")).startswith("nn.Module:"):
-            chain.append(parent)
-        pid = parent.get("args", {}).get("Python parent id")
-    chain.reverse()
-    return chain
-
-
 _FRAMEWORK_PATH_PREFIXES = ("bytedance/lagrange_torch/",)
 
 
@@ -835,7 +786,6 @@ def build_kernel_attribution_table(events, step_infos, fwdbwd_index):
     else:
         cpu_op_by_tid, cpu_op_ts_keys_by_tid = {}, {}
     ext_to_module, ext_id_to_cpuop = _build_external_id_to_module_map(events)
-    python_id_index = _build_python_id_index(events)
     module_events_by_tid = _build_module_index_by_tid(events)
     bwd_tids = set((fwdbwd_index or {}).get("by_bwd_tid", {}).keys())
 
@@ -849,8 +799,8 @@ def build_kernel_attribution_table(events, step_infos, fwdbwd_index):
         "framework_only": [],
     }
 
-    def _store_from_module_chain(target, idx, leaf_event, stack_traces):
-        """Attribute an event via its runtime module parent chain.
+    def _store_from_module_chain(target, idx, module_events, stack_traces):
+        """Attribute an event via its active runtime module stack.
 
         If `stack_traces` is a non-empty list, split one kernel event into N
         attributions (weight=1/N each), attaching the parsed stack frames to
@@ -858,8 +808,7 @@ def build_kernel_attribution_table(events, step_infos, fwdbwd_index):
 
         Returns (stored, framework_only).
         """
-        module_events = _collect_module_chain(leaf_event, python_id_index, include_leaf=True)
-        module_events, framework_only = _strip_framework_prefix(module_events)
+        module_events, framework_only = _strip_framework_prefix(module_events or [])
         if framework_only:
             return False, True
         frames = _build_module_frames(module_events)
@@ -919,22 +868,25 @@ def build_kernel_attribution_table(events, step_infos, fwdbwd_index):
         stats["total_kernels"] += 1
         stats["total_kernel_dur_us"] += dur
 
-        leaf_event = None
+        module_events = None
         scope = None
         if is_bwd and fwdbwd_index and fwdbwd_index["all"]:
             # Backward kernel: resolve the forward scope via fwdbwd flow, then
-            # pick the innermost forward module event to rebuild the fwd chain.
+            # use the active module-stack snapshot of its innermost module.
             scope = _resolve_fwdbwd_scope(e, fwdbwd_index, cpu_op_by_tid, cpu_op_ts_keys_by_tid, ext_id_to_cpuop)
             if scope is not None:
                 stats["bwd_via_flow_narrowed"] += 1
                 fwd_start, fwd_end, fwd_tid = scope
                 leaf_event = _find_innermost_module_in_window(module_events_by_tid, fwd_tid, fwd_start, fwd_end)
-        if leaf_event is None:
-            leaf_event = ext_to_module.get(ext_id)
+                if leaf_event is not None:
+                    leaf_ext_id = leaf_event.get("args", {}).get("External id")
+                    module_events = ext_to_module.get(leaf_ext_id)
+        if module_events is None:
+            module_events = ext_to_module.get(ext_id)
 
         stack_traces = e.get("args", {}).get("stack", {}).get("stack_traces")
         stored, framework_only = _store_from_module_chain(
-            kernel_attribution, idx, leaf_event, stack_traces
+            kernel_attribution, idx, module_events, stack_traces
         )
         if stored:
             stats["bwd_attributed" if is_bwd else "fwd_attributed"] += 1
@@ -973,31 +925,20 @@ def build_kernel_attribution_table(events, step_infos, fwdbwd_index):
     for idx, e in enumerate(events):
         if e.get("cat") != "cpu_op":
             continue
-        # Prefer the runtime module parent chain via ``Python parent id``.
-        # Some trace variants (newer torch, some kineto configs) do not emit
-        # ``Python parent id`` on cpu_op events; in that case fall back to the
-        # temporal-nesting map built from module_stack scanning, which
-        # resolves the innermost enclosing nn.Module event by tid + ts window.
-        py_parent = e.get("args", {}).get("Python parent id")
-        leaf_event = None
-        if py_parent is not None and py_parent in python_id_index:
-            leaf_event = python_id_index[py_parent]
-        else:
-            ext_id = e.get("args", {}).get("External id")
-            if ext_id is not None:
-                leaf_event = ext_to_module.get(ext_id)
-        if leaf_event is None:
+        ext_id = e.get("args", {}).get("External id")
+        module_events = ext_to_module.get(ext_id) if ext_id is not None else None
+        if module_events is None:
             continue
-        stored, framework_only = _store_from_module_chain(cpu_attribution, idx, leaf_event, None)
+        stored, framework_only = _store_from_module_chain(cpu_attribution, idx, module_events, None)
         if stored:
             stats["cpu_attributed"] += 1
         elif framework_only:
             continue
         else:
             raise RuntimeError(
-                "CPU op idx=%d (Python parent id=%s, ext_id=%s) resolved to "
-                "a leaf event but produced no call_chain."
-                % (idx, py_parent, e.get("args", {}).get("External id"))
+                "CPU op idx=%d (ext_id=%s) resolved to an active module stack "
+                "but produced no call_chain."
+                % (idx, ext_id)
             )
 
     return kernel_attribution, cpu_attribution, stats
