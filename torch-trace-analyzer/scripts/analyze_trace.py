@@ -1190,72 +1190,131 @@ def build_instance_timing_pipeline(events, step_infos, step_dur_us, roots=None):
     return panel
 
 
-def attach_timing_to_dag_groups(adapted: dict, panel: dict) -> list:
-    """将 timing panel 数据注入 DAG adapted dict 的 groups。
+def _require_chain_frame(frame, *, context: str) -> tuple[str, int]:
+    """Validate and normalize one DAG/timing chain frame to ``(basename, line)``."""
+    if not isinstance(frame, (list, tuple)) or len(frame) < 2:
+        raise RuntimeError(f"{context} must be a sequence containing file and line: {frame!r}")
+    file_name, line = frame[-2], frame[-1]
+    if not isinstance(file_name, str) or not file_name:
+        raise RuntimeError(f"{context} has invalid file: {file_name!r}")
+    if not isinstance(line, int) or isinstance(line, bool) or line <= 0:
+        raise RuntimeError(f"{context} has invalid line: {line!r}")
+    return os.path.basename(file_name), line
 
-    原地修改 adapted["groups"] 中每个 group。命中 leaf callsite 的 group 写入
-    "direct_timing" 字段；随后执行 downward rollup，将前端消费的最终结果写回
-    "timing" 字段：
-        group["direct_timing"] = {"inclusive_forward_us": float, "inclusive_backward_us": float}
-        group["timing"] = {"inclusive_forward_us": float, "inclusive_backward_us": float}
-    未命中的 group 不注入 timing 字段（不填默认 0）。
 
-    匹配规则：
-    - 主键：(basename(callsite_file), callsite_line) vs (basename(src_file), src_start_line)
-    - 只匹配 leaf（callsite），不再回退到 ancestors
-    - 相同 leaf loc 缓存匹配结果
-    - 一个 loc 命中多个 group 时均分（weight = 1/len(matched)）
-    - src_file 或 src_start_line 缺失的 group raise RuntimeError
+def _build_filtered_dag_chain(group: dict) -> tuple[tuple[str, int], ...]:
+    dag_chain = group.get("dag_chain")
+    if not isinstance(dag_chain, (list, tuple)):
+        raise RuntimeError(f"group has invalid dag_chain: {group.get('label')!r}")
+    normalized = []
+    for index, frame in enumerate(dag_chain):
+        normalized_frame = _require_chain_frame(
+            frame, context=f"group {group.get('label')!r} dag_chain[{index}]",
+        )
+        if normalized_frame[0] != "<container>":
+            normalized.append(normalized_frame)
+    if not normalized:
+        raise RuntimeError(f"group has empty filtered dag_chain: {group.get('label')!r}")
+    return tuple(normalized)
 
-    返回 warning 字符串列表。
-    """
-    import os
-    from collections import defaultdict
 
-    dag_loc_index: dict = defaultdict(list)
-    for g in adapted.get("groups", []):
-        sf = g.get("src_file")
-        sl = g.get("src_start_line")
-        if not sf or sl is None:
+def _build_timing_chain(item: dict, *, class_name: str) -> tuple[tuple[str, int], ...]:
+    ancestors = item.get("ancestors")
+    if not isinstance(ancestors, (list, tuple)):
+        raise RuntimeError(f"timing item {class_name!r} has invalid ancestors: {ancestors!r}")
+    chain = []
+    for index, frame in enumerate(ancestors):
+        if not isinstance(frame, (list, tuple)) or len(frame) != 4:
             raise RuntimeError(
-                f"group missing src_file/src_start_line: {g.get('label')!r}"
+                f"timing item {class_name!r} ancestors[{index}] must have 4 fields: {frame!r}"
             )
-        dag_loc_index[(os.path.basename(sf), int(sl))].append(g)
+        chain.append(_require_chain_frame(
+            (frame[1], frame[2]),
+            context=f"timing item {class_name!r} ancestors[{index}]",
+        ))
+    if "callsite_file" not in item or "callsite_line" not in item:
+        raise RuntimeError(f"timing item {class_name!r} missing callsite_file/callsite_line")
+    chain.append(_require_chain_frame(
+        (item["callsite_file"], item["callsite_line"]),
+        context=f"timing item {class_name!r} leaf",
+    ))
+    return tuple(chain)
 
-    match_cache: dict = {}
-    warnings_out: list = []
 
-    for cls, items in panel.get("runtime_instance_timings_by_class", {}).items():
+def _is_ordered_subsequence(needle: tuple, haystack: tuple) -> bool:
+    position = 0
+    for frame in haystack:
+        if position < len(needle) and needle[position] == frame:
+            position += 1
+    return position == len(needle)
+
+
+def _select_longest_chain_candidates(groups: list, timing_chain: tuple) -> list:
+    candidates = []
+    for group in groups:
+        dag_chain = _build_filtered_dag_chain(group)
+        if (dag_chain[0] == timing_chain[0]
+                and dag_chain[-1] == timing_chain[-1]
+                and _is_ordered_subsequence(dag_chain, timing_chain)):
+            candidates.append((len(dag_chain), group))
+    if not candidates:
+        return []
+    longest = max(length for length, _group in candidates)
+    return [group for length, group in candidates if length == longest]
+
+
+def attach_timing_to_dag_groups(adapted: dict, panel: dict) -> list:
+    """Attach each timing item to the longest matching eligible DAG chain.
+
+    A group is eligible only when it is non-synthetic and not a container group.
+    Its ``<container>`` frames are removed before matching.  The filtered DAG
+    chain must share the timing chain's first and last frames and be an ordered
+    subsequence.  Equal longest candidates split the complete timing evenly.
+    """
+    groups = adapted.get("groups")
+    if not isinstance(groups, list):
+        raise RuntimeError("adapted groups must be a list")
+    eligible_groups = [
+        group for group in groups
+        if group.get("synthetic_type") is None
+        and group.get("node_type") != "container_group"
+    ]
+    for group in eligible_groups:
+        _build_filtered_dag_chain(group)
+
+    timings_by_class = panel.get("runtime_instance_timings_by_class")
+    if not isinstance(timings_by_class, dict):
+        raise RuntimeError("runtime_instance_timings_by_class must be a dict")
+
+    warnings_out = []
+    for class_name, items in timings_by_class.items():
+        if not isinstance(items, list):
+            raise RuntimeError(f"timing items for {class_name!r} must be a list")
         for item in items:
-            leaf_file = os.path.basename(item.get("callsite_file") or "")
-            leaf_line = item.get("callsite_line") or 0
-            loc_key = (leaf_file, leaf_line)
-
-            if loc_key not in match_cache:
-                match_cache[loc_key] = dag_loc_index.get(loc_key)
-            matched = match_cache[loc_key]
-
-            csf = item.get("callsite_file", "")
-            csl = item.get("callsite_line", 0)
-
-            if matched is None:
-                warnings_out.append(f"WARN leaf-miss: {cls}@{csf}:{csl}")
+            if not isinstance(item, dict):
+                raise RuntimeError(f"timing item for {class_name!r} must be a dict")
+            timing_chain = _build_timing_chain(item, class_name=class_name)
+            matched = _select_longest_chain_candidates(eligible_groups, timing_chain)
+            if not matched:
+                warnings_out.append(
+                    f"WARN leaf-miss: {class_name}@{item['callsite_file']}:{item['callsite_line']}"
+                )
                 continue
-
-            eligible = [g for g in matched if g.get("synthetic_type") is None]
-            if not eligible:
-                continue
-
-            weight = 1.0 / len(eligible)
-            fwd = item.get("inclusive_forward_us", 0.0) * weight
-            bwd = item.get("inclusive_backward_us", 0.0) * weight
-            for g in eligible:
-                t = g.setdefault(
+            try:
+                fwd = float(item["inclusive_forward_us"])
+                bwd = float(item["inclusive_backward_us"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"timing item {class_name!r} has invalid inclusive timing"
+                ) from exc
+            weight = 1.0 / len(matched)
+            for group in matched:
+                direct = group.setdefault(
                     "direct_timing",
                     {"inclusive_forward_us": 0.0, "inclusive_backward_us": 0.0},
                 )
-                t["inclusive_forward_us"] += fwd
-                t["inclusive_backward_us"] += bwd
+                direct["inclusive_forward_us"] += fwd * weight
+                direct["inclusive_backward_us"] += bwd * weight
 
     rollup_timing_to_dag_groups(adapted)
     return warnings_out
