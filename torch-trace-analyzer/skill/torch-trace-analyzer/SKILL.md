@@ -166,23 +166,13 @@ python3 scripts/wrapper_swimlane.py <trace.json|.gz> -o swimlane.html
 - 顶部强制 `MOCK_RUN_DISABLE_FAKE_TENSOR=0`
 - FakeTensor pre-hook 检查已注册，无 real CPU tensor 进入 forward
 
-## 参考文档
+## 仓库内资源
 
-- Trace 字段与事件格式：references/trace-format.md
+Skill 位于 `skill/torch-trace-analyzer/`，实现脚本位于项目根目录的 `scripts/`。从项目根目录运行：
 
-## 操作说明
+```bash
+python3 scripts/analyze_trace.py [trace文件路径] [选项]
+python3 scripts/wrapper_swimlane.py <trace.json|.gz> -o swimlane.html
+```
 
-Skill 资源位于 user_skills/torch-trace-analyzer。
-
-相关资源路径：
-- scripts/analyze_trace.py
-- scripts/wrapper_swimlane.py
-- references/trace-format.md
-
-执行脚本时：
-- 先 cd user_skills/torch-trace-analyzer
-- 运行 python3 scripts/analyze_trace.py
-- 或运行 python3 scripts/wrapper_swimlane.py
-
-读取参考文档时，优先使用：
-- view_skill user_skills/torch-trace-analyzer/references/trace-format.md
+不要复制实现脚本到 Skill 目录；Skill 与项目代码共用唯一实现。
