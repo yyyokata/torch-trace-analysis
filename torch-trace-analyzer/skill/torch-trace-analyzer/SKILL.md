@@ -176,3 +176,13 @@ python3 scripts/wrapper_swimlane.py <trace.json|.gz> -o swimlane.html
 ```
 
 不要复制实现脚本到 Skill 目录；Skill 与项目代码共用唯一实现。
+
+## Profile 报告资产
+
+生成完整性能 Profile 报告时，必须从本 Skill 内读取模板与已验证示例：
+
+- 通用模板：`references/profile-report/perf_report_template.md`
+- 模型 6451993 已填充示例：`references/profile-report/perf_report_6451993.md`
+- 归档范围与复跑边界：`references/profile-report/MANIFEST.md`
+
+模板、示例报告和相关说明属于 Skill 资产，不放入项目 `design/`。新环境开始分析前仍须先询问用户的实际运行环境、依赖安装边界和服务可达方式，禁止从示例中复制固定 WSL 或本地路径。
